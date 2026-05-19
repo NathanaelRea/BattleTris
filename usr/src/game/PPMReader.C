@@ -7,7 +7,9 @@
 # define isspace(x) ((x == ' ') || (x == '\t'))
 #endif
 
-#include <iostream.h>
+
+#include <iostream>
+using namespace std;
 #include <stdio.h>
 #include <math.h>
 

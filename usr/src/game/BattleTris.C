@@ -15,7 +15,9 @@
 # include <unistd.h>
 #endif
 
-#include <iostream.h>
+
+#include <iostream>
+using namespace std;
 
 #if STDC_HEADERS
 # include <stdlib.h>
@@ -484,6 +486,7 @@ static void toolkit_warning(String msg)
     cerr << "BattleTris: Xt WARNING: " << msg << endl;
 }
 
+static void toolkit_error(String msg) __attribute__((noreturn));
 static void toolkit_error(String msg)
 {
   if(msg && *msg)
@@ -492,6 +495,7 @@ static void toolkit_error(String msg)
     cerr << "BattleTris: Xt ERROR: Unknown" << endl;
 
   bt_terminate(BT_ERROR);
+  exit(1);
 }
 
 static void toolkit_destroy(Widget widget, XtPointer data, XtPointer cbs)

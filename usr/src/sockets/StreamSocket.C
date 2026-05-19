@@ -28,7 +28,9 @@
 # include <unistd.h>
 #endif
 
-#include <iostream.h>
+
+#include <iostream>
+using namespace std;
 #include <assert.h>
 #include <stdio.h>
 #include <netdb.h>
@@ -166,7 +168,7 @@ short StreamSocket::listen(int backlog)
   if(un_addr_) {
     assert(un_peer_ == 0);
 
-    if(bind(sock(), un_addr_.addr(), un_addr_.size()) < 0)
+    if(::bind(sock(), un_addr_.addr(), un_addr_.size()) < 0)
       return ERRSTREAMBIND;
 
     if(::listen(sock(), backlog) < 0)
@@ -174,7 +176,7 @@ short StreamSocket::listen(int backlog)
   } else {
     assert(in_peer_ == 0);
 
-    if(bind(sock(), in_addr_.addr(), in_addr_.size()) < 0)
+    if(::bind(sock(), in_addr_.addr(), in_addr_.size()) < 0)
       return ERRSTREAMBIND;
 
     if(::listen(sock(), backlog) < 0)
@@ -188,7 +190,7 @@ short StreamSocket::listen(int backlog, InetAddress& addr)
 {
   assert(in_peer_ == 0);
 
-  if(bind(sock(), in_addr_.addr(), in_addr_.size()) < 0)
+  if(::bind(sock(), in_addr_.addr(), in_addr_.size()) < 0)
     return ERRSTREAMBIND;
 
   sockaddr_in name;
@@ -209,7 +211,7 @@ short StreamSocket::listen(int backlog, UnixAddress& addr)
 {
   assert(un_peer_ == 0);
 
-  if(bind(sock(), un_addr_.addr(), un_addr_.size()) < 0)
+  if(::bind(sock(), un_addr_.addr(), un_addr_.size()) < 0)
     return ERRSTREAMBIND;
 
   sockaddr_un name;

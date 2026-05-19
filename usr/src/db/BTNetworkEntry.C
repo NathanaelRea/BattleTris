@@ -14,8 +14,12 @@
 #include <assert.h>
 #include <stdio.h>
 
-#include <iostream.h>
-#include <iomanip.h>
+
+#include <iostream>
+using namespace std;
+
+#include <iomanip>
+using namespace std;
 
 #include "BTNetworkEntry.H"
 #include "BTProtocol.H"

@@ -8,7 +8,9 @@
 #include "BTConfig.H"
 
 #include <assert.h>
-#include <iostream.h>
+
+#include <iostream>
+using namespace std;
 
 #include "BTStartup.H"
 #include "BTCommManager.H"

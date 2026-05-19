@@ -10,7 +10,9 @@
 
 #include "BTConfig.H"
 
-#include <iostream.h>
+
+#include <iostream>
+using namespace std;
 
 #include "List.H"
 #include "ListIter.H"

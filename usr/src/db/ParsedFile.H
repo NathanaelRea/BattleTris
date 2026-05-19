@@ -3,7 +3,9 @@
 
 #include "BTConfig.H"
 
-#include <fstream.h>
+
+#include <fstream>
+using namespace std;
 
 class ParsedFile {
 

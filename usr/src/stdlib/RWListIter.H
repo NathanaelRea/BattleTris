@@ -27,8 +27,8 @@ public:
 };
 
 template<class T> RWListIter<T>::~RWListIter() {
-  ((List<T> *) list_)->remove_iter_(this); 
-  ((List<T> *) list_)->remove_rw_iter_(this); 
+  ((List<T> *) this->list_)->remove_iter_(this);
+  ((List<T> *) this->list_)->remove_rw_iter_(this);
 }
 
 template<class T> void RWListIter<T>::update_removal (ListElement<T> *old_elem) {
@@ -40,7 +40,7 @@ template<class T> void RWListIter<T>::update_insertion () {
 } 
 
 template<class T> void RWListIter<T>::check_iters() {
-  if (((List<T> *) list_)->iters_() > 1) {
+  if (((List<T> *) this->list_)->iters_() > 1) {
     // A write operation is being attempted, but there
     // are still read-only iters on the list 
     assert (1 == 0);

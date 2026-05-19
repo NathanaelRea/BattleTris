@@ -107,7 +107,7 @@
 /* #undef HAVE_NDIR_H */
 
 /* Define if you have the <stropts.h> header file.  */
-#define HAVE_STROPTS_H 1
+/* #undef HAVE_STROPTS_H */
 
 /* Define if you have the <sys/dir.h> header file.  */
 /* #undef HAVE_SYS_DIR_H */
@@ -190,18 +190,25 @@
 # include <strings.h>
 #endif
 
-/* XXX Fix this in autoconf */
-#ifdef __sun
+/* socklen_t is available on macOS and Solaris */
+#if defined(__sun) || defined(__APPLE__)
 #define HAVE_SOCKLEN_T
 #endif
 
-#ifndef __sun
+/* _XPG4_2: use msg_control/msg_controllen for fd passing (POSIX cmsg) */
+#if !defined(__sun) || defined(__APPLE__)
 #define _XPG4_2
+#endif
 
+/* drand48/lrand48/uint_t: macOS provides drand48/lrand48 natively */
+#if defined(__sun) && !defined(__APPLE__)
 #define drand48()	((double)rand() / (double)RAND_MAX)
 #define lrand48()	((long)rand())
 #define srand48(x)	srand(x)
+#endif
 
+/* uint_t is a Solaris type not in standard headers on macOS */
+#if !defined(__sun)
 typedef unsigned int	uint_t;
 #endif
 

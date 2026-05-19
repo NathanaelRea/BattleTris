@@ -70,18 +70,18 @@ void BTRecon::drawBoard (BTBoard *board) {
       k = drand48();
       int id = board->rep_[offset];
       if (id && (k < report_prob)) {
-	if ( map_[offset] > 0 )
+	if ( map_[offset] != NULL )
 	  doh = map_[offset]->id();
-	if ( (map_[offset] > 0) && (map_[offset ]->id() != id ) ) {
+	if ( (map_[offset] != NULL) && (map_[offset ]->id() != id ) ) {
 	  map_[offset]->erase();
 	  box_manager_->dispose( map_[offset] );
 	  map_[offset] = box_manager_->createByID (j, i, id);
 	  map_[offset]->redraw();
-	} else if ( map_[offset] <= 0 ) {
+	} else if ( map_[offset] == NULL ) {
 	  map_[offset] = box_manager_->createByID (j, i, id);
 	  map_[offset]->redraw();
 	}
-      } else if ( map_[offset ] > 0 ) {
+      } else if ( map_[offset] != NULL ) {
 	map_[offset]->erase();
 	box_manager_->dispose( map_[offset] );
 	map_[offset] = 0;

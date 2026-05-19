@@ -60,7 +60,7 @@ BTServer::BTServer(int nslaves, int port)
   strcat(pathbuf, "/");
   strcat(pathbuf, BTMD_LOGFILE);
 
-  if((log_ = new ofstream(pathbuf, ios::out, 0660)) == 0)
+  if((log_ = new ofstream(pathbuf, ios::out)) == 0)
     goto memerr;
 
   if((pidfile_ =

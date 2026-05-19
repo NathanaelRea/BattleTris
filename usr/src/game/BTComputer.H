@@ -3,7 +3,9 @@
 
 #include "BTConfig.H"
 
-#include <iostream.h>
+
+#include <iostream>
+using namespace std;
 
 #include "Block.H"
 #include "List.H"

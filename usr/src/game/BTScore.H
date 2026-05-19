@@ -11,7 +11,9 @@
 
 #include "BTConfig.H"
 
-#include <iostream.h>
+
+#include <iostream>
+using namespace std;
 
 class BTScore {
 friend ostream& operator<< (ostream& s, BTScore &score);

@@ -6,7 +6,9 @@
 /*    DATE: Thu Sep 28 13:12:42 1995                            */
 /****************************************************************/
 
-#include <iostream.h>
+
+#include <iostream>
+using namespace std;
 
 #include "BattleTris.H"
 #include "BTXPalette.H"

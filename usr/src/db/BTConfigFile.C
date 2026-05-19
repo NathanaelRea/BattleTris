@@ -7,7 +7,9 @@
 # define S_ISDIR(mode) (((mode) & S_IFMT) == S_IFDIR)
 #endif
 
-#include <iostream.h>
+
+#include <iostream>
+using namespace std;
 
 #include "ParsedFile.H"
 #include "BTConfigFile.H"

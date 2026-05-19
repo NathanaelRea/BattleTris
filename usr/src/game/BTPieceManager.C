@@ -152,6 +152,7 @@ void BTPieceManager::receive (BTRingPacket *packet) {
   pass (packet);
 }    
 
+#ifdef __sun
 #ifndef lrand48
 static long
 lrand48()
@@ -167,6 +168,7 @@ drand48()
 	return ((double)rand() / (double)RAND_MAX);
 }
 #endif
+#endif /* __sun */
 
 BTPiece *BTPieceManager::create (int x, int y) {
   BTPiece *new_piece;

@@ -20,7 +20,9 @@
 # include <unistd.h>
 #endif
 
-#include <fstream.h>
+
+#include <fstream>
+using namespace std;
 #include <assert.h>
 #include <stdio.h>
 #include <math.h>

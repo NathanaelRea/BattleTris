@@ -1,20 +1,17 @@
-# Define special targets for Sun make development
-
-.KEEP_STATE:
 .SUFFIXES:
 .SUFFIXES: .H .C .o
 
 SHELL		= /bin/sh
 
-# Define locations of package libraries and include files
+# macOS paths: OpenMotif via Homebrew, X11 via XQuartz
 
-MOTIF_CFLAGS	= -I/usr/local/include
-MOTIF_LIBS	= -L/usr/local/lib -lXm -R/usr/dt/lib
+MOTIF_CFLAGS	= -I/opt/homebrew/include
+MOTIF_LIBS	= -L/opt/homebrew/lib -lXm
 
-X11_CFLAGS	=  -I/usr/X11R6/include
-X11_LIBS	=  -lXt -lX11 -lXext  -L/usr/X11R6/lib -R/usr/X11R6/lib 
+X11_CFLAGS	= -I/opt/X11/include
+X11_LIBS	= -L/opt/X11/lib -lXt -lX11 -lXext
 
-NET_LIBS	=  #-lsocket -lnsl
+NET_LIBS	=
 
 # Define destination directories for targets relative to source directories
 
@@ -22,22 +19,22 @@ DSTINCDIR	= ../../include
 DSTLIBDIR	= ../../lib
 DSTBINDIR	= ../../bin
 
-RELMANDIR	= /home/mws/man/man1
-RELBINDIR	= /home/mws/bin
-RELSHRDIR	= /home/mws/share/BattleTris
-RELDEFDIR	= /home/mws/app-defaults
+RELMANDIR	= /usr/local/man/man1
+RELBINDIR	= /usr/local/bin
+RELSHRDIR	= /usr/local/share/BattleTris
+RELDEFDIR	= /usr/local/share/X11/app-defaults
 
 # Define base flags to be used in Makefiles
 
-BT_CXXFLAGS	= -DNDEBUG -g
-BT_IFLAGS	= -I. -I$(DSTINCDIR) 
-BT_LDFLAGS	= -L. -L$(DSTLIBDIR) -xildoff
+BT_CXXFLAGS	= -DNDEBUG -g -std=c++14 -Wno-deprecated-declarations
+BT_IFLAGS	= -I. -I$(DSTINCDIR)
+BT_LDFLAGS	= -L. -L$(DSTLIBDIR)
 
 # Define pathnames of needed utilities
 
-CXX		= c++
+CXX		= clang++
 AR		= ar -ru
-RANLIB		= :
+RANLIB		= ranlib
 INSTALL		= /bin/sh ../../bin/install-sh -c
 RM		= rm -rf
 

@@ -16,7 +16,9 @@
 
 #include <stdio.h>
 #include <fcntl.h>
-#include <iostream.h>
+
+#include <iostream>
+using namespace std;
 
 #include <Xm/Xm.h>
 #include <Xm/DialogS.h>

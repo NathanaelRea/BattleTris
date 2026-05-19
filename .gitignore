@@ -1,0 +1,9 @@
+# Build artifacts
+*.o
+*.a
+usr/src/game/BattleTris
+usr/src/daemons/btserverd
+usr/src/daemons/btslaved
+usr/src/btref/btref
+usr/lib/
+usr/bin/

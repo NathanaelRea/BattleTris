@@ -1,6 +1,8 @@
 #include "BTConfig.H" 
 
-#include <iostream.h>
+
+#include <iostream>
+using namespace std;
 #include <signal.h>
 
 #if HAVE_UNISTD_H

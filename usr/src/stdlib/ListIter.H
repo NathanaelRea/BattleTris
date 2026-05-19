@@ -35,7 +35,7 @@ private:
   }
 public:
   ListIter (List<T>& list) : AbsListIter (&list) { list.add_iter_ (this);  }
-  ~ListIter() { ((List<T> *) list_)->remove_iter_ (this); }
+  ~ListIter() { ((List<T> *) this->list_)->remove_iter_ (this); }
   void jump_before_head() { AbsListIter::jump_before_head(); }
   void jump_after_tail() { AbsListIter::jump_after_tail(); }
   inline int peek_next(T& data);

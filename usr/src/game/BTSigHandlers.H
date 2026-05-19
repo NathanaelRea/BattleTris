@@ -10,7 +10,9 @@
 
 #include "BTConfig.H"
 
-#include <iostream.h>
+
+#include <iostream>
+using namespace std;
 
 #if HAVE_UNISTD_H
 # include <unistd.h>

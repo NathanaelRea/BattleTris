@@ -31,7 +31,9 @@ typedef struct {
 
 #include <sys/stat.h>
 
-#include <iostream.h>
+
+#include <iostream>
+using namespace std;
 #include <stdio.h>
 #include <fcntl.h>
 #include <errno.h>

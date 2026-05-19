@@ -13,7 +13,9 @@
 
 #include <Xm/Xm.h>
 
-#include <iostream.h>
+
+#include <iostream>
+using namespace std;
 
 #include "BTCommManager.H"
 #include "BTDrawingAreaWidget.H"

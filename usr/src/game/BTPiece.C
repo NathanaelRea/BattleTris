@@ -12,7 +12,9 @@
 # include <stdlib.h>
 #endif
 
-#include <iostream.h>
+
+#include <iostream>
+using namespace std;
 #include <assert.h>
 
 #include "BTPiece.H"

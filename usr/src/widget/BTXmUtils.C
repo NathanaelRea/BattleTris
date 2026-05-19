@@ -1,9 +1,7 @@
 #include "BTConfig.H"
 #include "BTXmUtils.H"
 
-#ifdef __sun
 #include <alloca.h>
-#endif
 
 XmString
 xm_strcat(XmString s1, XmString s2)

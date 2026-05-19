@@ -28,7 +28,7 @@
 #include "btslaved.H"
 
 BTSlave::BTSlave(const char *logpath, int prindex, int maxclients)
-: maxclients_(maxclients), log_(logpath, ios::out, 0660), awol_(0),
+: maxclients_(maxclients), log_(logpath, ios::out), awol_(0),
   err_(0)
 {
   char pathbuf[1024];

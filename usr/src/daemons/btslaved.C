@@ -7,7 +7,9 @@
 
 #include "BTConfig.H"
 
-#include <iostream.h>
+
+#include <iostream>
+using namespace std;
 #include <stdio.h>
 
 #if STDC_HEADERS

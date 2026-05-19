@@ -13,7 +13,9 @@
 
 #ifndef NDEBUG
 
-#include <iostream.h>
+
+#include <iostream>
+using namespace std;
 
 #define BTDebug(x)  cerr << BT_VERSION << " [" << __FILE__ << ", " << __LINE__ << "] DEBUG: " << x << endl
 

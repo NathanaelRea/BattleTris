@@ -10,7 +10,9 @@
 
 #include "BTConfig.H"
 
-#include <iostream.h>
+
+#include <iostream>
+using namespace std;
 
 #include "StreamSocket.H"
 #include "PacketBuffer.H"

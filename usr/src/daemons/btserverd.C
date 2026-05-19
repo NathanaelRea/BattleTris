@@ -17,7 +17,9 @@
 # include <stdlib.h>
 #endif
 
-#include <iostream.h>
+
+#include <iostream>
+using namespace std;
 
 #include "StreamSocketErr.H"
 

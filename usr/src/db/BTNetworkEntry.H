@@ -10,7 +10,9 @@
 
 #include "BTConfig.H"
 
-#include <iostream.h>
+
+#include <iostream>
+using namespace std;
 
 #include "Address.H"
 #include "BTDBRecord.H"

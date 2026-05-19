@@ -14,7 +14,9 @@
 # include <unistd.h>
 #endif
 
-#include <iostream.h>
+
+#include <iostream>
+using namespace std;
 
 #include "PacketBuffer.H"
 

@@ -8,7 +8,9 @@
 
 #include "BTXDisplay.H"
 #include "BTConstants.H"
-#include <iostream.h>
+
+#include <iostream>
+using namespace std;
 #include "BTXPalette.H"
 
 extern Widget g_toplevel;

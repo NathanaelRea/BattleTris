@@ -8,7 +8,9 @@
 
 #include "BTConfig.H"
 
-#include <iostream.h>
+
+#include <iostream>
+using namespace std;
 #include <assert.h>
 
 #include "BattleTris.H"

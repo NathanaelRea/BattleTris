@@ -15,7 +15,9 @@
 #include <Xm/DialogS.h>
 
 #include <stdio.h>
-#include <iostream.h>
+
+#include <iostream>
+using namespace std;
 
 #include "DevAudio.H"
 #include "BTWidget.H"
