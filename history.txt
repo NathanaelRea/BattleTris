@@ -1,0 +1,626 @@
+commit 269bc4dbdd25ba02428ea424c549898f42c3666b
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Wed Oct 24 08:38:08 2001
+
+    1000022 should not resolve server hostname when run with "-X"
+
+    1.3    usr/src/game/BTNetManager.C
+
+commit b13015dc269cf2b039f3b24e2ce30b57b2a3da46
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Tue Oct 23 20:14:55 2001
+
+    1000021 Gimp PPMs must be in src base
+
+    1.1    usr/src/art/btgimp.ppm
+    1.1    usr/src/art/btgimp2.ppm
+
+commit 8727aafb7eb364106637473cbe5eec45db38bca7
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Tue Oct 23 20:14:54 2001
+
+    1000020 Need better handling of image loading failure
+
+    1.4    usr/src/game/BTStartup.C
+    1.2    usr/src/game/BTStartup.H
+
+commit f3ac5f4874938d518698f8e205dbfd645ac603c4
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Tue Oct 23 19:29:18 2001
+
+    1000019 Contrary to cgh's wishes, Ernie has more names than "Greased"
+
+    1.2    usr/src/game/BTCommManager.H
+    1.3    usr/src/game/BTStartup.C
+
+commit 4d1f74a0a070082af43b7f07c353b2ecce12793c
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Tue Oct 23 00:05:29 2001
+
+    1000017 Ernie needs levels other than "Hard" and "Impossible"
+
+    1.3    usr/src/game/BTChallenge.C
+    1.2    usr/src/game/BTChallenge.H
+    1.2    usr/src/game/BTComputer.C
+    1.2    usr/src/game/BTComputer.H
+    1.2    usr/src/game/BTFallbacks.C
+    1.6    usr/src/game/BTGame.C
+    1.2    usr/src/game/BTStartup.C
+    1.1    usr/src/widget/BTSliderWidget.C
+    1.1    usr/src/widget/BTSliderWidget.H
+    1.2    usr/src/widget/BTWidget.C
+    1.2    usr/src/widget/Makefile
+
+commit 1a17503f68495ae0a60698e9dc092f0736955155
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Tue Oct 23 00:05:28 2001
+
+    1000018 "mofo" is not a filename
+
+    1.5    usr/src/game/BTSoundManager.C
+
+commit db88bac4f4825fc26ddfed6ee8d37295a206c80b
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Mon Oct 22 22:56:09 2001
+
+    1000016 ^C'ing causes seg fault under libumem
+
+    1.3    usr/src/widget/BTScrolledListWidget.H
+    1.3    usr/src/widget/BTScrolledTextWidget.H
+
+commit c1ed801103b1a75dc99e58e0940662d939f22a25
+Author: Adam Leventhal <ahl@eng.sun.com>
+Date:   Mon Oct 22 22:30:59 2001
+
+    1000013 props for airslides (I suck)
+
+    1.5    usr/src/game/BTGame.C
+    1.5    usr/src/game/BTGame.H
+
+commit cb05242c6bf35f23c3d11d6eda0fc1f938e7ece0
+Author: Dave Powell <dep@eng.sun.com>
+Date:   Mon Oct 22 22:16:07 2001
+
+    1000015 sounds don't play under libumem
+
+    1.3    usr/src/game/BTSoundManager.H
+
+commit b8c48468dbbfd4710a9cf1b3f9dd54fd73ee27f7
+Author: Adam Leventhal <ahl@eng.sun.com>
+Date:   Mon Oct 22 21:11:05 2001
+
+    1000013 props for airslides (lint)
+
+    1.4    usr/src/game/BTGame.C
+    1.4    usr/src/game/BTGame.H
+
+commit dedda5a528f286b005408f5986f68f78fc340abb
+Author: Dave Powell <dep@eng.sun.com>
+Date:   Mon Oct 22 21:07:28 2001
+
+    1000014 off-by-one in ppm reader
+
+    1.3    usr/src/game/PPMReader.C
+    1.3    usr/src/game/PPMReader.H
+
+commit cc4e2eee401da00998997a6defc8b1572e7b706e
+Author: Adam Leventhal <ahl@eng.sun.com>
+Date:   Mon Oct 22 17:56:47 2001
+
+    1000013 props for airslides
+
+    1.3    usr/src/game/BTGame.C
+    1.3    usr/src/game/BTGame.H
+    1.2    usr/src/game/BTProtocol.H
+    1.4    usr/src/game/BTSoundManager.C
+
+commit e5285a89efba5dc004d0ab4fd79adc6f9cceb140
+Author: Mike Shapiro <mws@eng.sun.com>
+Date:   Sun Oct 21 22:46:37 2001
+
+    1000012 derive domain name from Sun RPC domain if DNS is not configured
+
+    1.2    usr/src/game/BTNetManager.C
+
+commit b517edb725fab03df7a230ef5beebcad4a8aab42
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sun Oct 21 19:25:19 2001
+
+    1000011 compile game, widget with no warnings (anachronisms remain)
+
+    1.3    usr/src/audio/DevAudio.C
+    1.2    usr/src/audio/DevAudio.H
+    1.2    usr/src/game/BTArsenal.C
+    1.2    usr/src/game/BTBazaar.C
+    1.2    usr/src/game/BTBazaar.H
+    1.2    usr/src/game/BTBiff.C
+    1.2    usr/src/game/BTChallenge.C
+    1.2    usr/src/game/BTChallengeDialog.C
+    1.2    usr/src/game/BTGame.C
+    1.2    usr/src/game/BTGame.H
+    1.2    usr/src/game/BTNetManager.H
+    1.2    usr/src/game/BTRoster.C
+    1.3    usr/src/game/BTSoundManager.C
+    1.2    usr/src/game/BTSoundManager.H
+    1.4    usr/src/game/BattleTris.C
+    1.2    usr/src/game/PPMReader.C
+    1.2    usr/src/game/PPMReader.H
+    1.2    usr/src/widget/BTCheckBoxWidget.H
+    1.2    usr/src/widget/BTDrawingAreaWidget.C
+    1.2    usr/src/widget/BTDrawingAreaWidget.H
+    1.2    usr/src/widget/BTFormWidget.C
+    1.2    usr/src/widget/BTFormWidget.H
+    1.2    usr/src/widget/BTFrameWidget.C
+    1.2    usr/src/widget/BTFrameWidget.H
+    1.2    usr/src/widget/BTLabelWidget.C
+    1.2    usr/src/widget/BTLabelWidget.H
+    1.2    usr/src/widget/BTMessageDlog.C
+    1.2    usr/src/widget/BTMessageDlog.H
+    1.2    usr/src/widget/BTPushButtonWidget.C
+    1.2    usr/src/widget/BTPushButtonWidget.H
+    1.2    usr/src/widget/BTRowColumnWidget.C
+    1.2    usr/src/widget/BTRowColumnWidget.H
+    1.2    usr/src/widget/BTScrolledListWidget.C
+    1.2    usr/src/widget/BTScrolledListWidget.H
+    1.2    usr/src/widget/BTScrolledTextWidget.C
+    1.2    usr/src/widget/BTScrolledTextWidget.H
+    1.2    usr/src/widget/BTTextWidget.C
+    1.2    usr/src/widget/BTTextWidget.H
+
+commit 2d25b2891a35d0cc3b6da454267ab0b9a1abfbca
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sun Oct 21 01:52:49 2001
+
+    1000010 in new era of detente, BTArmor no longer needed
+
+    1.3    usr/src/game/BattleTris.C
+
+commit 8cc93282c54f16a6a32ab73eb40228e18e944d80
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sun Oct 21 01:52:49 2001
+
+    1000007 audio relies on broken, unshipped header files, libraries
+
+    1.5    usr/src/Makeinclude
+    1.2    usr/src/audio/DevAudio.C
+    1.2    usr/src/audio/Makefile
+    1.2    usr/src/game/Makefile
+
+commit 78babc99bd29723756cd374c860e63abdff223a6
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sun Oct 21 01:52:48 2001
+
+    1000009 shouldn't core dump when sound files not found
+
+    1.2    usr/src/game/BTSoundManager.C
+
+commit 4fab03e9aabddd75d4daddcf2fe2b08795a86e77
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sun Oct 21 01:52:46 2001
+
+    1000008 sending/receiving boards broken between different endian machines
+
+    1.2    usr/src/game/BTCommManager.C
+
+commit 2c01993702e3c4d97149bcec3ed4c6f849cf38fc
+Author: Adam Leventhal <ahl@eng.sun.com>
+Date:   Sat Oct 20 18:26:21 2001
+
+    1000006 Makefile should have a rule for cscope stuff
+
+    1.3    usr/src/Makefile
+
+commit 7cb6a48e1676c79833f033da26b84282b53db26a
+Author: Adam Leventhal <ahl@eng.sun.com>
+Date:   Sat Oct 20 16:24:30 2001
+
+    1000005 install-sh isn't executable so needs /bin/sh in front of it
+
+    1.2    usr/src/Makefile
+
+commit 85572529ced3c5561e15860463b84519a81b31cc
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sat Oct 20 15:46:30 2001
+
+    1000005 make install work properly
+
+    1.4    usr/src/Makeinclude
+
+commit 4c73e7c7c0f7a592b83c6a08910c5c0bc01c1ea4
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sat Oct 20 15:24:09 2001
+
+    1000004 xm_strcreate needs to take const strings and make a copy
+
+    1.2    usr/src/widget/BTXmUtils.C
+    1.2    usr/src/widget/BTXmUtils.H
+
+commit 6a376117bd07e1280087e47361da10cbcd74b692
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sat Oct 20 15:24:08 2001
+
+    1000002 add -xildoff to linker flags
+
+    1.3    usr/src/Makeinclude
+
+commit 5985a6e925b8fb4e1e02daeff6508ff4f154b445
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sat Oct 20 15:24:08 2001
+
+    1000003 fix C++ const issue
+
+    1.2    usr/src/game/BattleTris.C
+
+commit 777c9324e263400c4936cc51c89e6e2b4d016098
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sat Oct 20 13:57:28 2001
+
+    1000001 BT needs 4.2 compilers
+
+    1.2    usr/src/Makeinclude
+
+commit 4fdcb6ba6e694fa0a544ca210648b8ac00e5edd7
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sat Oct 20 13:40:19 2001
+
+    (initial)
+
+    1.1    usr/bin/install-sh
+    1.1    usr/src/BTConfig.H
+    1.1    usr/src/BTConfig.H.bot
+    1.1    usr/src/BTConfig.H.in
+    1.1    usr/src/BTConfig.H.top
+    1.1    usr/src/Makefile
+    1.1    usr/src/Makeinclude
+    1.1    usr/src/Makeinclude.in
+    1.1    usr/src/art/btbazaar.ppm
+    1.1    usr/src/art/btbiff1.ppm
+    1.1    usr/src/art/btbiff3.ppm
+    1.1    usr/src/art/btbiff4.ppm
+    1.1    usr/src/art/btchalbiff.ppm
+    1.1    usr/src/art/btchalbiff.xpm
+    1.1    usr/src/art/btchallbiff.xpm
+    1.1    usr/src/art/btchallmask.xbm
+    1.1    usr/src/art/btsleepbiff.ppm
+    1.1    usr/src/art/btsleepbiff.xbm
+    1.1    usr/src/art/btsleepbiff.xpm
+    1.1    usr/src/art/btsleepmask.xbm
+    1.1    usr/src/art/btstartup2.ppm
+    1.1    usr/src/art/bttitle.ppm
+    1.1    usr/src/art/dummy.ppm
+    1.1    usr/src/art/sds.gif
+    1.1    usr/src/art/sdssmall.gif
+    1.1    usr/src/art/sdssmall.ppm
+    1.1    usr/src/audio/DevAudio.C
+    1.1    usr/src/audio/DevAudio.H
+    1.1    usr/src/audio/Makefile
+    1.1    usr/src/btref/btcmds.C
+    1.1    usr/src/btref/btcmdtab.C
+    1.1    usr/src/btref/btcmdtab.H
+    1.1    usr/src/btref/btglob.C
+    1.1    usr/src/btref/btglob.H
+    1.1    usr/src/btref/btref.C
+    1.1    usr/src/btref/btref.H
+    1.1    usr/src/btref/btsignals.H
+    1.1    usr/src/config.cache
+    1.1    usr/src/config.status
+    1.1    usr/src/configure
+    1.1    usr/src/configure.in
+    1.1    usr/src/daemons/BTDBServer.C
+    1.1    usr/src/daemons/BTDBServer.H
+    1.1    usr/src/daemons/BTMDSignals.H
+    1.1    usr/src/daemons/BTMDSlave.C
+    1.1    usr/src/daemons/BTMDSlave.H
+    1.1    usr/src/daemons/BTSDClient.C
+    1.1    usr/src/daemons/BTSDClient.H
+    1.1    usr/src/daemons/BTServer.C
+    1.1    usr/src/daemons/BTServer.H
+    1.1    usr/src/daemons/BTSlave.C
+    1.1    usr/src/daemons/Makefile
+    1.1    usr/src/daemons/btserver.cf
+    1.1    usr/src/daemons/btserverd.C
+    1.1    usr/src/daemons/btserverd.H
+    1.1    usr/src/daemons/btslaved.C
+    1.1    usr/src/daemons/btslaved.H
+    1.1    usr/src/db/BTConfigFile.C
+    1.1    usr/src/db/BTConfigFile.H
+    1.1    usr/src/db/BTDB.C
+    1.1    usr/src/db/BTDB.H
+    1.1    usr/src/db/BTDBErr.C
+    1.1    usr/src/db/BTDBErr.H
+    1.1    usr/src/db/BTDBLock.C
+    1.1    usr/src/db/BTDBLock.H
+    1.1    usr/src/db/BTDBRecord.C
+    1.1    usr/src/db/BTDBRecord.H
+    1.1    usr/src/db/BTGameStats.C
+    1.1    usr/src/db/BTGameStats.H
+    1.1    usr/src/db/BTNetwork.H
+    1.1    usr/src/db/BTNetworkEntry.C
+    1.1    usr/src/db/BTNetworkEntry.H
+    1.1    usr/src/db/BTPlayer.C
+    1.1    usr/src/db/BTPlayer.H
+    1.1    usr/src/db/BTPlayerRecord.C
+    1.1    usr/src/db/BTPlayerRecord.H
+    1.1    usr/src/db/Makefile
+    1.1    usr/src/db/ParsedFile.C
+    1.1    usr/src/db/ParsedFile.H
+    1.1    usr/src/game/.del-BTArmor.s-Oct-20-01
+    1.1    usr/src/game/BTAbout.C
+    1.1    usr/src/game/BTArsenal.C
+    1.1    usr/src/game/BTArsenal.H
+    1.1    usr/src/game/BTBazaar.C
+    1.1    usr/src/game/BTBazaar.H
+    1.1    usr/src/game/BTBiff.C
+    1.1    usr/src/game/BTBiff.H
+    1.1    usr/src/game/BTBoard.C
+    1.1    usr/src/game/BTBoard.H
+    1.1    usr/src/game/BTBoardManager.C
+    1.1    usr/src/game/BTBoardManager.H
+    1.1    usr/src/game/BTBox.C
+    1.1    usr/src/game/BTBox.H
+    1.1    usr/src/game/BTCBoard.C
+    1.1    usr/src/game/BTCBoard.H
+    1.1    usr/src/game/BTChallenge.C
+    1.1    usr/src/game/BTChallenge.H
+    1.1    usr/src/game/BTChallengeDialog.C
+    1.1    usr/src/game/BTChallengeDialog.H
+    1.1    usr/src/game/BTCommManager.C
+    1.1    usr/src/game/BTCommManager.H
+    1.1    usr/src/game/BTComputer.C
+    1.1    usr/src/game/BTComputer.H
+    1.1    usr/src/game/BTConstants.H
+    1.1    usr/src/game/BTDebug.H
+    1.1    usr/src/game/BTDirs.H
+    1.1    usr/src/game/BTFallbacks.C
+    1.1    usr/src/game/BTGame.C
+    1.1    usr/src/game/BTGame.H
+    1.1    usr/src/game/BTLine.H
+    1.1    usr/src/game/BTList.C
+    1.1    usr/src/game/BTList.H
+    1.1    usr/src/game/BTMove.H
+    1.1    usr/src/game/BTMovePath.C
+    1.1    usr/src/game/BTMovePath.H
+    1.1    usr/src/game/BTNetManager.C
+    1.1    usr/src/game/BTNetManager.H
+    1.1    usr/src/game/BTPiece.C
+    1.1    usr/src/game/BTPiece.H
+    1.1    usr/src/game/BTPieceManager.C
+    1.1    usr/src/game/BTPieceManager.H
+    1.1    usr/src/game/BTPimp.C
+    1.1    usr/src/game/BTPimp.H
+    1.1    usr/src/game/BTProtocol.H
+    1.1    usr/src/game/BTRecon.C
+    1.1    usr/src/game/BTRecon.H
+    1.1    usr/src/game/BTRingNode.C
+    1.1    usr/src/game/BTRingNode.H
+    1.1    usr/src/game/BTRoster.C
+    1.1    usr/src/game/BTRoster.H
+    1.1    usr/src/game/BTScore.C
+    1.1    usr/src/game/BTScore.H
+    1.1    usr/src/game/BTScoreManager.C
+    1.1    usr/src/game/BTScoreManager.H
+    1.1    usr/src/game/BTSigHandlers.H
+    1.1    usr/src/game/BTSoundManager.C
+    1.1    usr/src/game/BTStack.C
+    1.1    usr/src/game/BTStack.H
+    1.1    usr/src/game/BTStartup.C
+    1.1    usr/src/game/BTStartup.H
+    1.1    usr/src/game/BTStopwatch.H
+    1.1    usr/src/game/BTTimeOut.H
+    1.1    usr/src/game/BTWeapon.H
+    1.1    usr/src/game/BTWeaponManager.C
+    1.1    usr/src/game/BTWeaponManager.H
+    1.1    usr/src/game/BattleTris.C
+    1.1    usr/src/game/BattleTris.H
+    1.1    usr/src/game/Makefile
+    1.1    usr/src/game/Mem.C
+    1.1    usr/src/game/Mem.H
+    1.1    usr/src/game/PPMReader.C
+    1.1    usr/src/game/PPMReader.H
+    1.1    usr/src/game/bt_fonts.txt
+    1.1    usr/src/man/BattleTris.1
+    1.1    usr/src/man/btref.1
+    1.1    usr/src/share/BattleTris.ad
+    1.1    usr/src/share/Makefile
+    1.1    usr/src/share/btweapons.db
+    1.1    usr/src/share/btweaponsp.db
+    1.1    usr/src/signals/Makefile
+    1.1    usr/src/signals/SigHandler.H
+    1.1    usr/src/signals/SigReceiver.C
+    1.1    usr/src/signals/SigReceiver.H
+    1.1    usr/src/sockets/Address.C
+    1.1    usr/src/sockets/Address.H
+    1.1    usr/src/sockets/Makefile
+    1.1    usr/src/sockets/PacketBuffer.C
+    1.1    usr/src/sockets/PacketBuffer.H
+    1.1    usr/src/sockets/Socket.C
+    1.1    usr/src/sockets/Socket.H
+    1.1    usr/src/sockets/SocketCB.H
+    1.1    usr/src/sockets/StreamSocket.C
+    1.1    usr/src/sockets/StreamSocket.H
+    1.1    usr/src/sockets/StreamSocketErr.C
+    1.1    usr/src/sockets/StreamSocketErr.H
+    1.1    usr/src/sockets/XtSocketCB.C
+    1.1    usr/src/sockets/XtSocketCB.H
+    1.1    usr/src/stdlib/AbsList.C
+    1.1    usr/src/stdlib/AbsList.H
+    1.1    usr/src/stdlib/AbsListElement.C
+    1.1    usr/src/stdlib/AbsListElement.H
+    1.1    usr/src/stdlib/AbsListIter.C
+    1.1    usr/src/stdlib/AbsListIter.H
+    1.1    usr/src/stdlib/Block.C
+    1.1    usr/src/stdlib/Block.H
+    1.1    usr/src/stdlib/List.C
+    1.1    usr/src/stdlib/List.H
+    1.1    usr/src/stdlib/ListElement.H
+    1.1    usr/src/stdlib/ListIter.H
+    1.1    usr/src/stdlib/Makefile
+    1.1    usr/src/stdlib/RWListIter.H
+    1.1    usr/src/widget/BTCheckBoxWidget.H
+    1.1    usr/src/widget/BTColor.H
+    1.1    usr/src/widget/BTDisplay.C
+    1.1    usr/src/widget/BTDisplay.H
+    1.1    usr/src/widget/BTDrawingAreaWidget.C
+    1.1    usr/src/widget/BTDrawingAreaWidget.H
+    1.1    usr/src/widget/BTFormWidget.C
+    1.1    usr/src/widget/BTFormWidget.H
+    1.1    usr/src/widget/BTFrameWidget.C
+    1.1    usr/src/widget/BTFrameWidget.H
+    1.1    usr/src/widget/BTLabelWidget.C
+    1.1    usr/src/widget/BTLabelWidget.H
+    1.1    usr/src/widget/BTMessageDlog.C
+    1.1    usr/src/widget/BTMessageDlog.H
+    1.1    usr/src/widget/BTPalette.H
+    1.1    usr/src/widget/BTPixmap.C
+    1.1    usr/src/widget/BTPixmap.H
+    1.1    usr/src/widget/BTPushButtonWidget.C
+    1.1    usr/src/widget/BTPushButtonWidget.H
+    1.1    usr/src/widget/BTRowColumnWidget.C
+    1.1    usr/src/widget/BTRowColumnWidget.H
+    1.1    usr/src/widget/BTScrolledListWidget.C
+    1.1    usr/src/widget/BTScrolledListWidget.H
+    1.1    usr/src/widget/BTScrolledTextWidget.C
+    1.1    usr/src/widget/BTScrolledTextWidget.H
+    1.1    usr/src/widget/BTStatusDlog.H
+    1.1    usr/src/widget/BTTextWidget.C
+    1.1    usr/src/widget/BTTextWidget.H
+    1.1    usr/src/widget/BTWidget.C
+    1.1    usr/src/widget/BTWidget.H
+    1.1    usr/src/widget/BTXColor.H
+    1.1    usr/src/widget/BTXDisplay.C
+    1.1    usr/src/widget/BTXDisplay.H
+    1.1    usr/src/widget/BTXPalette.C
+    1.1    usr/src/widget/BTXPalette.H
+    1.1    usr/src/widget/BTXSocketCB.H
+    1.1    usr/src/widget/BTXmUtils.C
+    1.1    usr/src/widget/BTXmUtils.H
+    1.1    usr/src/widget/Makefile
+
+commit 6d60cfcb51fca008b2a20df136fa8e814328a403
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sat Oct 20 13:35:41 2001
+
+    CodeManager Uniquification: src/config.log date and time created 01/10/20 13:35:41 by bmc
+
+    1.1    usr/src/config.log
+
+commit 8457548cf50c109c840b2d941969b0c7c1fda72f
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sat Oct 20 13:35:41 2001
+
+    CodeManager Uniquification: src/acconfig.h date and time created 01/10/20 13:35:41 by bmc
+
+    1.1    usr/src/acconfig.h
+
+commit 760df9c651537e671248f8bee150c9adf2c3fd1b
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sat Oct 20 13:35:33 2001
+
+    CodeManager Uniquification: src/game/BTSoundManager.H date and time created 01/10/20 13:35:33 by bmc
+
+    1.1    usr/src/game/BTSoundManager.H
+
+commit 0b7952cf44127521db606b6e4820f8628aefcf9a
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sat Oct 20 13:35:33 2001
+
+    CodeManager Uniquification: src/game/BTAbout.H date and time created 01/10/20 13:35:33 by bmc
+
+    1.1    usr/src/game/BTAbout.H
+
+commit b6e80a46fd9b36a839ff55e8a6d890ae9a5a4f9b
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sat Oct 20 13:35:11 2001
+
+    CodeManager Uniquification: src/art/btchalmask2.xbm date and time created 01/10/20 13:35:11 by bmc
+
+    1.1    usr/src/art/btchalmask2.xbm
+
+commit 8b8994608b1a6108e583f62163147debbb310785
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sat Oct 20 13:35:11 2001
+
+    CodeManager Uniquification: src/art/btchalmask.xbm date and time created 01/10/20 13:35:11 by bmc
+
+    1.1    usr/src/art/btchalmask.xbm
+
+commit 2125f4ae94030245fa0e0106e10789629cd24458
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sat Oct 20 13:35:11 2001
+
+    CodeManager Uniquification: src/art/btchalmask.xbm.old date and time created 01/10/20 13:35:11 by bmc
+
+    1.1    usr/src/art/btchalmask.xbm.old
+
+commit 4621496b5fd2c0c0290129f16b47f5b4d660dad1
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sat Oct 20 13:35:11 2001
+
+    CodeManager Uniquification: src/art/btchalmask.xpm date and time created 01/10/20 13:35:11 by bmc
+
+    1.1    usr/src/art/btchalmask.xpm
+
+commit f2e11cbaabce643fa2c939c221514b81dc874497
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sat Oct 20 13:35:03 2001
+
+    CodeManager Uniquification: src/stdlib/ListElement.C date and time created 01/10/20 13:35:03 by bmc
+
+    1.1    usr/src/stdlib/ListElement.C
+
+commit f1f6241b086d612ec6c9649fd0efba228bad3300
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sat Oct 20 13:35:03 2001
+
+    CodeManager Uniquification: src/stdlib/ListIter.C date and time created 01/10/20 13:35:03 by bmc
+
+    1.1    usr/src/stdlib/ListIter.C
+
+commit 915fa8151c83db51acf29c989199b3bf886334cc
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sat Oct 20 13:34:56 2001
+
+    CodeManager Uniquification: src/daemons/BTSDSignals.H date and time created 01/10/20 13:34:56 by bmc
+
+    1.1    usr/src/daemons/BTSDSignals.H
+
+commit 551249cf45a1894a2e7dea479b65731471a4edb6
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sat Oct 20 13:34:56 2001
+
+    CodeManager Uniquification: src/daemons/BTSlave.H date and time created 01/10/20 13:34:56 by bmc
+
+    1.1    usr/src/daemons/BTSlave.H
+
+commit 7240f69755bac812258f53c733b7b1c5c01c19b4
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sat Oct 20 13:34:52 2001
+
+    CodeManager Uniquification: src/btref/btcmds.H date and time created 01/10/20 13:34:52 by bmc
+
+    1.1    usr/src/btref/btcmds.H
+
+commit 597217b28eb51365ceac4545b42ad72d218933d8
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sat Oct 20 13:34:52 2001
+
+    CodeManager Uniquification: src/btref/Makefile date and time created 01/10/20 13:34:52 by bmc
+
+    1.1    usr/src/btref/Makefile
+
+commit 671fe9b861179ba94a2be96c41bd1b3231f006d2
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sat Oct 20 13:34:48 2001
+
+    CodeManager Uniquification: src/db/BTDBWriteLock.H date and time created 01/10/20 13:34:48 by bmc
+
+    1.1    usr/src/db/BTDBWriteLock.H
+
+commit a7cee1cc11d8df9b0bd18710b51080ad7b7f1f1e
+Author: Bryan Cantrill <bmc@eng.sun.com>
+Date:   Sat Oct 20 13:34:48 2001
+
+    CodeManager Uniquification: src/db/BTDBReadLock.H date and time created 01/10/20 13:34:48 by bmc
+
+    1.1    usr/src/db/BTDBReadLock.H
+
