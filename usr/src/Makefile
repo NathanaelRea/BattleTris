@@ -10,13 +10,16 @@ include ./Makeinclude
 
 all: config src
 
-config: ../include/BTConfig.H
+config: dirs ../include/BTConfig.H
+
+dirs:
+	@mkdir -p ../include ../lib ../bin
 
 ../include/BTConfig.H: BTConfig.H
 	@echo "+++ installing BattleTris configuration file"
 	sh ../bin/install-sh -c -m 0444 BTConfig.H ../include/BTConfig.H
 
-src:
+src: dirs
 	@echo "+++ building BattleTris include directory"
 	@( cd game && $(MAKE) common )
 	@echo "+++ building BattleTris standard library"

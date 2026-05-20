@@ -43,3 +43,11 @@ AR		= @AR@ ruc
 RANLIB		= @RANLIB@
 RM		= @RM@ -rf
 INSTALL		= @INSTALL@
+
+# Pattern rule for installing public headers into $(DSTINCDIR).
+# Sun make supplied this implicitly via its built-in suffix rules; GNU make
+# does not, so subdirectory Makefiles that list $(DSTINCDIR)/foo.H as a
+# dependency would otherwise have no rule to build it.
+$(DSTINCDIR)/%.H: %.H
+	@mkdir -p $(DSTINCDIR)
+	$(INSTALL) -m 0444 $< $@
