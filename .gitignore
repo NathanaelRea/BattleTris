@@ -21,3 +21,13 @@ usr/src/daemons/btserver.cf
 # Autoconf working files
 usr/src/autom4te.cache/
 usr/src/configure~
+
+# Daemon runtime artifacts
+usr/src/daemons/btserverd.log
+usr/src/daemons/btserverd.pid
+usr/src/daemons/btslaved*.log
+usr/src/daemons/btnetwork.dat
+usr/src/daemons/btnetwork.idx
+usr/src/daemons/btplayers.dat
+usr/src/daemons/btplayers.idx
+usr/src/btref/btref.tmpdb*
