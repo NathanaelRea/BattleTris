@@ -349,7 +349,7 @@ void BTCommManager::sendWeapon(BTWeapon *weapon)
 void
 BTCommManager::sendBoard(BTBoard *board)
 {
-	char buf[(BT_BOARD_HGT * BT_BOARD_WTH * sizeof (int)) +
+	char buf[(BT_BOARD_HGT * BT_BOARD_WTH * sizeof (unsigned long)) +
 	    (3 * sizeof(unsigned short))];
 	char *bufptr = buf;
 	unsigned short ts;
