@@ -7,6 +7,9 @@
 /****************************************************************/
 
 #include "BTConfig.H"
+
+#include <string.h>
+
 #include "BTStack.H"
 
 #define RESIZE_RATIO 2

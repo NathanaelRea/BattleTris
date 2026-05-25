@@ -17,6 +17,8 @@
 
 #include <assert.h>
 #include <fcntl.h>
+#include <string.h>
+#include <strings.h>
 
 #include "BTDB.H"
 #include "BTDBRecord.H"

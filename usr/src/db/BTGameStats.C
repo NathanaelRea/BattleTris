@@ -6,6 +6,10 @@
 /****************************************************************/
 
 #include "BTConfig.H"
+
+#include <string.h>
+#include <strings.h>
+
 #include "BTGameStats.H"
 #include "BTNetwork.H"
 

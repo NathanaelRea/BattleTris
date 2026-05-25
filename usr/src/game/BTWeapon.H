@@ -13,6 +13,8 @@
 #include "BTProtocol.H"
 #include "Block.H"
 
+#include <string.h>
+
 class BTWeapon {
 
 friend class BTCommManager;

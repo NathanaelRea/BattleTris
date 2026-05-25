@@ -19,6 +19,8 @@
 // releng note -- this needs to be autoconf'ed --mws
 #include <dirent.h>
 
+#include <time.h>
+
 #include "BattleTris.H"
 
 #include "BTDebug.H"

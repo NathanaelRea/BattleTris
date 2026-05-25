@@ -11,6 +11,7 @@
 #include "BTConfig.H"
 
 #include <netinet/in.h>
+#include <strings.h>
 
 #define BTNET_PUTLONG(bufptr, tmp, x) \
 tmp = htonl(x); \

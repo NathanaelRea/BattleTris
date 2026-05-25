@@ -11,6 +11,8 @@
 #include <iostream>
 using namespace std;
 
+#include <string.h>
+
 #include "ParsedFile.H"
 #include "BTConfigFile.H"
 

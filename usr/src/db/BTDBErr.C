@@ -6,6 +6,9 @@
 /****************************************************************/
 
 #include "BTConfig.H"
+
+#include <string.h>
+
 #include "BTDBErr.H"
 
 static char errmsg[255];

@@ -10,6 +10,8 @@
 
 #include "BTConfig.H"
 
+#include <sys/types.h>
+
 enum {
   BTDBRECORD_KEYLEN = 280
 };

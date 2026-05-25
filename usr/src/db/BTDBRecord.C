@@ -8,6 +8,8 @@
 #include "BTConfig.H"
 
 #include <assert.h>
+#include <string.h>
+#include <strings.h>
 
 #include "BTDBRecord.H"
 

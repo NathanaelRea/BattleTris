@@ -27,6 +27,8 @@ using namespace std;
 #include <stdio.h>
 #include <math.h>
 #include <pwd.h>
+#include <string.h>
+#include <strings.h>
 
 #include "BTGameStats.H"
 #include "BTNetwork.H"

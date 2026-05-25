@@ -11,6 +11,8 @@
 
 #include "BTConfig.H"
 
+#include <sys/types.h>
+
 class DevAudio {
 private:
 	int fd_, slave_fd_, master_fd_;
