@@ -170,33 +170,10 @@ void BTCommManager::receiveFromLocal(BTRingPacket *packet)
   pass(packet);
 }
 
-void BTCommManager::flushStash()
-{
-  // Ernie calls this method when he\'s done deciding...
-  BTRingPacket *packet;
-
-  while(stash_.remove_head(packet))
-    receiveFromSibling(packet);
-}
-
-void BTCommManager::clear()
-{
-  BTRingPacket *packet;
-
-  while(stash_.remove_head(packet))
-    delete packet;
-}
-
 void BTCommManager::receiveFromSibling(BTRingPacket *packet)
 {
   if(!(cain_ || sock_))
     return;
-
-  if(computer_ && (computer_->deciding())) {
-    // Ernie\'s making a move... hold da packets
-    stash_.insert_after_tail( packet );
-    return;
-  }
 
   switch(packet->token) {
 
@@ -501,8 +478,6 @@ void BTCommManager::recvArsenal()
 
 BTCommManager::~BTCommManager()
 {
-  clear();
-
   if(sock_) {
     pbuf_.sendpacket(BT_ERR);
     delete sock_;

@@ -230,8 +230,6 @@ void BTComputer::reset(int level)
 	} else {
 		update_freq_ = 1;
 	}
-
-  comm_manager_->clear();
 }
 
 void BTComputer::_cmptimeout_( void *data, unsigned long * )
@@ -1260,7 +1258,6 @@ int BTComputer::run()
   deciding_ = 0;
   
   if ( comm_manager_ ) {
-    comm_manager_->flushStash();
     comm_manager_->flushWeapons();
   }
   

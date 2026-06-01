@@ -35,7 +35,6 @@ private:
   SocketCB *gamecb_;
   BTWidget *widget_;
   List<BTWeaponToken> weapq_;
-  List<BTRingPacket *> stash_;
   BTBoard *board_buf_;
   BTPimp *pimp_;	// The street-walkin\' pimp
   BTCommManager *cain_;	// The evil brother CommManager
@@ -78,8 +77,6 @@ public:
   void receiveFromSibling(BTRingPacket *packet);
 
   void setComputer(BTComputer *computer) { computer_ = computer; }
-  void flushStash();
-  void clear();
 };
 
 #endif
