@@ -641,8 +641,7 @@ void BTNetManager::netupdate()
   char *bufptr;
   short err;
   int i;
-
-  unsigned long oldlen = netlen_;
+  unsigned long newlen;
 
   if((err = dbuf_.sendpacket(BT_QUER_NETDB)) < 0)
     goto neterr;
@@ -650,25 +649,30 @@ void BTNetManager::netupdate()
   if((err = dbuf_.recvpacket()) < 0)	// BT_RESP_DBLEN packet
     goto neterr;
 
-  netlen_ = *((unsigned long *) dbuf_.databuf());
-  netlen_ = ntohl(netlen_);
+  newlen = *((unsigned long *) dbuf_.databuf());
+  newlen = ntohl(newlen);
 
   if((err = dbuf_.recvpacket()) < 0)	// BT_RESP_NETDB packet
     goto neterr;
 
+  // Free the old arrays (still sized by netlen_) before committing the
+  // new length, and null them so a later fatalErr can't double-free or
+  // walk a stale length.
   if(netdata_ != 0) {
-    for(i = 0; i < oldlen; i++)
+    for(i = 0; i < netlen_; i++)
       delete netdata_[i];
     delete [] netdata_;
+    netdata_ = 0;
   }
 
   if(netbuf_ != 0) {
-    for(i = 0; i < oldlen; i++)
+    for(i = 0; i < netlen_; i++)
       delete [] netbuf_[i];
     delete [] netbuf_;
+    netbuf_ = 0;
   }
 
-  if(netlen_ == 0)
+  if((netlen_ = newlen) == 0)
     return;
 
   netdata_ = new BTNetworkEntry * [netlen_];
@@ -756,8 +760,7 @@ void BTNetManager::plyupdate()
   char *bufptr;
   short err;
   int i;
-
-  unsigned long oldlen = plylen_;
+  unsigned long newlen;
 
   if((err = dbuf_.sendpacket(BT_QUER_PLYDB)) < 0)
     goto neterr;
@@ -765,31 +768,37 @@ void BTNetManager::plyupdate()
   if((err = dbuf_.recvpacket()) < 0)	// BT_RESP_DBLEN packet
     goto neterr;
 
-  plylen_ = *((unsigned long *) dbuf_.databuf());
-  plylen_ = ntohl(plylen_);
+  newlen = *((unsigned long *) dbuf_.databuf());
+  newlen = ntohl(newlen);
 
   if((err = dbuf_.recvpacket()) < 0)	// BT_RESP_PLYDB packet
     goto neterr;
 
+  // Free the old arrays (still sized by plylen_) before committing the
+  // new length, and null them so a later fatalErr can't double-free or
+  // walk a stale length.
   if(plydata_ != 0) {
-    for(i = 0; i < oldlen; i++)
+    for(i = 0; i < plylen_; i++)
       delete plydata_[i];
     delete [] plydata_;
+    plydata_ = 0;
   }
 
   if(plynamebuf_ != 0) {
-    for(i = 0; i < oldlen; i++)
+    for(i = 0; i < plylen_; i++)
       delete [] plynamebuf_[i];
     delete [] plynamebuf_;
+    plynamebuf_ = 0;
   }
 
   if(plyrankbuf_ != 0) {
-    for(i = 0; i < oldlen; i++)
+    for(i = 0; i < plylen_; i++)
       delete [] plyrankbuf_[i];
     delete [] plyrankbuf_;
+    plyrankbuf_ = 0;
   }
 
-  if(plylen_ == 0)
+  if((plylen_ = newlen) == 0)
     return;
 
   plydata_ = new BTPlayer * [plylen_];
