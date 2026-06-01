@@ -41,12 +41,22 @@ void BTPimp::purchase (BTWeaponToken index) {
   purchases_[(int) index]++; 
 }
 
-int BTPimp::load() 
+#define READLINE(buf, file) \
+  do { \
+    if (fgets((buf), sizeof ((buf)), (file)) == NULL) \
+      goto out; \
+  } while ((buf)[0] == '#');
+
+//
+// Has worse code ever been written for a simpler operation?
+//
+int BTPimp::load()
 {
   char buffer1[1024];
   char buffer2[4096];
   char buffer3[1024];
   char buffer4[1024];
+  int i = 0;
 
   FILE *file,*file2;
 
@@ -55,14 +65,12 @@ int BTPimp::load()
 
   if(!(file2 = fopen(BTDB_WEAPONSP,"r")))
     return 0;
-   
-  int i = 0;
 
   while( i < max_weapons ) {
-    do {fgets(buffer1,sizeof(buffer1),file);} while ( buffer1[0]=='#' );
-    do {fgets(buffer2,sizeof(buffer2),file);} while ( buffer2[0]=='#' );
-    do {fgets(buffer3,sizeof(buffer3),file2);} while ( buffer3[0]=='#' );
-    do {fgets(buffer4,sizeof(buffer4),file2);} while ( buffer4[0]=='#' );
+    READLINE(buffer1, file);
+    READLINE(buffer2, file);
+    READLINE(buffer3, file2);
+    READLINE(buffer4, file2);
 
     if(!(buffer1[0] | buffer2[0] | buffer3[0] | buffer4[0]))
       return 0;
@@ -75,11 +83,22 @@ int BTPimp::load()
     delete cathouse_[i];
     cathouse_[i] = new BTWeapon(i, buffer1, buffer2, atoi(buffer3), atoi(buffer4));
     i++;
-    do {fgets(buffer4,sizeof(buffer4),file2);} while ( buffer4[0]=='#' );
+    READLINE(buffer4, file2);
   }
 
+out:
   fclose(file);
   fclose(file2);
+
+  //
+  // If we failed to read in all weapons, then we need to return failure.
+  //
+  if (i < max_weapons) {
+    cerr << "BattleTris: Bad weapons database: "
+         << "found " << i << " weapons; expected " << max_weapons
+         << endl;
+    return 0;
+  }
 
   return 1;
 }
