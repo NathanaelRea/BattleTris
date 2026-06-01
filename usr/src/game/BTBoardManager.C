@@ -271,19 +271,11 @@ void BTBoardManager::receive (BTRingPacket *packet) {
     old_lines_ = 0;
     upside_ = 0;
     break;
-  case BT_OP_SCORE: {
-    BTScore *op_score = (BTScore *) packet->data;
-
-    // If Lawyers\' Delite is active and the number of lines has increased,
-    // push the board up.
-    if (op_score->lines_ > old_lines_ && weapon_manager_->BTActive[BT_LAWYERS]) {
-      for (int i = 0; i < op_score->lines_ - old_lines_; i++)
-        insertLine();
-      redraw();
-    }
-    old_lines_ = op_score->lines_;
+  case BT_LAWYER:
+    // A Lawyers' Delite line-rise, sent explicitly (and piece-aware)
+    // by the owner of the weapon via BTGame::lawyers().  See 1000033.
+    insertLine();
     break;
-  } 
 
   case BT_WPN_ON: {
     actives_++;  // Why do we need this?

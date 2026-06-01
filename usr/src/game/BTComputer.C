@@ -218,6 +218,7 @@ void BTComputer::reset(int level)
   make_move_ = deciding_ = no_nice_day_ = next_launch_ = bazaar_ = 0;
   left_bazaar_ = op_left_bazaar_ = 0;
   lawyers_ = weapons_ = paused_ = condor_ = weapons_bought_ = 0;
+  old_lines_ = 0;
   piece_no_ = 0;
   next_weapon_ = BT_MONDALE;
   arsenal_ = 0;
@@ -278,7 +279,19 @@ void BTComputer::receive (BTRingPacket *packet) {
     lines_removed_ = ((BTLine *) packet->data)->inc();
     break;
   }
-    
+
+  case BT_OP_SCORE: {
+    // If Ernie holds a Lawyers' Delite, push his board up by one line
+    // for each line the opponent just cleared.
+    BTScore *op_score = (BTScore *) packet->data;
+    if (weapon_manager_->BTActive[BT_LAWYERS]) {
+      for (int i = 0; i < op_score->lines_ - old_lines_; i++)
+        send(BT_LAWYER, NULL);
+    }
+    old_lines_ = op_score->lines_;
+    break;
+  }
+
   case BT_START_BAZ: {
     removeTimer();
     BTDebug2("Received start baz token!");

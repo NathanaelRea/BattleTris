@@ -146,7 +146,8 @@ private:
   make_move_,   // keeps track of how many moves Ernie should make
   update_freq_, // number of pieces ernie uses before a condor update (used b/c super ernie)
   super_,       // are we super Ernie
-  rescan_;
+  rescan_,
+  old_lines_;   // opponent's line count, for Lawyers' Delite
 
   char name_[BT_ERNIE_NAME_LEN];
 

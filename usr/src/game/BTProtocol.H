@@ -29,6 +29,7 @@ enum BTToken {
   BT_END_BAZ,     // Opponent has finished making selection
   BT_GAME_OVER,   // Your game\'s over.  You suck.
   BT_AIRSLIDE,    // You made an airlide.  You rock.
+  BT_LAWYER,      // Lawyers' D.-induced rise-up.
 
   BT_PING = 30,   // An opponent is requesting your current status
   BT_BUSY,        // Currently busy--data is the login of an opponent

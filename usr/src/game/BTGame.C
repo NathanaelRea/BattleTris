@@ -474,6 +474,14 @@ void BTGame::receive (BTRingPacket *packet) {
 
     break;
   }
+  case BT_OP_SCORE: {
+    // Opponent's line count changed.  If we're holding a Lawyers'
+    // Delite, push our board up -- but piece-aware, via lawyers().
+    BTScore *op_score = (BTScore *) packet->data;
+    lawyers(op_score->lines_ - old_lines_);
+    old_lines_ = op_score->lines_;
+    break;
+  }
   case BT_BOARD: {
     if ( in_baz_ == 1) {
       pass(packet);
@@ -819,6 +827,46 @@ void BTGame::place(int force) {
 	DISPLAY->flush();
 }
 
+void
+BTGame::lawyers(int lines)
+{
+	int new_piece = 0, i;
+
+	if (!weapon_manager_->BTActive[BT_LAWYERS])
+		return;
+
+	for (i = 0; i < lines; new_piece ? new_piece = 0 : i++) {
+		/*
+		 * If Lawyers' Delite is active, we need to see if the piece
+		 * can move down.  If it can't (i.e., it's sliding), we need
+		 * to cancel the slide timeout and add the piece to the board.
+		 * If it can move down, we need to send a BT_LAWYER around
+		 * and recheck the piece.  If it cannot move down, we must
+		 * cancel the drop timeout and start the slide timeout.
+		 */
+		if (current_piece_ == NULL)
+			return;
+
+		if (sliding_ ||
+		    !current_piece_->canMoveTo(x_, y_ + delta_y_)) {
+			removeTimeOut(BT_DROP_TIMEOUT);
+			removeTimeOut(BT_SLICK_TIMEOUT);
+			removeTimeOut(BT_SLIDE_TIMEOUT);
+			place(1);
+			sliding_ = 0;
+			new_piece = 1;
+			continue;
+		}
+
+		if (!current_piece_->canMoveTo(x_, y_ + 2 * delta_y_))
+			startSlide();
+
+		send(BT_LAWYER, NULL);
+	}
+
+	board_->redraw();
+}
+
 void BTGame::startGame() {
   XmProcessTraversal (*drawing_area_, XmTRAVERSE_CURRENT);
   stopwatch_.restart();
@@ -864,6 +912,7 @@ void BTGame::cleanUp() {
 
 void BTGame::reset() {
   m = 0;
+  old_lines_ = 0;
   if ( current_piece_ )
     current_piece_->reset();
   current_piece_ = 0;
