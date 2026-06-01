@@ -325,12 +325,6 @@ void BTComputer::receive (BTRingPacket *packet) {
     switch (wpn->token()) {
       
     case BT_KEATING: {
-      pass(packet);
-/* How can I erase this?
-      BTWeapon temp(BT_REAGAN);
-      send(BT_WPN_LAUNCH,&temp);
-      return;
-      */
       break;
     }
     case BT_CARTER: {
