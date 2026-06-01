@@ -253,11 +253,13 @@ void BTBoardManager::flipOnVert() {
 void BTBoardManager::fill (int x, int y, BTBox *new_box) { 
   // Fill in the given location with the given box
   if ((x >= 0) && (x < width_) && (y >= 0) && (y < height_)) {
-    map_[x][y] = new_box; 
+    map_[x][y] = new_box;
     new_fill_[fill_count_++] = new_box;
   }
   else
-    assert ( 1 == 0);
+    // This box must have moved off of the board (due, e.g., to a
+    // BT_FALL_OUT).  Just delete the box.
+    delete new_box;
 }
 
 void BTBoardManager::receive (BTRingPacket *packet) {
