@@ -79,6 +79,11 @@ External implementation research packets are collected in
 Bevy API names, packaging notes, and rejected external alternatives. Keep this
 spec focused on legacy behavior and compatibility facts.
 
+High-risk implementation handoff notes are collected in
+`docs/legacy-implementation-handoff.md`. Fixture conventions are in
+`docs/core-fixtures.md`. Use those documents when implementing phase behavior so
+source quirks and fixture formats stay consistent across agents.
+
 Known quirks that need explicit tests or ADRs before changing:
 
 | Quirk                                                                                                                            | Initial decision                                                                                                     |
@@ -395,6 +400,6 @@ Phase 1 can start from these concrete contracts:
 
 | Question                                                                                                                              | Proposed phase                |
 | ------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------- |
-| Which exact local networking mode ships first: direct IP only, LAN discovery, or both?                                                | Phase 5 ADR.                  |
-| For MVP+ hosted/self-hosted play, should the server be authoritative, a relay with verification, or a lobby plus peer game transport? | Phase 5/6 ADR.                |
-| How should server-local rankings discover or label a community's "main" server without hard-coding a global ranking service?          | Phase 6 decision.             |
+| Should the fresh schema intentionally fix known legacy rank/stat update bugs, or preserve them for compatibility?                      | Phase 16 ADR or test decision. |
+| How should server-local rankings discover or label a community's "main" server without hard-coding a global ranking service?          | Phase 16 decision.            |
+| For MVP+ hosted/self-hosted play, should the server be authoritative, a relay with verification, or a lobby plus peer game transport? | Phase 17 ADR.                 |
