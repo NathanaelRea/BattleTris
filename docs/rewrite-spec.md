@@ -148,6 +148,20 @@ Known quirks that need explicit tests or ADRs before changing:
 | Mirror reflects supported launches back onto a mirrored launcher and nullifies the legacy exception matrix after consuming the arsenal quantity.                                                                                                                                    | `usr/src/game/BTWeaponManager.C:191-219`                                                                                 | Implemented in `battletris-core::game` with explicit reflected/nullified launch events. |
 | Spy weapons live on the launcher, produce deterministic recon board/funds snapshots after target placements, and use the William Ames/Ace/Condor visibility tiers.                                                                                                                   | `usr/src/game/BTRecon.C:54-118`, `usr/src/game/BTRecon.C:171-210`, `usr/src/game/BTGame.C:781-793`                       | Implemented in `battletris-core::recon` and emitted by `battletris-core::game`; client display and protocol payloads remain adapter work. |
 
+## Client Presentation And Settings
+
+Phase 13 adds the first Bevy client shell beyond the playfield. The client owns
+screen navigation, local settings, theme selection, control layouts, and semantic
+sound-event mapping while gameplay decisions remain in `battletris-core`.
+
+| Area | Implementation note |
+| --- | --- |
+| Startup/menu flow | `battletris-client` exposes startup, challenge placeholder, settings, about placeholder, roster placeholder, sleep placeholder, and game screens through keyboard shortcuts. Challenge remains a placeholder until protocol/networking phases. |
+| Local modes | Startup can launch local human-vs-human or unranked human-vs-computer. Computer play uses the deterministic core `ComputerOpponent` for placement commands and the core `HumanVsComputer` mode for unranked status. |
+| Settings | Runtime settings cover theme, sound-pack selection, control layout, and pixel scale. Persistence to platform config paths remains Phase 16/18 polish. |
+| Themes/assets | The default theme is original-inspired scalable sprites; a high-contrast theme validates the swappable theme boundary without blocking on final art packs. |
+| Audio | The client maps core `BattleEvent`/`CoreEvent` values to semantic `SoundEvent` categories such as menu action, line clear, bazaar, weapon launch, warning, and game over. The generated-default versus muted pack setting validates a swappable sound-pack boundary before recovered audio exists. |
+
 ## Protocol And Networking
 
 ### Legacy Protocol Facts

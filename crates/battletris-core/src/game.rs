@@ -396,6 +396,13 @@ impl PieceLoop {
         self.active.as_ref()
     }
 
+    /// Returns the next generated piece kind without advancing this loop.
+    #[must_use]
+    pub fn next_piece_kind_preview(&self) -> PieceKind {
+        let mut generator = self.generator.clone();
+        generator.next_piece().kind()
+    }
+
     /// Returns the current score.
     #[must_use]
     pub const fn score(&self) -> i32 {

@@ -50,7 +50,7 @@ Platform notes:
 
 | Platform | Notes |
 | --- | --- |
-| Linux | Enable both `x11` and `wayland` for v1. Bevy's winit path should select the available session backend at runtime. Source builds may need normal graphics/windowing development packages. |
+| Linux | Enable `x11` by default and keep `wayland` available behind the client `wayland` Cargo feature. Bevy's winit path should select an available compiled backend at runtime; Wayland source builds need normal Wayland development packages. |
 | macOS | Use the same Bevy feature set without platform-specific code in core. Verify Metal-backed renderer startup in packaged smoke tests. |
 | Windows | Keep feature choices compatible with standard winit/wgpu desktop builds. Verify asset path and SQLite bundled behavior on Windows before release. |
 

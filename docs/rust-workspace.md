@@ -29,7 +29,7 @@ added preemptively.
 | --- | --- |
 | `battletris-core` | `rand = "0.10.1"` and `rand_chacha = "0.10.0"` with OS/thread RNG features disabled, as accepted in ADR 0002. Keep Bevy, sockets, database drivers, and platform APIs out. |
 | `battletris-protocol` | `serde = "1.0.228"` with `derive`, `postcard = "1.1.3"` with `use-std`, and `bytes = "1.12.0"`, as accepted in ADR 0003. |
-| `battletris-client` | `bevy = "0.19.0"` once the workspace is on Rust `1.95.0` or newer. Use explicit 2D/audio/UI/png/wav/vorbis/x11/wayland features rather than Bevy defaults. Use Bevy UI plus a local action map before considering `bevy_egui` or `leafwing-input-manager`. |
+| `battletris-client` | `bevy = "0.19.0"` once the workspace is on Rust `1.95.0` or newer. Use explicit 2D/audio/UI/png/wav/vorbis/x11 features rather than Bevy defaults, with Wayland available through the client `wayland` Cargo feature for environments with Wayland development packages. Use Bevy UI plus a local action map before considering `bevy_egui` or `leafwing-input-manager`. |
 | `battletris-client` settings | `directories = "6.0.0"` and `toml = "1.1.2+spec-1.1.0"` when settings persistence is implemented. |
 | `battletris-client` networking | `tokio = "1.52.3"`, `tokio-util = "0.7.18"`, and `mdns-sd = "0.20.1"` for direct TCP connect plus optional LAN discovery, as accepted in ADR 0004. |
 | `battletris-db` | `rusqlite = "0.40.1"` with `bundled`, `refinery = "0.9.2"` with `rusqlite-bundled`, and `directories = "6.0.0"`, as accepted in ADR 0005. |

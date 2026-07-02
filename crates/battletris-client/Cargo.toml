@@ -5,7 +5,33 @@ edition.workspace = true
 publish.workspace = true
 description = "BattleTris desktop client, rendering, input, menus, assets, and audio."
 
+[[bin]]
+name = "client"
+path = "src/main.rs"
+
 [lints]
 workspace = true
 
 [dependencies]
+battletris-core = { path = "../battletris-core" }
+bevy = { version = "0.19.0", default-features = false, features = [
+    "bevy_asset",
+    "bevy_core_pipeline",
+    "bevy_log",
+    "bevy_render",
+    "bevy_sprite",
+    "bevy_sprite_render",
+    "bevy_text",
+    "bevy_winit",
+    "default_font",
+    "multi_threaded",
+    "png",
+    "x11",
+] }
+
+[features]
+default = []
+wayland = ["bevy/wayland"]
+
+[dev-dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }
