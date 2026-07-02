@@ -1,0 +1,11 @@
+[package]
+name = "battletris-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Deterministic BattleTris rules, state, events, and AI primitives."
+
+[lints]
+workspace = true
+
+[dependencies]

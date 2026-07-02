@@ -1,0 +1,11 @@
+[package]
+name = "battletris-db"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "BattleTris player profiles, ranking, statistics, and persistence."
+
+[lints]
+workspace = true
+
+[dependencies]

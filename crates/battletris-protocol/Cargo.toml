@@ -1,0 +1,11 @@
+[package]
+name = "battletris-protocol"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "BattleTris network messages, framing, versioning, and compatibility fixtures."
+
+[lints]
+workspace = true
+
+[dependencies]

@@ -33,3 +33,4 @@ usr/src/daemons/btplayers.idx
 usr/src/btref/btref.tmpdb*
 
 plan*.md
+target/

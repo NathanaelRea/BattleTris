@@ -1,0 +1,11 @@
+[package]
+name = "battletris-tools"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "BattleTris asset, audio, replay, protocol, and legacy extraction tools."
+
+[lints]
+workspace = true
+
+[dependencies]

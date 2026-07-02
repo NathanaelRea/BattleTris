@@ -1,0 +1,11 @@
+[package]
+name = "battletris-server"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Optional BattleTris lobby, relay, or dedicated server service."
+
+[lints]
+workspace = true
+
+[dependencies]

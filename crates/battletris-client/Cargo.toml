@@ -1,0 +1,11 @@
+[package]
+name = "battletris-client"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "BattleTris desktop client, rendering, input, menus, assets, and audio."
+
+[lints]
+workspace = true
+
+[dependencies]

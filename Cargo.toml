@@ -1,0 +1,23 @@
+[workspace]
+members = [
+    "crates/battletris-client",
+    "crates/battletris-core",
+    "crates/battletris-db",
+    "crates/battletris-protocol",
+    "crates/battletris-server",
+    "crates/battletris-tools",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[workspace.lints.rustdoc]
+bare_urls = "deny"
+broken_intra_doc_links = "deny"
