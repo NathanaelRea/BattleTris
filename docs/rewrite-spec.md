@@ -65,14 +65,19 @@ Modernization decisions for the rewrite:
 
 | Area                | Modernize                                                                                                                                                                                                                    |
 | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Rendering/UI        | Replace Motif/X11 with Bevy while preserving screens and flows. The default theme should evoke the original Motif-era presentation, but Motif internals should not leak into core rules or data models.                      |
-| Assets              | Treat art, fonts, themes, and sounds as data packs. Use generated/source-controlled audio first; recovered original sounds are optional.                                                                                     |
-| Network format      | Do not preserve C++ ABI details like `unsigned long` packet sizes. Define a versioned fixed-width Rust protocol and write compatibility notes/tests from the legacy behavior.                                                |
-| Networking topology | Preserve challenge/start/play/bazaar/game-over flow, but do not require the old server/slave direct-peer architecture. V1 starts with local networking; hosted/self-hosted server, relay, lobby, and internet play are MVP+. |
+| Rendering/UI        | Replace Motif/X11 with Bevy while preserving screens and flows. Current external recommendation is Bevy `0.19.0`, sprite/atlas board rendering, Bevy UI for player screens, and a local action map. Motif internals should not leak into core rules or data models. |
+| Assets              | Treat art, fonts, themes, and sounds as data packs. Use generated/source-controlled audio first; recovered original sounds are optional. See `docs/external-research.md` for the theme and sound-pack layout.              |
+| Network format      | Do not preserve C++ ABI details like `unsigned long` packet sizes. ADR 0003 selects a fixed-width frame envelope with postcard payloads and compatibility fixtures.                                                            |
+| Networking topology | Preserve challenge/start/play/bazaar/game-over flow, but do not require the old server/slave direct-peer architecture. ADR 0004 selects direct TCP connect plus best-effort LAN discovery for Phase 15.                    |
 | Identity            | Do not bind new identity to Unix login/GECOS/plan files. V1 should not require accounts; MVP+ hosted/self-hosted servers can issue identities.                                                                               |
-| Persistence         | Do not port the hash-file DB implementation unless needed for import. Recreate the data model with migrations, plus optional import/export tooling if legacy records appear.                                                 |
+| Persistence         | Do not port the hash-file DB implementation unless needed for import. ADR 0005 selects SQLite, migrations, and cross-platform project paths for the fresh schema.                                                              |
 | Build               | Replace Make/autoconf and custom containers with Cargo workspace, CI, tests, clippy, formatting, and idiomatic Rust collections.                                                                                             |
 | Platform support    | Keep platform-specific code behind adapters so the v1 target set can include Linux, macOS, and Windows.                                                                                                                      |
+
+External implementation research packets are collected in
+`docs/external-research.md`. Use that document for crate versions, feature flags,
+Bevy API names, packaging notes, and rejected external alternatives. Keep this
+spec focused on legacy behavior and compatibility facts.
 
 Known quirks that need explicit tests or ADRs before changing:
 
@@ -393,4 +398,3 @@ Phase 1 can start from these concrete contracts:
 | Which exact local networking mode ships first: direct IP only, LAN discovery, or both?                                                | Phase 5 ADR.                  |
 | For MVP+ hosted/self-hosted play, should the server be authoritative, a relay with verification, or a lobby plus peer game transport? | Phase 5/6 ADR.                |
 | How should server-local rankings discover or label a community's "main" server without hard-coding a global ranking service?          | Phase 6 decision.             |
-| What level of ADR/process documentation should agents be required to update per module?                                               | Development-process decision. |
