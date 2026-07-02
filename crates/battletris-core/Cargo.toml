@@ -9,3 +9,5 @@ description = "Deterministic BattleTris rules, state, events, and AI primitives.
 workspace = true
 
 [dependencies]
+rand = { version = "0.10.1", default-features = false, features = ["std"] }
+rand_chacha = { version = "0.10.0", default-features = false, features = ["std"] }
