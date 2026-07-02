@@ -7,6 +7,7 @@
 //! `battletris-core` must not depend on Bevy, rendering, input devices, sockets,
 //! databases, or platform UI APIs. Those concerns belong to adapter crates.
 
+pub mod ai;
 pub mod board;
 pub mod cell;
 pub mod fixtures;

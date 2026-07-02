@@ -55,6 +55,8 @@ pub enum RngStream {
     HappyQueue,
     /// Future weapon random effects.
     WeaponEffects,
+    /// Computer opponent shopping and tie-breaking.
+    ComputerOpponent,
 }
 
 impl RngStream {
@@ -64,6 +66,7 @@ impl RngStream {
             Self::DicePips => b"dice-pips",
             Self::HappyQueue => b"happy-queue",
             Self::WeaponEffects => b"weapon-effects",
+            Self::ComputerOpponent => b"computer-opponent",
         }
     }
 }

@@ -4,6 +4,7 @@
 //! adapters can render, send, or record without coupling core logic to those adapters.
 
 use crate::{
+    ai::ComputerDifficulty,
     board::{Board, LineClearMode, BOARD_HEIGHT},
     cell::Cell,
     piece::{Piece, PieceKind},
@@ -156,6 +157,28 @@ pub enum GamePhase {
     Bazaar,
     /// One player has died and the match is complete.
     GameOver,
+}
+
+/// Whether a BattleTris Game result is eligible for ranked persistence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GameMode {
+    /// Both players are human-controlled; ranked adapters may submit the result.
+    HumanVsHuman,
+    /// One player is a deterministic computer opponent; legacy mode is unranked.
+    HumanVsComputer {
+        /// Computer-controlled player slot.
+        computer: PlayerId,
+        /// Computer opponent difficulty row.
+        difficulty: ComputerDifficulty,
+    },
+}
+
+impl GameMode {
+    /// Returns whether this game mode may write ranked results.
+    #[must_use]
+    pub const fn is_ranked(self) -> bool {
+        matches!(self, Self::HumanVsHuman)
+    }
 }
 
 /// Deterministic event boundary consumed by renderers, audio, networking, replays, and tests.
@@ -754,6 +777,7 @@ pub struct TwoPlayerGame {
     bazaar_sessions: [Option<Bazaar>; 2],
     incoming_weapons: [VecDeque<QueuedWeapon>; 2],
     cached_opponent_funds: [i32; 2],
+    mode: GameMode,
     log: Vec<LoggedEvent>,
 }
 
@@ -777,6 +801,49 @@ impl TwoPlayerGame {
         player_two_seed: GameSeed,
         player_two_board: Board,
     ) -> Self {
+        Self::with_boards_and_mode(
+            player_one_seed,
+            player_one_board,
+            player_two_seed,
+            player_two_board,
+            GameMode::HumanVsHuman,
+        )
+    }
+
+    /// Starts an unranked human-vs-computer game with explicit boards.
+    #[must_use]
+    pub fn human_vs_computer(
+        human_seed: GameSeed,
+        human_board: Board,
+        computer_seed: GameSeed,
+        computer_board: Board,
+        computer: PlayerId,
+        difficulty: ComputerDifficulty,
+    ) -> Self {
+        let (player_one_seed, player_one_board, player_two_seed, player_two_board) = match computer
+        {
+            PlayerId::One => (computer_seed, computer_board, human_seed, human_board),
+            PlayerId::Two => (human_seed, human_board, computer_seed, computer_board),
+        };
+        Self::with_boards_and_mode(
+            player_one_seed,
+            player_one_board,
+            player_two_seed,
+            player_two_board,
+            GameMode::HumanVsComputer {
+                computer,
+                difficulty,
+            },
+        )
+    }
+
+    fn with_boards_and_mode(
+        player_one_seed: GameSeed,
+        player_one_board: Board,
+        player_two_seed: GameSeed,
+        player_two_board: Board,
+        mode: GameMode,
+    ) -> Self {
         let (player_one, player_one_events) =
             PieceLoop::with_board(player_one_seed, player_one_board);
         let (player_two, player_two_events) =
@@ -791,6 +858,7 @@ impl TwoPlayerGame {
             bazaar_sessions: [None, None],
             incoming_weapons: [VecDeque::new(), VecDeque::new()],
             cached_opponent_funds: [0, 0],
+            mode,
             log: Vec::new(),
         };
 
@@ -799,6 +867,18 @@ impl TwoPlayerGame {
         game.record_player_events(PlayerId::Two, player_two_events);
         game.detect_startup_deaths();
         game
+    }
+
+    /// Returns the control/ranking mode for this BattleTris Game.
+    #[must_use]
+    pub const fn mode(&self) -> GameMode {
+        self.mode
+    }
+
+    /// Returns whether adapters may submit this result to ranked persistence.
+    #[must_use]
+    pub const fn is_ranked_game(&self) -> bool {
+        self.mode.is_ranked()
     }
 
     /// Returns the current session phase.
@@ -1415,10 +1495,11 @@ const fn timed_effect_target(launcher: PlayerId, target: PlayerId, token: Weapon
 #[cfg(test)]
 mod tests {
     use super::{
-        BattleEvent, Command, CoreEvent, GamePhase, PieceLoop, PlayerId, ShoppingError,
+        BattleEvent, Command, CoreEvent, GameMode, GamePhase, PieceLoop, PlayerId, ShoppingError,
         TwoPlayerGame, DEFAULT_DROP_MS, DEFAULT_SLIDE_MS,
     };
     use crate::{
+        ai::computer_difficulty,
         board::{Board, Coord, LineClearMode, LineClearOutcome, BOARD_HEIGHT, BOARD_WIDTH},
         cell::{Cell, Pip},
         piece::PieceKind,
@@ -1576,6 +1657,29 @@ mod tests {
                 event: CoreEvent::PieceSpawned { .. }
             }
         ));
+    }
+
+    #[test]
+    fn human_vs_computer_games_are_unranked() {
+        let difficulty = computer_difficulty(14).unwrap();
+        let game = TwoPlayerGame::human_vs_computer(
+            GameSeed::from_u64(1),
+            Board::empty(),
+            GameSeed::from_u64(2),
+            Board::empty(),
+            PlayerId::Two,
+            difficulty,
+        );
+
+        assert_eq!(
+            game.mode(),
+            GameMode::HumanVsComputer {
+                computer: PlayerId::Two,
+                difficulty,
+            }
+        );
+        assert!(!game.is_ranked_game());
+        assert!(GameMode::HumanVsHuman.is_ranked());
     }
 
     #[test]
