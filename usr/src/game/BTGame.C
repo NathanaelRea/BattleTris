@@ -424,6 +424,74 @@ void BTGame::exposeEvent () {
   }
 }
 
+void BTGame::showBazaarFixture() {
+  strcpy(opponent_msg_, "Playing Visual Fixture");
+  message_->setLabel(opponent_msg_);
+
+  form_->manage();
+  exposeEvent();
+
+  score_manager_->rep_.score_ = 48250;
+  score_manager_->rep_.op_score_ = 37600;
+  score_manager_->rep_.lines_ = 20;
+  score_manager_->rep_.op_lines_ = 12;
+  score_manager_->rep_.funds_ = 650;
+  score_manager_->rep_.op_funds_ = 425;
+  score_manager_->updateDisplay();
+
+  weapon_manager_->arsenal_->clear();
+  weapon_manager_->arsenal_->buyWeapon((*pimp_)[BT_GIMP]);
+  weapon_manager_->arsenal_->buyWeapon((*pimp_)[BT_FLIP_OUT]);
+  weapon_manager_->arsenal_->buyWeapon((*pimp_)[BT_RISE_UP]);
+  weapon_manager_->update();
+
+  sendPlusMe(BT_START_BAZ, 0);
+  bazaar_->setMessage("Legacy visual fixture: bazaar shopping.");
+  bazaar_->message_->manage();
+}
+
+void BTGame::showReconFixture() {
+  strcpy(opponent_msg_, "Playing Visual Fixture");
+  message_->setLabel(opponent_msg_);
+
+  form_->manage();
+  exposeEvent();
+
+  score_manager_->rep_.score_ = 48250;
+  score_manager_->rep_.op_score_ = 37600;
+  score_manager_->rep_.lines_ = 18;
+  score_manager_->rep_.op_lines_ = 24;
+  score_manager_->rep_.funds_ = 650;
+  score_manager_->rep_.op_funds_ = 425;
+  score_manager_->lines_til_baz_ = 18;
+
+  board_->clear();
+  int colors[] = { BT_RED, BT_BLUE, BT_ORANGE, BT_GREEN, BT_CYAN, BT_PURPLE };
+  for (int y = 21; y < BT_BOARD_HGT; y++) {
+    for (int x = 0; x < BT_BOARD_WTH; x++) {
+      if (((x + y) % 4) == 0)
+        continue;
+      board_->fill(x, y, board_->box_manager_->create(x, y, colors[(x + y) % 6]));
+    }
+  }
+  board_->fill(0, 20, board_->box_manager_->structureCreate(0, 20));
+  board_->fill(2, 20, board_->box_manager_->dieCreate(2, 20, 5));
+  board_->fill(4, 20, board_->box_manager_->happyCreate(4, 20));
+  board_->fill(6, 20, board_->box_manager_->createGimp(6, 20));
+  board_->redraw();
+
+  sendPlusMe(BT_WPN_LAUNCH, (*pimp_)[BT_CONDOR]);
+  recon_->spy_on_ = 65535;
+  score_manager_->spy_on_ = 1;
+  score_manager_->updateDisplay();
+  DISPLAY->flush();
+
+  recon_->exposeEvent();
+  BTBoard snapshot(board_);
+  snapshot.motivation(BT_CONDOR);
+  sendPlusMe(BT_BOARD, &snapshot);
+}
+
 void BTGame::leaveBazaar() {
   
   BTDebug ("Everyone has exited...now leaving bazaar.");

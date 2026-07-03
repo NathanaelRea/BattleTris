@@ -136,6 +136,8 @@ public:
 	    BTPixmap *gimp = NULL);
 	~BTGame();
 	void receive(BTRingPacket *packet);
+	void showBazaarFixture();
+	void showReconFixture();
 	void startGame();
 	void endGame();
 	void pause(int no_send = 0);

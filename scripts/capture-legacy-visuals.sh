@@ -9,8 +9,8 @@ original_args=("$@")
 usage() {
     printf '%s\n' "Usage: $0 [--out-dir target/visual/legacy] [--fixture NAME ...]"
     printf '%s\n' ""
-    printf '%s\n' "Default fixtures: startup challenge sleep about roster game-playing"
-    printf '%s\n' "Reachable fixtures: startup challenge sleep about roster game-playing"
+    printf '%s\n' "Default fixtures: startup challenge sleep about roster game-playing game-bazaar game-recon"
+    printf '%s\n' "Reachable fixtures: startup challenge sleep about roster game-playing game-bazaar game-recon"
 }
 
 for arg in "$@"; do
@@ -63,7 +63,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ${#fixtures[@]} -eq 0 ]]; then
-    fixtures=(startup challenge sleep about roster game-playing)
+    fixtures=(startup challenge sleep about roster game-playing game-bazaar game-recon)
 fi
 
 write_manifest() {
@@ -221,6 +221,18 @@ capture_fixture() {
             click_window "$window" 170 488
             window=$(wait_for_window)
             sleep 0.5
+            capture_window "$window" "$output"
+            ;;
+        game-bazaar)
+            legacy_pid=$(BATTLETRIS_LEGACY_FIXTURE=game-bazaar run_legacy "$fixture" -X -m)
+            window=$(wait_for_window)
+            sleep 1.0
+            capture_window "$window" "$output"
+            ;;
+        game-recon)
+            legacy_pid=$(BATTLETRIS_LEGACY_FIXTURE=game-recon run_legacy "$fixture" -X -m)
+            window=$(wait_for_window)
+            sleep 1.0
             capture_window "$window" "$output"
             ;;
         *)

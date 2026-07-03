@@ -341,6 +341,18 @@ void BTStartup::showGame() {
   parent_->noResize();
 }  
 
+void BTStartup::showBazaarFixture() {
+  showGame();
+  game_->showBazaarFixture();
+  location_ = BT_ERNIE;
+}
+
+void BTStartup::showReconFixture() {
+  showGame();
+  game_->showReconFixture();
+  location_ = BT_ERNIE;
+}
+
 void BTStartup::hideGame() {
   game_->form_->unmanage();
   show(0);

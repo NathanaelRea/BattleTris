@@ -83,6 +83,8 @@ public:
 
   void showGame();
   void hideGame();
+  void showBazaarFixture();
+  void showReconFixture();
 
   void childDied();
 

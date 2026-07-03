@@ -21,6 +21,7 @@ using namespace std;
 
 #if STDC_HEADERS
 # include <stdlib.h>
+# include <string.h>
 #endif
 
 #include "SigReceiver.H"
@@ -699,7 +700,15 @@ int main(int argc, char *argv[])
 
   XtRealizeWidget(g_toplevel);
 
-  if(g_resources.sleep)
+  const char *legacy_fixture = getenv("BATTLETRIS_LEGACY_FIXTURE");
+  if(legacy_fixture && strcmp(legacy_fixture, "game-bazaar") == 0)
+    g_startup->showBazaarFixture();
+  else if(legacy_fixture && strcmp(legacy_fixture, "game-recon") == 0)
+    g_startup->showReconFixture();
+  else if(legacy_fixture) {
+    cerr << "BattleTris: unknown legacy fixture: " << legacy_fixture << endl;
+    bt_terminate(BT_USAGE);
+  } else if(g_resources.sleep)
     g_startup->handleSleep();
   else
     g_startup->show(1);
