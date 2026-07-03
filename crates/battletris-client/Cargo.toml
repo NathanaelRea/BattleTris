@@ -15,8 +15,10 @@ workspace = true
 [dependencies]
 battletris-core = { path = "../battletris-core" }
 battletris-db = { path = "../battletris-db" }
+battletris-protocol = { path = "../battletris-protocol" }
 bevy = { version = "0.19.0", default-features = false, features = [
     "bevy_asset",
+    "bevy_audio",
     "bevy_core_pipeline",
     "bevy_log",
     "bevy_render",
@@ -27,15 +29,14 @@ bevy = { version = "0.19.0", default-features = false, features = [
     "default_font",
     "multi_threaded",
     "png",
+    "wav",
     "x11",
 ] }
 directories = "6.0.0"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.1.2"
 
 [features]
 default = []
 wayland = ["bevy/wayland"]
-
-[dev-dependencies]
-image = { version = "0.25.10", default-features = false, features = ["png"] }

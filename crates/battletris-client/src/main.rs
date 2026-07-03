@@ -7,23 +7,32 @@
 use battletris_core::{
     ai::{computer_difficulty, ComputerOpponent, BAZAAR_LEAVE_DELAY_MS, COMPUTER_DIFFICULTIES},
     board::{Board, Coord, BOARD_HEIGHT, BOARD_WIDTH},
-    cell::Cell,
+    cell::{Cell, Pip, VisibleColor},
     game::{BattleEvent, Command, CoreEvent, GameMode, GamePhase, PlayerId, TwoPlayerGame},
     piece::PieceKind,
-    recon::ReconSnapshot,
+    recon::{ReconLevel, ReconSnapshot},
     rng::GameSeed,
     weapons::{weapon_spec, WeaponToken, WEAPON_CATALOG},
 };
 use battletris_db::{CommunityLabel, PersistencePaths, PlayerStore, StreakKind};
+use battletris_protocol::{
+    HostedPlayer, LobbyRegister, CAPABILITY_DIRECT_TCP, CAPABILITY_SELF_HOSTED_LOBBY,
+    PROTOCOL_MAJOR, PROTOCOL_MINOR,
+};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured};
 use bevy::window::PrimaryWindow;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use std::{ffi::OsStr, fmt::Write as _, fs, path::PathBuf};
+use std::{
+    ffi::{OsStr, OsString},
+    fmt::Write as _,
+    fs,
+    path::{Path, PathBuf},
+};
 
-const SMOKE_SCREENSHOT_CAPTURE_DELAY_FRAMES: u16 = 5;
+const SMOKE_SCREENSHOT_CAPTURE_DELAY_FRAMES: u16 = 30;
 const SMOKE_SCREENSHOT_TIMEOUT_FRAMES: u16 = 300;
 const SETTINGS_FILE_NAME: &str = "settings.toml";
 const CLIENT_FIXED_TICK_MS: u64 = 10;
@@ -32,30 +41,87 @@ const INPUT_REPEAT_MS: u64 = 50;
 const DEFAULT_ERNIE_LEVEL: usize = 7;
 
 fn main() {
-    let smoke_screenshot = smoke_screenshot_path().map(SmokeScreenshot::new);
-    let settings = ClientSettings::load_or_default();
+    let run_config = ClientRunConfig::from_env().unwrap_or_else(|error| {
+        eprintln!("{error}\n\n{}", client_usage());
+        std::process::exit(2);
+    });
+    run_client(run_config);
+}
+
+fn run_client(run_config: ClientRunConfig) {
+    let mut settings = if run_config.deterministic_capture {
+        ClientSettings::default()
+    } else {
+        ClientSettings::load_or_default()
+    };
+    if run_config.deterministic_capture {
+        settings.sound_pack = SoundPackChoice::Muted;
+        settings.settings_path = None;
+        settings.pixel_scale = 1.0;
+    }
     let themes = ThemePacks::load(&settings.assets_dir);
+    let sound_packs = SoundPacks::load(&settings.assets_dir);
+    let visual_capture = run_config
+        .capture
+        .as_ref()
+        .map(|spec| spec.to_capture(&themes, settings.theme));
+    if let Some(capture) = &visual_capture {
+        if let Some(job) = capture.jobs.first() {
+            settings.theme = job.theme;
+        }
+    }
     let window = themes.get(settings.theme).layout.window;
+    let mut local_game = LocalGame::new_human_vs_human();
+    let mut recon_panel = ReconPanel::default();
+    let mut bazaar_ui = BazaarUiState::default();
+    let mut roster_records = if run_config.deterministic_capture {
+        visual_roster_records()
+    } else {
+        RosterRecords::load()
+    };
+    if let Some(capture) = &visual_capture {
+        if let Some(job) = capture.jobs.first() {
+            apply_visual_fixture_state(
+                job.fixture,
+                &mut settings,
+                &mut local_game,
+                &mut recon_panel,
+                &mut bazaar_ui,
+                &mut roster_records,
+            );
+        }
+    }
+    let asset_file_path = settings.assets_dir.to_string_lossy().into_owned();
     let mut app = App::new();
     app.insert_resource(ClearColor(themes.get(settings.theme).palette.background))
-        .insert_resource(LocalGame::new_human_vs_human())
+        .insert_resource(local_game)
         .insert_resource(ClientTickClock::default())
         .insert_resource(InputRepeatState::default())
-        .insert_resource(ReconPanel::default())
-        .insert_resource(BazaarUiState::default())
+        .insert_resource(recon_panel)
+        .insert_resource(bazaar_ui)
         .insert_resource(themes)
+        .insert_resource(sound_packs)
         .insert_resource(settings)
         .insert_resource(SoundEventState::default())
-        .insert_resource(RosterRecords::load())
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "BattleTris".into(),
-                resolution: (window.width as u32, window.height as u32).into(),
-                ..default()
-            }),
-            ..default()
-        }))
+        .insert_resource(roster_records)
+        .add_plugins(
+            DefaultPlugins
+                .set(AssetPlugin {
+                    file_path: asset_file_path,
+                    ..default()
+                })
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: "BattleTris".into(),
+                        resolution: (window.width as u32, window.height as u32).into(),
+                        resizable: false,
+                        ..default()
+                    }),
+                    ..default()
+                }),
+        )
         .add_systems(Startup, setup)
+        .add_systems(Update, apply_visual_capture_fixture.before(render_game))
         .add_systems(
             Update,
             (
@@ -65,15 +131,20 @@ fn main() {
                 tick_game,
                 update_recon_panel,
                 collect_sound_events,
+                play_sound_events,
                 render_game,
                 update_screen_visibility,
                 update_menu_button_visuals,
             ),
         );
 
-    if let Some(smoke_screenshot) = smoke_screenshot {
-        app.insert_resource(smoke_screenshot)
-            .add_systems(Update, request_smoke_screenshot.after(render_game));
+    if let Some(visual_capture) = visual_capture {
+        app.insert_resource(visual_capture).add_systems(
+            Update,
+            request_visual_capture
+                .after(render_game)
+                .after(update_screen_visibility),
+        );
     }
 
     app.run();
@@ -104,6 +175,15 @@ enum SoundPackChoice {
     Muted,
 }
 
+impl SoundPackChoice {
+    const fn directory(self) -> &'static str {
+        match self {
+            Self::GeneratedDefault => "generated-default",
+            Self::Muted => "muted",
+        }
+    }
+}
+
 impl ThemeChoice {
     const fn directory(self) -> &'static str {
         match self {
@@ -111,6 +191,536 @@ impl ThemeChoice {
             Self::HighContrast => "high-contrast",
         }
     }
+
+    fn from_id(value: &str) -> Option<Self> {
+        [Self::OriginalInspired, Self::HighContrast]
+            .into_iter()
+            .find(|choice| choice.directory() == value)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ClientRunConfig {
+    capture: Option<VisualCaptureSpec>,
+    deterministic_capture: bool,
+}
+
+impl ClientRunConfig {
+    fn from_env() -> Result<Self, String> {
+        let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+        if args.len() == 1 && is_help_arg(&args[0])
+            || args
+                .first()
+                .is_some_and(|arg| arg == OsStr::new("headless"))
+                && args.get(1).is_some_and(|arg| is_help_arg(arg))
+        {
+            println!("{}", client_usage());
+            std::process::exit(0);
+        }
+        Self::parse(args, std::env::var_os("BATTLETRIS_SMOKE_SCREENSHOT"))
+    }
+
+    fn parse(args: Vec<OsString>, smoke_env: Option<OsString>) -> Result<Self, String> {
+        if args.is_empty() {
+            return Ok(Self {
+                capture: smoke_env.map(|path| VisualCaptureSpec::Smoke { path: path.into() }),
+                deterministic_capture: false,
+            });
+        }
+
+        if args
+            .first()
+            .is_some_and(|arg| arg == OsStr::new("headless"))
+        {
+            return parse_headless_args(&args[1..]);
+        }
+
+        if args.len() == 1 && is_help_arg(&args[0]) {
+            return Err(client_usage());
+        }
+
+        let mut index = 0;
+        let mut smoke_path = smoke_env.map(PathBuf::from);
+        while index < args.len() {
+            let arg = &args[index];
+            if arg == OsStr::new("--smoke-screenshot") {
+                index += 1;
+                let Some(path) = args.get(index) else {
+                    return Err("--smoke-screenshot requires a path".to_string());
+                };
+                smoke_path = Some(PathBuf::from(path));
+            } else if let Some(path) = arg
+                .to_str()
+                .and_then(|arg| arg.strip_prefix("--smoke-screenshot="))
+            {
+                smoke_path = Some(PathBuf::from(path));
+            } else {
+                return Err(format!(
+                    "unrecognized client argument: {}",
+                    display_arg(arg)
+                ));
+            }
+            index += 1;
+        }
+
+        Ok(Self {
+            capture: smoke_path.map(|path| VisualCaptureSpec::Smoke { path }),
+            deterministic_capture: false,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisualFixture {
+    Startup,
+    Challenge,
+    Sleep,
+    About,
+    Roster,
+    Settings,
+    GamePlaying,
+    GameBazaar,
+    GameRecon,
+    BoardCells,
+}
+
+impl VisualFixture {
+    const ALL: [Self; 10] = [
+        Self::Startup,
+        Self::Challenge,
+        Self::Sleep,
+        Self::About,
+        Self::Roster,
+        Self::Settings,
+        Self::GamePlaying,
+        Self::GameBazaar,
+        Self::GameRecon,
+        Self::BoardCells,
+    ];
+
+    const fn id(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Challenge => "challenge",
+            Self::Sleep => "sleep",
+            Self::About => "about",
+            Self::Roster => "roster",
+            Self::Settings => "settings",
+            Self::GamePlaying => "game-playing",
+            Self::GameBazaar => "game-bazaar",
+            Self::GameRecon => "game-recon",
+            Self::BoardCells => "board-cells",
+        }
+    }
+
+    fn from_id(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|fixture| fixture.id() == value)
+    }
+
+    const fn screen(self) -> ClientScreen {
+        match self {
+            Self::Startup => ClientScreen::Startup,
+            Self::Challenge => ClientScreen::Challenge,
+            Self::Sleep => ClientScreen::Sleep,
+            Self::About => ClientScreen::About,
+            Self::Roster => ClientScreen::Roster,
+            Self::Settings => ClientScreen::Settings,
+            Self::GamePlaying | Self::GameBazaar | Self::GameRecon | Self::BoardCells => {
+                ClientScreen::Game
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum VisualCaptureSpec {
+    Smoke {
+        path: PathBuf,
+    },
+    One {
+        fixture: VisualFixture,
+        theme: ThemeChoice,
+        output: PathBuf,
+    },
+    All {
+        theme: ThemeChoice,
+        out_dir: PathBuf,
+    },
+}
+
+impl VisualCaptureSpec {
+    fn to_capture(&self, themes: &ThemePacks, default_theme: ThemeChoice) -> VisualCapture {
+        let jobs = match self {
+            Self::Smoke { path } => vec![visual_capture_job(
+                VisualFixture::Startup,
+                default_theme,
+                path.clone(),
+                themes,
+            )],
+            Self::One {
+                fixture,
+                theme,
+                output,
+            } => vec![visual_capture_job(*fixture, *theme, output.clone(), themes)],
+            Self::All { theme, out_dir } => VisualFixture::ALL
+                .into_iter()
+                .map(|fixture| {
+                    visual_capture_job(
+                        fixture,
+                        *theme,
+                        out_dir.join(format!("{}.png", fixture.id())),
+                        themes,
+                    )
+                })
+                .collect(),
+        };
+        VisualCapture::new(jobs)
+    }
+}
+
+#[derive(Resource, Debug)]
+struct VisualCapture {
+    jobs: Vec<VisualCaptureJob>,
+    current: usize,
+    applied: Option<usize>,
+    frames_until_capture: u16,
+    frames_since_request: u16,
+    requested: bool,
+}
+
+impl VisualCapture {
+    fn new(jobs: Vec<VisualCaptureJob>) -> Self {
+        Self {
+            jobs,
+            current: 0,
+            applied: None,
+            frames_until_capture: SMOKE_SCREENSHOT_CAPTURE_DELAY_FRAMES,
+            frames_since_request: 0,
+            requested: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VisualCaptureJob {
+    fixture: VisualFixture,
+    theme: ThemeChoice,
+    path: PathBuf,
+    expected_width: u32,
+    expected_height: u32,
+}
+
+fn visual_capture_job(
+    fixture: VisualFixture,
+    theme: ThemeChoice,
+    path: PathBuf,
+    themes: &ThemePacks,
+) -> VisualCaptureJob {
+    let window = themes.get(theme).layout.window;
+    VisualCaptureJob {
+        fixture,
+        theme,
+        path,
+        expected_width: window.width.round() as u32,
+        expected_height: window.height.round() as u32,
+    }
+}
+
+fn parse_headless_args(args: &[OsString]) -> Result<ClientRunConfig, String> {
+    let Some(command) = args.first() else {
+        return Err("headless requires a command: capture or capture-all".to_string());
+    };
+    if is_help_arg(command) {
+        return Err(client_usage());
+    }
+
+    match command.to_str() {
+        Some("capture") => parse_headless_capture_args(&args[1..]),
+        Some("capture-all") => parse_headless_capture_all_args(&args[1..]),
+        Some(other) => Err(format!("unrecognized headless command: {other}")),
+        None => Err(format!(
+            "headless command is not valid UTF-8: {}",
+            display_arg(command)
+        )),
+    }
+}
+
+fn parse_headless_capture_args(args: &[OsString]) -> Result<ClientRunConfig, String> {
+    let mut fixture = None;
+    let mut theme = ThemeChoice::OriginalInspired;
+    let mut output = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = &args[index];
+        if let Some(value) = option_value(arg, "--fixture") {
+            fixture = Some(parse_visual_fixture(value)?);
+        } else if arg == OsStr::new("--fixture") {
+            index += 1;
+            fixture = Some(parse_visual_fixture(required_arg(
+                args,
+                index,
+                "--fixture",
+            )?)?);
+        } else if let Some(value) = option_value(arg, "--theme") {
+            theme = parse_theme_choice(value)?;
+        } else if arg == OsStr::new("--theme") {
+            index += 1;
+            theme = parse_theme_choice(required_arg(args, index, "--theme")?)?;
+        } else if let Some(value) = option_value(arg, "--output") {
+            output = Some(PathBuf::from(value));
+        } else if arg == OsStr::new("--output") {
+            index += 1;
+            output = Some(PathBuf::from(required_os_arg(args, index, "--output")?));
+        } else {
+            return Err(format!(
+                "unrecognized headless capture argument: {}",
+                display_arg(arg)
+            ));
+        }
+        index += 1;
+    }
+
+    Ok(ClientRunConfig {
+        capture: Some(VisualCaptureSpec::One {
+            fixture: fixture.ok_or_else(|| "headless capture requires --fixture".to_string())?,
+            theme,
+            output: output.ok_or_else(|| "headless capture requires --output".to_string())?,
+        }),
+        deterministic_capture: true,
+    })
+}
+
+fn parse_headless_capture_all_args(args: &[OsString]) -> Result<ClientRunConfig, String> {
+    let mut theme = ThemeChoice::OriginalInspired;
+    let mut out_dir = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = &args[index];
+        if let Some(value) = option_value(arg, "--theme") {
+            theme = parse_theme_choice(value)?;
+        } else if arg == OsStr::new("--theme") {
+            index += 1;
+            theme = parse_theme_choice(required_arg(args, index, "--theme")?)?;
+        } else if let Some(value) = option_value(arg, "--out-dir") {
+            out_dir = Some(PathBuf::from(value));
+        } else if arg == OsStr::new("--out-dir") {
+            index += 1;
+            out_dir = Some(PathBuf::from(required_os_arg(args, index, "--out-dir")?));
+        } else {
+            return Err(format!(
+                "unrecognized headless capture-all argument: {}",
+                display_arg(arg)
+            ));
+        }
+        index += 1;
+    }
+
+    Ok(ClientRunConfig {
+        capture: Some(VisualCaptureSpec::All {
+            theme,
+            out_dir: out_dir
+                .ok_or_else(|| "headless capture-all requires --out-dir".to_string())?,
+        }),
+        deterministic_capture: true,
+    })
+}
+
+fn parse_visual_fixture(value: &str) -> Result<VisualFixture, String> {
+    VisualFixture::from_id(value).ok_or_else(|| {
+        format!(
+            "unknown visual fixture '{value}'; expected one of: {}",
+            visual_fixture_list()
+        )
+    })
+}
+
+fn parse_theme_choice(value: &str) -> Result<ThemeChoice, String> {
+    ThemeChoice::from_id(value).ok_or_else(|| {
+        format!("unknown theme '{value}'; expected original-inspired or high-contrast")
+    })
+}
+
+fn required_arg<'a>(args: &'a [OsString], index: usize, option: &str) -> Result<&'a str, String> {
+    required_os_arg(args, index, option)?
+        .to_str()
+        .ok_or_else(|| {
+            format!(
+                "{option} value is not valid UTF-8: {}",
+                display_arg(&args[index])
+            )
+        })
+}
+
+fn required_os_arg<'a>(
+    args: &'a [OsString],
+    index: usize,
+    option: &str,
+) -> Result<&'a OsStr, String> {
+    args.get(index)
+        .map(OsString::as_os_str)
+        .ok_or_else(|| format!("{option} requires a value"))
+}
+
+fn option_value<'a>(arg: &'a OsStr, option: &str) -> Option<&'a str> {
+    arg.to_str()
+        .and_then(|arg| arg.strip_prefix(option))
+        .and_then(|rest| rest.strip_prefix('='))
+}
+
+fn display_arg(arg: &OsStr) -> String {
+    arg.to_string_lossy().into_owned()
+}
+
+fn is_help_arg(arg: &OsStr) -> bool {
+    arg == OsStr::new("--help") || arg == OsStr::new("-h")
+}
+
+fn visual_fixture_list() -> String {
+    VisualFixture::ALL
+        .into_iter()
+        .map(VisualFixture::id)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn client_usage() -> String {
+    format!(
+        "Usage:\n  client\n  client --smoke-screenshot <path>\n  client headless capture --fixture <fixture> --theme <theme> --output <path>\n  client headless capture-all --theme <theme> --out-dir <dir>\n\nFixtures: {}\nThemes: original-inspired, high-contrast",
+        visual_fixture_list()
+    )
+}
+
+#[derive(Resource, Debug, Clone)]
+struct SoundPacks {
+    generated_default: LoadedSoundPack,
+}
+
+impl SoundPacks {
+    fn load(assets_dir: &std::path::Path) -> Self {
+        Self {
+            generated_default: LoadedSoundPack::load(assets_dir, SoundPackChoice::GeneratedDefault),
+        }
+    }
+
+    fn sound_for(&self, choice: SoundPackChoice, event: SoundEvent) -> Option<&LoadedSoundEvent> {
+        match choice {
+            SoundPackChoice::GeneratedDefault => self.generated_default.event(event),
+            SoundPackChoice::Muted => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LoadedSoundPack {
+    events: Vec<LoadedSoundEvent>,
+}
+
+impl LoadedSoundPack {
+    fn load(assets_dir: &std::path::Path, choice: SoundPackChoice) -> Self {
+        let sound_dir = assets_dir.join("sounds").join(choice.directory());
+        let manifest_path = sound_dir.join("sound-pack.toml");
+        let contents = fs::read_to_string(&manifest_path).unwrap_or_else(|error| {
+            panic!(
+                "BattleTris sound-pack manifest {} could not be read: {error}",
+                manifest_path.display()
+            )
+        });
+        let raw: RawSoundPack = toml::from_str(&contents).unwrap_or_else(|error| {
+            panic!(
+                "BattleTris sound-pack manifest {} could not be parsed: {error}",
+                manifest_path.display()
+            )
+        });
+        raw.validate(&sound_dir, &manifest_path);
+        let prefix = format!("sounds/{}/", choice.directory());
+        Self {
+            events: raw
+                .event
+                .into_iter()
+                .filter_map(|event| {
+                    let kind = SoundEvent::from_id(&event.id)?;
+                    Some(LoadedSoundEvent {
+                        kind,
+                        file: format!("{prefix}{}", event.files[0]),
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    fn event(&self, kind: SoundEvent) -> Option<&LoadedSoundEvent> {
+        self.events.iter().find(|event| event.kind == kind)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LoadedSoundEvent {
+    kind: SoundEvent,
+    file: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSoundPack {
+    kind: String,
+    format_version: u32,
+    event: Vec<RawSoundEvent>,
+}
+
+impl RawSoundPack {
+    fn validate(&self, sound_dir: &std::path::Path, manifest_path: &std::path::Path) {
+        if self.kind != "sound-pack" || self.format_version != 1 {
+            panic!(
+                "BattleTris sound-pack manifest {} has unsupported kind/version: kind={} format_version={}",
+                manifest_path.display(),
+                self.kind,
+                self.format_version
+            );
+        }
+        for expected in SoundEvent::ALL {
+            if !self.event.iter().any(|event| event.id == expected.id()) {
+                panic!(
+                    "BattleTris sound-pack manifest {} is missing event {}",
+                    manifest_path.display(),
+                    expected.id()
+                );
+            }
+        }
+        for event in &self.event {
+            if SoundEvent::from_id(&event.id).is_none() {
+                panic!(
+                    "BattleTris sound-pack manifest {} has unknown event {}",
+                    manifest_path.display(),
+                    event.id
+                );
+            }
+            if event.files.is_empty() || !event.volume.is_finite() || event.volume < 0.0 {
+                panic!(
+                    "BattleTris sound-pack manifest {} has invalid event {}",
+                    manifest_path.display(),
+                    event.id
+                );
+            }
+            for relative in &event.files {
+                let path = sound_dir.join(relative);
+                if !path.is_file() {
+                    panic!(
+                        "BattleTris sound-pack manifest {} requires missing sound {}",
+                        manifest_path.display(),
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSoundEvent {
+    id: String,
+    files: Vec<String>,
+    volume: f32,
 }
 
 #[derive(Resource, Debug, Clone)]
@@ -420,6 +1030,10 @@ struct ClientSettings {
     controls: ControlScheme,
     pixel_scale: f32,
     ernie_level: usize,
+    display_name: String,
+    community_label: String,
+    direct_listen_addr: String,
+    lobby_addr: String,
     settings_path: Option<PathBuf>,
     assets_dir: PathBuf,
 }
@@ -433,6 +1047,10 @@ impl Default for ClientSettings {
             controls: ControlScheme::ModernSplit,
             pixel_scale: 1.0,
             ernie_level: DEFAULT_ERNIE_LEVEL,
+            display_name: default_display_name(),
+            community_label: CommunityLabel::local().as_str().to_string(),
+            direct_listen_addr: "127.0.0.1:4405".to_string(),
+            lobby_addr: "127.0.0.1:4404".to_string(),
             settings_path: settings_path(),
             assets_dir: assets_dir(),
         }
@@ -495,6 +1113,10 @@ impl ClientSettings {
             controls: self.controls,
             pixel_scale: self.pixel_scale,
             ernie_level: self.ernie_level,
+            display_name: self.display_name.clone(),
+            community_label: self.community_label.clone(),
+            direct_listen_addr: self.direct_listen_addr.clone(),
+            lobby_addr: self.lobby_addr.clone(),
         }
     }
 
@@ -504,10 +1126,18 @@ impl ClientSettings {
         self.controls = persisted.controls;
         self.pixel_scale = sanitize_pixel_scale(persisted.pixel_scale);
         self.ernie_level = sanitize_ernie_level(persisted.ernie_level);
+        self.display_name =
+            sanitize_nonempty_setting(persisted.display_name, default_display_name());
+        self.community_label =
+            sanitize_nonempty_setting(persisted.community_label, "local".to_string());
+        self.direct_listen_addr =
+            sanitize_nonempty_setting(persisted.direct_listen_addr, "127.0.0.1:4405".to_string());
+        self.lobby_addr =
+            sanitize_nonempty_setting(persisted.lobby_addr, "127.0.0.1:4404".to_string());
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 struct PersistedClientSettings {
     theme: ThemeChoice,
@@ -515,6 +1145,10 @@ struct PersistedClientSettings {
     controls: ControlScheme,
     pixel_scale: f32,
     ernie_level: usize,
+    display_name: String,
+    community_label: String,
+    direct_listen_addr: String,
+    lobby_addr: String,
 }
 
 impl Default for PersistedClientSettings {
@@ -525,6 +1159,10 @@ impl Default for PersistedClientSettings {
             controls: ControlScheme::ModernSplit,
             pixel_scale: 1.0,
             ernie_level: DEFAULT_ERNIE_LEVEL,
+            display_name: default_display_name(),
+            community_label: "local".to_string(),
+            direct_listen_addr: "127.0.0.1:4405".to_string(),
+            lobby_addr: "127.0.0.1:4404".to_string(),
         }
     }
 }
@@ -605,6 +1243,277 @@ impl RosterRecords {
             },
         }
     }
+}
+
+fn apply_visual_fixture_state(
+    fixture: VisualFixture,
+    settings: &mut ClientSettings,
+    local: &mut LocalGame,
+    recon: &mut ReconPanel,
+    bazaar_ui: &mut BazaarUiState,
+    roster: &mut RosterRecords,
+) {
+    settings.screen = fixture.screen();
+    settings.pixel_scale = 1.0;
+    settings.display_name = "Visual Fixture".to_string();
+    settings.community_label = "visual".to_string();
+    settings.direct_listen_addr = "127.0.0.1:4405".to_string();
+    settings.lobby_addr = "127.0.0.1:4404".to_string();
+
+    if fixture == VisualFixture::Settings {
+        settings.controls = ControlScheme::LegacyInspired;
+    }
+
+    *local = visual_local_game(fixture, settings.ernie_level);
+    *recon = visual_recon_panel(fixture, local);
+    *bazaar_ui = visual_bazaar_ui(fixture);
+    *roster = visual_roster_records();
+}
+
+fn visual_local_game(fixture: VisualFixture, ernie_level: usize) -> LocalGame {
+    match fixture {
+        VisualFixture::GamePlaying => visual_computer_game(
+            ernie_level,
+            visual_playing_board(),
+            visual_opponent_board(),
+            "Visual fixture: playing",
+        ),
+        VisualFixture::GameRecon => visual_computer_game(
+            ernie_level,
+            visual_playing_board(),
+            visual_opponent_board(),
+            "Visual fixture: Condor recon snapshot",
+        ),
+        VisualFixture::BoardCells => visual_computer_game(
+            ernie_level,
+            visual_board_cells_board(),
+            Board::empty(),
+            "Visual fixture: board cell catalog",
+        ),
+        VisualFixture::GameBazaar => visual_bazaar_game(),
+        _ => LocalGame::new_human_vs_human(),
+    }
+}
+
+fn visual_computer_game(
+    ernie_level: usize,
+    player_board: Board,
+    computer_board: Board,
+    status_message: &str,
+) -> LocalGame {
+    let difficulty = computer_difficulty(sanitize_ernie_level(ernie_level))
+        .expect("legacy AI difficulty exists");
+    LocalGame {
+        game: TwoPlayerGame::human_vs_computer(
+            GameSeed::from_u64(101),
+            player_board,
+            GameSeed::from_u64(202),
+            computer_board,
+            PlayerId::Two,
+            difficulty,
+        ),
+        computer: Some(ComputerController::new(
+            PlayerId::Two,
+            GameSeed::from_u64(303),
+            difficulty.level,
+        )),
+        local_player: PlayerId::One,
+        status_message: Some(status_message.to_string()),
+    }
+}
+
+fn visual_bazaar_game() -> LocalGame {
+    let mut game = TwoPlayerGame::bazaar_fixture(
+        GameSeed::from_u64(111),
+        visual_playing_board(),
+        650,
+        GameSeed::from_u64(222),
+        visual_opponent_board(),
+        425,
+    );
+    let _ = game.bazaar_buy(PlayerId::One, WeaponToken::Gimp);
+    let _ = game.bazaar_buy(PlayerId::One, WeaponToken::FlipOut);
+    let _ = game.bazaar_buy(PlayerId::Two, WeaponToken::RiseUp);
+    LocalGame {
+        game,
+        computer: None,
+        local_player: PlayerId::One,
+        status_message: Some("Visual fixture: bazaar shopping".to_string()),
+    }
+}
+
+fn visual_recon_panel(fixture: VisualFixture, local: &LocalGame) -> ReconPanel {
+    let mut recon = ReconPanel::default();
+    if fixture == VisualFixture::GameRecon {
+        let target = opponent_player(local.local_player);
+        recon.snapshot = Some(ReconSnapshot {
+            level: ReconLevel::Condor,
+            board: local.game.player(target).board().snapshot(),
+            funds: 375,
+        });
+    }
+    recon
+}
+
+fn visual_bazaar_ui(fixture: VisualFixture) -> BazaarUiState {
+    if fixture == VisualFixture::GameBazaar {
+        BazaarUiState {
+            selected: WeaponToken::Gimp,
+            last_message: "Visual fixture has staged Gimp and Flip out for Player 1.".to_string(),
+        }
+    } else {
+        BazaarUiState::default()
+    }
+}
+
+fn visual_roster_records() -> RosterRecords {
+    RosterRecords {
+        rows: vec![
+            RosterRow {
+                rank: 1,
+                display_name: "Ada".to_string(),
+                wins: 12,
+                losses: 3,
+                high_score: 48_250,
+                high_lines: 82,
+                high_funds: 1_450,
+                streak: "W5".to_string(),
+            },
+            RosterRow {
+                rank: 2,
+                display_name: "Grace".to_string(),
+                wins: 9,
+                losses: 4,
+                high_score: 37_600,
+                high_lines: 69,
+                high_funds: 1_100,
+                streak: "W2".to_string(),
+            },
+            RosterRow {
+                rank: 3,
+                display_name: "Katherine".to_string(),
+                wins: 7,
+                losses: 5,
+                high_score: 31_900,
+                high_lines: 58,
+                high_funds: 980,
+                streak: "L1".to_string(),
+            },
+        ],
+        error: None,
+    }
+}
+
+fn visual_playing_board() -> Board {
+    let mut board = Board::empty();
+    for x in 0..BOARD_WIDTH {
+        if x != 4 {
+            board.set(
+                Coord::new(x, BOARD_HEIGHT - 1).expect("fixture coordinate in bounds"),
+                Some(visible_cell((x % 7 + 1) as u8)),
+            );
+        }
+    }
+    for x in 2..BOARD_WIDTH {
+        board.set(
+            Coord::new(x, BOARD_HEIGHT - 2).expect("fixture coordinate in bounds"),
+            Some(visible_cell(((x + 2) % 7 + 1) as u8)),
+        );
+    }
+    for (x, cell) in [
+        (0, Cell::Happy),
+        (1, Cell::die(Pip::new(4).expect("valid pip"))),
+        (2, Cell::Gimp { value: 25 }),
+        (7, Cell::Structure),
+        (
+            8,
+            Cell::Hidden {
+                value: 5,
+                removable: true,
+            },
+        ),
+        (9, Cell::Invisible),
+    ] {
+        board.set(
+            Coord::new(x, BOARD_HEIGHT - 4).expect("fixture coordinate in bounds"),
+            Some(cell),
+        );
+    }
+    board
+}
+
+fn visual_opponent_board() -> Board {
+    let mut board = Board::empty();
+    for y in BOARD_HEIGHT - 6..BOARD_HEIGHT {
+        for x in 0..BOARD_WIDTH {
+            if (x + y).is_multiple_of(3) {
+                board.set(
+                    Coord::new(x, y).expect("fixture coordinate in bounds"),
+                    Some(visible_cell(((x + y) % 7 + 1) as u8)),
+                );
+            }
+        }
+    }
+    board.set(
+        Coord::new(5, BOARD_HEIGHT - 7).expect("fixture coordinate in bounds"),
+        Some(Cell::die(Pip::new(6).expect("valid pip"))),
+    );
+    board.set(
+        Coord::new(6, BOARD_HEIGHT - 7).expect("fixture coordinate in bounds"),
+        Some(Cell::Frown),
+    );
+    board
+}
+
+fn visual_board_cells_board() -> Board {
+    let mut board = Board::empty();
+    let samples = [
+        visible_cell(1),
+        visible_cell(2),
+        visible_cell(3),
+        visible_cell(4),
+        visible_cell(5),
+        visible_cell(6),
+        visible_cell(7),
+        Cell::Structure,
+        Cell::Happy,
+        Cell::Frown,
+        Cell::Gimp { value: 150 },
+        Cell::Invisible,
+        Cell::Hidden {
+            value: 50,
+            removable: true,
+        },
+        Cell::die(Pip::new(1).expect("valid pip")),
+        Cell::die(Pip::new(2).expect("valid pip")),
+        Cell::die(Pip::new(3).expect("valid pip")),
+        Cell::die(Pip::new(4).expect("valid pip")),
+        Cell::die(Pip::new(5).expect("valid pip")),
+        Cell::die(Pip::new(6).expect("valid pip")),
+        visible_cell(8),
+    ];
+    for (index, cell) in samples.into_iter().enumerate() {
+        board.set(
+            Coord::new(index % BOARD_WIDTH, 5 + index / BOARD_WIDTH)
+                .expect("fixture coordinate in bounds"),
+            Some(cell),
+        );
+    }
+    for y in BOARD_HEIGHT - 5..BOARD_HEIGHT {
+        for x in 0..BOARD_WIDTH {
+            if !(x == 4 && y == BOARD_HEIGHT - 1) {
+                board.set(
+                    Coord::new(x, y).expect("fixture coordinate in bounds"),
+                    Some(visible_cell(((x + y) % 9 + 1) as u8)),
+                );
+            }
+        }
+    }
+    board
+}
+
+fn visible_cell(color: u8) -> Cell {
+    Cell::visible_with_color(VisibleColor::new(color).expect("fixture color in legacy range"))
 }
 
 impl LocalGame {
@@ -752,25 +1661,7 @@ impl ComputerController {
 struct SoundEventState {
     next_log_index: usize,
     last_event: Option<SoundEvent>,
-}
-
-#[derive(Resource, Debug)]
-struct SmokeScreenshot {
-    path: PathBuf,
-    frames_until_capture: u16,
-    frames_since_request: u16,
-    requested: bool,
-}
-
-impl SmokeScreenshot {
-    fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            frames_until_capture: SMOKE_SCREENSHOT_CAPTURE_DELAY_FRAMES,
-            frames_since_request: 0,
-            requested: false,
-        }
-    }
+    pending_events: Vec<SoundEvent>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -783,6 +1674,36 @@ enum SoundEvent {
     WeaponLaunch,
     Warning,
     GameOver,
+}
+
+impl SoundEvent {
+    const ALL: [Self; 8] = [
+        Self::MenuAction,
+        Self::PieceLocked,
+        Self::LineClear,
+        Self::BazaarEntered,
+        Self::Purchase,
+        Self::WeaponLaunch,
+        Self::Warning,
+        Self::GameOver,
+    ];
+
+    const fn id(self) -> &'static str {
+        match self {
+            Self::MenuAction => "menu_action",
+            Self::PieceLocked => "piece_locked",
+            Self::LineClear => "line_clear",
+            Self::BazaarEntered => "bazaar_entered",
+            Self::Purchase => "purchase",
+            Self::WeaponLaunch => "weapon_launch",
+            Self::Warning => "warning",
+            Self::GameOver => "game_over",
+        }
+    }
+
+    fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|event| event.id() == id)
+    }
 }
 
 #[derive(Component)]
@@ -1166,9 +2087,13 @@ struct KeyboardInputParams<'w> {
     repeat: ResMut<'w, InputRepeatState>,
     recon: ResMut<'w, ReconPanel>,
     bazaar_ui: ResMut<'w, BazaarUiState>,
+    capture: Option<Res<'w, VisualCapture>>,
 }
 
 fn handle_keyboard_input(mut input: KeyboardInputParams) {
+    if input.capture.is_some() {
+        return;
+    }
     handle_screen_shortcuts(&input.keys, &mut input.settings, &mut input.sound);
     let elapsed_ms = input.time.delta().as_millis().min(u128::from(u64::MAX)) as u64;
 
@@ -1211,9 +2136,13 @@ struct MouseButtonParams<'w, 's> {
     sound: ResMut<'w, SoundEventState>,
     bazaar_ui: ResMut<'w, BazaarUiState>,
     app_exit: MessageWriter<'w, AppExit>,
+    capture: Option<Res<'w, VisualCapture>>,
 }
 
 fn handle_mouse_buttons(mut input: MouseButtonParams) {
+    if input.capture.is_some() {
+        return;
+    }
     if !input.mouse.just_pressed(MouseButton::Left) {
         return;
     }
@@ -1272,7 +2201,12 @@ fn apply_menu_action(
             app_exit.write(AppExit::Success);
         }
     }
-    sound.last_event = Some(SoundEvent::MenuAction);
+    queue_sound(sound, SoundEvent::MenuAction);
+}
+
+fn queue_sound(sound: &mut SoundEventState, event: SoundEvent) {
+    sound.last_event = Some(event);
+    sound.pending_events.push(event);
 }
 
 fn handle_screen_shortcuts(
@@ -1300,7 +2234,7 @@ fn handle_screen_shortcuts(
 
     if let Some(screen) = target {
         settings.screen = screen;
-        sound.last_event = Some(SoundEvent::MenuAction);
+        queue_sound(sound, SoundEvent::MenuAction);
     }
 }
 
@@ -1314,13 +2248,13 @@ fn handle_startup_input(
         *local = LocalGame::new_human_vs_human();
         settings.screen = ClientScreen::Game;
         sound.next_log_index = 0;
-        sound.last_event = Some(SoundEvent::MenuAction);
+        queue_sound(sound, SoundEvent::MenuAction);
     }
     if keys.just_pressed(KeyCode::KeyC) {
         *local = LocalGame::new_human_vs_computer(settings.ernie_level);
         settings.screen = ClientScreen::Game;
         sound.next_log_index = 0;
-        sound.last_event = Some(SoundEvent::MenuAction);
+        queue_sound(sound, SoundEvent::MenuAction);
     }
 }
 
@@ -1332,17 +2266,17 @@ fn handle_challenge_input(
 ) {
     if keys.just_pressed(KeyCode::ArrowLeft) || keys.just_pressed(KeyCode::KeyJ) {
         adjust_ernie_level(settings, -1);
-        sound.last_event = Some(SoundEvent::MenuAction);
+        queue_sound(sound, SoundEvent::MenuAction);
     }
     if keys.just_pressed(KeyCode::ArrowRight) || keys.just_pressed(KeyCode::KeyL) {
         adjust_ernie_level(settings, 1);
-        sound.last_event = Some(SoundEvent::MenuAction);
+        queue_sound(sound, SoundEvent::MenuAction);
     }
     if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::KeyC) {
         *local = LocalGame::new_human_vs_computer(settings.ernie_level);
         settings.screen = ClientScreen::Game;
         sound.next_log_index = 0;
-        sound.last_event = Some(SoundEvent::MenuAction);
+        queue_sound(sound, SoundEvent::MenuAction);
     }
 }
 
@@ -1358,29 +2292,29 @@ fn handle_settings_input(
             ThemeChoice::OriginalInspired => ThemeChoice::HighContrast,
             ThemeChoice::HighContrast => ThemeChoice::OriginalInspired,
         };
-        sound.last_event = Some(SoundEvent::MenuAction);
+        queue_sound(sound, SoundEvent::MenuAction);
     }
     if keys.just_pressed(KeyCode::KeyO) {
         settings.sound_pack = match settings.sound_pack {
             SoundPackChoice::GeneratedDefault => SoundPackChoice::Muted,
             SoundPackChoice::Muted => SoundPackChoice::GeneratedDefault,
         };
-        sound.last_event = Some(SoundEvent::MenuAction);
+        queue_sound(sound, SoundEvent::MenuAction);
     }
     if keys.just_pressed(KeyCode::KeyM) {
         settings.controls = match settings.controls {
             ControlScheme::ModernSplit => ControlScheme::LegacyInspired,
             ControlScheme::LegacyInspired => ControlScheme::ModernSplit,
         };
-        sound.last_event = Some(SoundEvent::MenuAction);
+        queue_sound(sound, SoundEvent::MenuAction);
     }
     if keys.just_pressed(KeyCode::Equal) {
         settings.pixel_scale = sanitize_pixel_scale(settings.pixel_scale + 0.25).min(2.0);
-        sound.last_event = Some(SoundEvent::MenuAction);
+        queue_sound(sound, SoundEvent::MenuAction);
     }
     if keys.just_pressed(KeyCode::Minus) {
         settings.pixel_scale = sanitize_pixel_scale(settings.pixel_scale - 0.25).max(0.75);
-        sound.last_event = Some(SoundEvent::MenuAction);
+        queue_sound(sound, SoundEvent::MenuAction);
     }
 
     if settings.persisted() != previous {
@@ -1606,7 +2540,11 @@ fn drive_computer_opponent(
     settings: Res<ClientSettings>,
     mut local: ResMut<LocalGame>,
     mut clock: ResMut<ClientTickClock>,
+    capture: Option<Res<VisualCapture>>,
 ) {
+    if capture.is_some() {
+        return;
+    }
     if settings.screen != ClientScreen::Game {
         return;
     }
@@ -1725,7 +2663,11 @@ fn tick_game(
     settings: Res<ClientSettings>,
     mut local: ResMut<LocalGame>,
     mut clock: ResMut<ClientTickClock>,
+    capture: Option<Res<VisualCapture>>,
 ) {
+    if capture.is_some() {
+        return;
+    }
     if settings.screen != ClientScreen::Game {
         return;
     }
@@ -1782,15 +2724,39 @@ fn collect_sound_events(
     if settings.sound_pack == SoundPackChoice::Muted {
         sound.next_log_index = local.game.event_log().len();
         sound.last_event = None;
+        sound.pending_events.clear();
         return;
     }
 
     for logged in &local.game.event_log()[sound.next_log_index..] {
         if let Some(event) = sound_event_for(&logged.event) {
-            sound.last_event = Some(event);
+            queue_sound(&mut sound, event);
         }
     }
     sound.next_log_index = local.game.event_log().len();
+}
+
+fn play_sound_events(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    settings: Res<ClientSettings>,
+    sound_packs: Res<SoundPacks>,
+    mut sound: ResMut<SoundEventState>,
+) {
+    if settings.sound_pack == SoundPackChoice::Muted {
+        sound.pending_events.clear();
+        return;
+    }
+
+    for event in std::mem::take(&mut sound.pending_events) {
+        let Some(sound_event) = sound_packs.sound_for(settings.sound_pack, event) else {
+            continue;
+        };
+        commands.spawn((
+            AudioPlayer::new(asset_server.load(sound_event.file.clone())),
+            PlaybackSettings::DESPAWN,
+        ));
+    }
 }
 
 type HudTextQuery<'w, 's> =
@@ -1977,84 +2943,192 @@ fn report_startup_render_health(screen: ClientScreen, menu_label_chars: usize) {
     }
 }
 
-fn smoke_screenshot_path() -> Option<PathBuf> {
-    let mut args = std::env::args_os().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == OsStr::new("--smoke-screenshot") {
-            return args.next().map(PathBuf::from);
-        }
-        if let Some(path) = arg
-            .to_str()
-            .and_then(|arg| arg.strip_prefix("--smoke-screenshot="))
-        {
-            return Some(PathBuf::from(path));
-        }
+fn apply_visual_capture_fixture(
+    capture: Option<ResMut<VisualCapture>>,
+    mut settings: ResMut<ClientSettings>,
+    mut local: ResMut<LocalGame>,
+    mut recon: ResMut<ReconPanel>,
+    mut bazaar_ui: ResMut<BazaarUiState>,
+    mut roster: ResMut<RosterRecords>,
+) {
+    let Some(mut capture) = capture else {
+        return;
+    };
+    if capture.current >= capture.jobs.len() || capture.applied == Some(capture.current) {
+        return;
     }
 
-    std::env::var_os("BATTLETRIS_SMOKE_SCREENSHOT").map(PathBuf::from)
+    let job = capture.jobs[capture.current].clone();
+    settings.theme = job.theme;
+    apply_visual_fixture_state(
+        job.fixture,
+        &mut settings,
+        &mut local,
+        &mut recon,
+        &mut bazaar_ui,
+        &mut roster,
+    );
+    capture.applied = Some(capture.current);
+    capture.frames_until_capture = SMOKE_SCREENSHOT_CAPTURE_DELAY_FRAMES;
+    capture.frames_since_request = 0;
+    capture.requested = false;
+    info!(
+        "BattleTris visual fixture applied: fixture={} theme={} output={} expected={}x{}",
+        job.fixture.id(),
+        job.theme.directory(),
+        job.path.display(),
+        job.expected_width,
+        job.expected_height,
+    );
 }
 
-fn request_smoke_screenshot(
+fn request_visual_capture(
     mut commands: Commands,
-    mut smoke: ResMut<SmokeScreenshot>,
+    mut capture: ResMut<VisualCapture>,
     mut app_exit: MessageWriter<AppExit>,
 ) {
-    if smoke.requested {
-        smoke.frames_since_request = smoke.frames_since_request.saturating_add(1);
-        if smoke.frames_since_request > SMOKE_SCREENSHOT_TIMEOUT_FRAMES {
+    if capture.current >= capture.jobs.len() {
+        app_exit.write(AppExit::Success);
+        return;
+    }
+    if capture.requested {
+        capture.frames_since_request = capture.frames_since_request.saturating_add(1);
+        if capture.frames_since_request > SMOKE_SCREENSHOT_TIMEOUT_FRAMES {
+            let job = &capture.jobs[capture.current];
             error!(
-                "BattleTris smoke screenshot timed out before capture: {}",
-                smoke.path.display()
+                "BattleTris visual capture timed out: fixture={} path={}",
+                job.fixture.id(),
+                job.path.display()
             );
             app_exit.write(AppExit::error());
         }
         return;
     }
 
-    if smoke.frames_until_capture > 0 {
-        smoke.frames_until_capture -= 1;
+    if capture.frames_until_capture > 0 {
+        capture.frames_until_capture -= 1;
         return;
     }
 
-    let path = smoke.path.clone();
-    info!("BattleTris smoke screenshot requested: {}", path.display());
+    let job_index = capture.current;
+    let job = capture.jobs[job_index].clone();
+    info!(
+        "BattleTris visual capture requested: fixture={} theme={} path={}",
+        job.fixture.id(),
+        job.theme.directory(),
+        job.path.display()
+    );
     commands.spawn(Screenshot::primary_window()).observe(
-        move |screenshot: On<ScreenshotCaptured>, mut app_exit: MessageWriter<AppExit>| {
-            if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    if let Err(error) = std::fs::create_dir_all(parent) {
-                        error!(
-                            "BattleTris smoke screenshot could not create {}: {error}",
-                            parent.display()
-                        );
-                        app_exit.write(AppExit::error());
-                        return;
-                    }
-                }
+        move |screenshot: On<ScreenshotCaptured>,
+              mut capture: ResMut<VisualCapture>,
+              mut app_exit: MessageWriter<AppExit>| {
+            if capture.current != job_index {
+                error!(
+                    "BattleTris visual capture received stale screenshot: requested={} current={}",
+                    job_index, capture.current
+                );
+                app_exit.write(AppExit::error());
+                return;
             }
 
-            match screenshot.image.clone().try_into_dynamic() {
-                Ok(image) => match image.to_rgb8().save(&path) {
-                    Ok(()) => {
-                        info!("BattleTris smoke screenshot saved: {}", path.display());
+            match save_visual_capture(&screenshot, &job) {
+                Ok((width, height)) => {
+                    info!(
+                        "BattleTris visual capture saved: fixture={} theme={} path={} size={}x{}",
+                        job.fixture.id(),
+                        job.theme.directory(),
+                        job.path.display(),
+                        width,
+                        height,
+                    );
+                    capture.current += 1;
+                    capture.applied = None;
+                    capture.requested = false;
+                    capture.frames_since_request = 0;
+                    capture.frames_until_capture = SMOKE_SCREENSHOT_CAPTURE_DELAY_FRAMES;
+                    if capture.current >= capture.jobs.len() {
                         app_exit.write(AppExit::Success);
                     }
-                    Err(error) => {
-                        error!(
-                            "BattleTris smoke screenshot could not save {}: {error}",
-                            path.display()
-                        );
-                        app_exit.write(AppExit::error());
-                    }
-                },
+                }
                 Err(error) => {
-                    error!("BattleTris smoke screenshot could not decode captured image: {error}");
+                    error!(
+                        "BattleTris visual capture failed: fixture={} path={} error={error}",
+                        job.fixture.id(),
+                        job.path.display(),
+                    );
                     app_exit.write(AppExit::error());
                 }
             }
         },
     );
-    smoke.requested = true;
+    capture.requested = true;
+}
+
+fn save_visual_capture(
+    screenshot: &ScreenshotCaptured,
+    job: &VisualCaptureJob,
+) -> Result<(u32, u32), String> {
+    ensure_parent_dir(&job.path)?;
+    let image = screenshot
+        .image
+        .clone()
+        .try_into_dynamic()
+        .map_err(|error| format!("captured image could not be decoded: {error}"))?
+        .to_rgb8();
+    let (width, height) = image.dimensions();
+    if width != job.expected_width || height != job.expected_height {
+        return Err(format!(
+            "captured image dimensions were {width}x{height}, expected {}x{}",
+            job.expected_width, job.expected_height
+        ));
+    }
+    validate_visual_capture_pixels(&image, job)?;
+    image
+        .save(&job.path)
+        .map_err(|error| format!("could not save {}: {error}", job.path.display()))?;
+    Ok((width, height))
+}
+
+fn validate_visual_capture_pixels(
+    image: &image::RgbImage,
+    job: &VisualCaptureJob,
+) -> Result<(), String> {
+    let (width, height) = image.dimensions();
+    let total_pixels = u64::from(width) * u64::from(height);
+    let mut bright_pixels = 0_u64;
+    let mut min_luma = u8::MAX;
+    let mut max_luma = u8::MIN;
+
+    for pixel in image.pixels() {
+        let [red, green, blue] = pixel.0;
+        let luma = ((u32::from(red) * 2126 + u32::from(green) * 7152 + u32::from(blue) * 722)
+            / 10_000) as u8;
+        if luma > 80 {
+            bright_pixels += 1;
+        }
+        min_luma = min_luma.min(luma);
+        max_luma = max_luma.max(luma);
+    }
+
+    if bright_pixels <= total_pixels / 1_000 || max_luma.saturating_sub(min_luma) <= 40 {
+        return Err(format!(
+            "captured image looks blank for fixture={} theme={}: bright_pixels={bright_pixels} total_pixels={total_pixels} luma_range={min_luma}..{max_luma}",
+            job.fixture.id(),
+            job.theme.directory(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_parent_dir(path: &Path) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))
 }
 
 fn send_press_command(
@@ -2267,9 +3341,7 @@ fn phase_label(local: &LocalGame, settings: &ClientSettings, sound: &SoundEventS
 
 fn menu_label(_game: &TwoPlayerGame, settings: &ClientSettings) -> String {
     match settings.screen {
-        ClientScreen::Startup => {
-            "BattleTris\nLegacy shell: Challenge, Sleep, About, Roster, Quit".to_string()
-        }
+        ClientScreen::Startup => "BattleTris\nChallenge, Sleep, About, Roster, Quit".to_string(),
         ClientScreen::Game => String::new(),
         ClientScreen::Challenge => "Challenge".to_string(),
         ClientScreen::Sleep => "Sleep".to_string(),
@@ -2289,12 +3361,23 @@ fn screen_body_label(
 ) -> String {
     match settings.screen {
         ClientScreen::Startup => {
-            "Click the legacy startup buttons. Keyboard: H local game, C Play Ernie, F2/F3/F4/F5/F6 screens.".to_string()
+            "Click Challenge for human/computer setup, Sleep to wait as available, About for credits, Roster for records, or Quit. Keyboard: H local game, C Play Ernie, F2/F3/F4/F5/F6 screens.".to_string()
         }
         ClientScreen::Challenge => {
             let difficulty = selected_ernie_difficulty(settings);
+            let lobby_preview = lobby_registration_preview(settings);
             format!(
-                "Network challenges are reserved for the networking phase.\nErnie difficulty: level {} of {}  {}  {}ms action delay\nUse J/Left and L/Right or Level -/+ as the slider.\nClick Play {} Ernie or press Enter/C for unranked computer play.",
+                "Challenge\nIdentity: {} ({}) on community {}\nDirect TCP protocol v{}.{} ({}, {})\nAdvertised direct address: {}  Lobby: {}  Ranked: {}\nErnie difficulty: level {} of {}  {}  {}ms action delay\nUse J/Left and L/Right or Level -/+ as the slider.\nClick Play {} Ernie or press Enter/C for unranked computer play.",
+                lobby_preview.player.display_name,
+                lobby_preview.player.player_id,
+                settings.community_label,
+                PROTOCOL_MAJOR,
+                PROTOCOL_MINOR,
+                CAPABILITY_DIRECT_TCP,
+                CAPABILITY_SELF_HOSTED_LOBBY,
+                lobby_preview.direct_addr,
+                settings.lobby_addr,
+                lobby_preview.ranked,
                 difficulty.level,
                 COMPUTER_DIFFICULTIES.len() - 1,
                 difficulty.name,
@@ -2303,18 +3386,30 @@ fn screen_body_label(
             )
         }
         ClientScreen::Sleep => {
-            "Biff is standing by for incoming challenges.\nAvailability and challenge wake-up state will attach to the networking adapter.\nClick Wake to return to Startup.".to_string()
+            format!(
+                "Sleep\n{} is marked available for BattleTris challenges.\nBiff is standing by on {} for direct TCP protocol v{}.{}.\nClick Wake to return to Startup.",
+                settings.display_name,
+                settings.direct_listen_addr,
+                PROTOCOL_MAJOR,
+                PROTOCOL_MINOR,
+            )
         }
         ClientScreen::About => {
-            "BattleTris\nRust/Bevy rewrite of the legacy X11 game.\nAuthors: legacy BattleTris team; Rust rewrite preserves deterministic core rules and data-driven presentation.\nThanks to the original players, testers, and Biff.\nClick OK to return.".to_string()
+            "BattleTris\nRust/Bevy rewrite of the legacy X11/Motif game.\nOriginal authors: Bryan Cantrill, Charlie Hoecker, and Mike Shapiro, Brown CS32 spring 1994.\nRevived and exhumed by the BattleTris community in 2026.\nThis build preserves deterministic rules, the weapon economy, Biff, Ernie, ranked records, and source-backed art/audio packs.\nClick OK to return.".to_string()
         }
-        ClientScreen::Roster => roster_label(game, roster),
+        ClientScreen::Roster => roster_label(game, settings, roster),
         ClientScreen::Settings => format!(
-            "Theme: {:?}\nSound pack: {:?}\nControls: {}\nScale: {:.2}x\nAssets: {}\nSettings: {}",
+            "Theme: {:?}\nSound pack: {:?}\nControls: {}\nScale: {:.2}x\nDisplay name: {}\nCommunity: {}\nDirect listen: {}\nLobby: {}\nProtocol: v{}.{}\nAssets: {}\nSettings: {}",
             settings.theme,
             settings.sound_pack,
             controls_label(settings.controls),
             settings.pixel_scale,
+            settings.display_name,
+            settings.community_label,
+            settings.direct_listen_addr,
+            settings.lobby_addr,
+            PROTOCOL_MAJOR,
+            PROTOCOL_MINOR,
             settings.assets_dir.display(),
             settings
                 .settings_path
@@ -2334,6 +3429,15 @@ fn sanitize_pixel_scale(pixel_scale: f32) -> f32 {
     }
 }
 
+fn sanitize_nonempty_setting(value: String, fallback: String) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        fallback
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn sanitize_ernie_level(level: usize) -> usize {
     level.min(COMPUTER_DIFFICULTIES.len() - 1)
 }
@@ -2346,6 +3450,43 @@ fn adjust_ernie_level(settings: &mut ClientSettings, step: isize) {
 
 fn selected_ernie_difficulty(settings: &ClientSettings) -> battletris_core::ai::ComputerDifficulty {
     computer_difficulty(settings.ernie_level).expect("sanitized legacy AI difficulty exists")
+}
+
+fn default_display_name() -> String {
+    std::env::var("BATTLETRIS_DISPLAY_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| std::env::var("USER").ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "Local Player".to_string())
+}
+
+fn lobby_registration_preview(settings: &ClientSettings) -> LobbyRegister {
+    LobbyRegister {
+        player: HostedPlayer {
+            player_id: player_id_from_display_name(&settings.display_name),
+            display_name: settings.display_name.clone(),
+        },
+        direct_addr: settings.direct_listen_addr.clone(),
+        ranked: true,
+    }
+}
+
+fn player_id_from_display_name(display_name: &str) -> String {
+    let mut id = String::new();
+    for ch in display_name.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            id.push(ch.to_ascii_lowercase());
+        } else if (ch.is_ascii_whitespace() || ch == '-' || ch == '_') && !id.ends_with('-') {
+            id.push('-');
+        }
+    }
+    let id = id.trim_matches('-');
+    if id.is_empty() {
+        "local-player".to_string()
+    } else {
+        id.to_string()
+    }
 }
 
 fn computer_bazaar_line_value(game: &TwoPlayerGame, computer: PlayerId) -> u32 {
@@ -2378,18 +3519,20 @@ fn assets_dir() -> PathBuf {
         .join("assets")
 }
 
-fn roster_label(game: &TwoPlayerGame, roster: &RosterRecords) -> String {
+fn roster_label(game: &TwoPlayerGame, settings: &ClientSettings, roster: &RosterRecords) -> String {
     let ranked = if game.is_ranked_game() {
         "ranked"
     } else {
         "unranked"
     };
     let mut label = format!(
-        "Roster\nPlayer 1: local human\nPlayer 2: {}\nCurrent game is {ranked}. Local records sorted by rank.\n",
+        "Roster\nPlayer 1: {}\nPlayer 2: {}\nCommunity: {}\nCurrent game is {ranked}. Local records sorted by rank.\n",
+        settings.display_name,
         match game.mode() {
             GameMode::HumanVsHuman => "local human",
             GameMode::HumanVsComputer { .. } => "computer Ernie",
-        }
+        },
+        settings.community_label,
     );
     if let Some(error) = &roster.error {
         let _ = writeln!(label, "Records unavailable: {error}");
@@ -2970,6 +4113,121 @@ mod tests {
     }
 
     #[test]
+    fn visual_fixture_names_are_canonical() {
+        let ids = VisualFixture::ALL
+            .into_iter()
+            .map(VisualFixture::id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ids,
+            vec![
+                "startup",
+                "challenge",
+                "sleep",
+                "about",
+                "roster",
+                "settings",
+                "game-playing",
+                "game-bazaar",
+                "game-recon",
+                "board-cells",
+            ]
+        );
+        assert_eq!(
+            VisualFixture::from_id("game-bazaar"),
+            Some(VisualFixture::GameBazaar)
+        );
+        assert!(VisualFixture::from_id("bazaar").is_none());
+    }
+
+    #[test]
+    fn headless_capture_cli_parses_fixture_theme_and_output() {
+        let config = ClientRunConfig::parse(
+            vec![
+                OsString::from("headless"),
+                OsString::from("capture"),
+                OsString::from("--fixture"),
+                OsString::from("game-recon"),
+                OsString::from("--theme=high-contrast"),
+                OsString::from("--output"),
+                OsString::from("target/visual/current/game-recon.png"),
+            ],
+            None,
+        )
+        .expect("headless capture CLI parses");
+
+        assert!(config.deterministic_capture);
+        match config.capture.expect("capture spec") {
+            VisualCaptureSpec::One {
+                fixture,
+                theme,
+                output,
+            } => {
+                assert_eq!(fixture, VisualFixture::GameRecon);
+                assert_eq!(theme, ThemeChoice::HighContrast);
+                assert_eq!(
+                    output,
+                    PathBuf::from("target/visual/current/game-recon.png")
+                );
+            }
+            other => panic!("unexpected capture spec: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capture_all_jobs_cover_every_fixture_for_one_theme() {
+        let config = ClientRunConfig::parse(
+            vec![
+                OsString::from("headless"),
+                OsString::from("capture-all"),
+                OsString::from("--theme"),
+                OsString::from("original-inspired"),
+                OsString::from("--out-dir"),
+                OsString::from("target/visual/current"),
+            ],
+            None,
+        )
+        .expect("headless capture-all CLI parses");
+        let themes = ThemePacks::load(&assets_dir());
+        let capture = config
+            .capture
+            .expect("capture spec")
+            .to_capture(&themes, ThemeChoice::HighContrast);
+
+        assert_eq!(capture.jobs.len(), VisualFixture::ALL.len());
+        assert_eq!(capture.jobs[0].fixture, VisualFixture::Startup);
+        assert_eq!(capture.jobs[0].theme, ThemeChoice::OriginalInspired);
+        assert_eq!(
+            capture.jobs[0].path,
+            PathBuf::from("target/visual/current/startup.png")
+        );
+        assert_eq!(capture.jobs[0].expected_width, 1040);
+        assert_eq!(capture.jobs[0].expected_height, 720);
+        assert_eq!(
+            capture.jobs.last().unwrap().path,
+            PathBuf::from("target/visual/current/board-cells.png")
+        );
+    }
+
+    #[test]
+    fn smoke_screenshot_uses_shared_startup_capture_spec() {
+        let config = ClientRunConfig::parse(
+            Vec::new(),
+            Some(OsString::from("target/visual/current/startup.png")),
+        )
+        .expect("smoke env parses");
+
+        assert!(!config.deterministic_capture);
+        match config.capture.expect("capture spec") {
+            VisualCaptureSpec::Smoke { path } => {
+                assert_eq!(path, PathBuf::from("target/visual/current/startup.png"));
+            }
+            other => panic!("unexpected capture spec: {other:?}"),
+        }
+    }
+
+    #[test]
     fn hud_mentions_core_state_and_preview() {
         let local = LocalGame::new_human_vs_human();
         let recon = ReconPanel::default();
@@ -3100,6 +4358,10 @@ mod tests {
             controls: ControlScheme::LegacyInspired,
             pixel_scale: 1.5,
             ernie_level: 12,
+            display_name: "Ada".to_string(),
+            community_label: "garage".to_string(),
+            direct_listen_addr: "127.0.0.1:4405".to_string(),
+            lobby_addr: "127.0.0.1:4404".to_string(),
         };
 
         let encoded = toml::to_string_pretty(&settings).expect("settings encode");
@@ -3108,6 +4370,38 @@ mod tests {
         assert_eq!(decoded, settings);
         assert!(encoded.contains("high-contrast"));
         assert!(encoded.contains("legacy-inspired"));
+        assert!(encoded.contains("Ada"));
+    }
+
+    #[test]
+    fn generated_sound_pack_maps_all_semantic_events() {
+        let packs = SoundPacks::load(&assets_dir());
+
+        for event in SoundEvent::ALL {
+            let loaded = packs
+                .sound_for(SoundPackChoice::GeneratedDefault, event)
+                .expect("generated-default maps every semantic event");
+            assert!(loaded.file.ends_with(".wav"));
+        }
+        assert!(packs
+            .sound_for(SoundPackChoice::Muted, SoundEvent::LineClear)
+            .is_none());
+    }
+
+    #[test]
+    fn lobby_registration_preview_uses_protocol_identity() {
+        let settings = ClientSettings {
+            display_name: "Ada Lovelace".to_string(),
+            direct_listen_addr: "127.0.0.1:4405".to_string(),
+            ..Default::default()
+        };
+
+        let preview = lobby_registration_preview(&settings);
+
+        assert_eq!(preview.player.player_id, "ada-lovelace");
+        assert_eq!(preview.player.display_name, "Ada Lovelace");
+        assert_eq!(preview.direct_addr, "127.0.0.1:4405");
+        assert!(preview.ranked);
     }
 
     #[test]

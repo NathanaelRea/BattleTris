@@ -858,6 +858,31 @@ impl TwoPlayerGame {
         )
     }
 
+    /// Creates a deterministic bazaar-phase session for adapters and visual fixtures.
+    #[must_use]
+    pub fn bazaar_fixture(
+        player_one_seed: GameSeed,
+        player_one_board: Board,
+        player_one_funds: i32,
+        player_two_seed: GameSeed,
+        player_two_board: Board,
+        player_two_funds: i32,
+    ) -> Self {
+        let mut game = Self::with_boards(
+            player_one_seed,
+            player_one_board,
+            player_two_seed,
+            player_two_board,
+        );
+        game.player_one.set_funds(player_one_funds);
+        game.player_two.set_funds(player_two_funds);
+        game.phase = GamePhase::Bazaar;
+        game.bazaar_done = [false, false];
+        game.open_bazaar_sessions();
+        game.record(BattleEvent::BazaarEntered);
+        game
+    }
+
     fn with_boards_and_mode(
         player_one_seed: GameSeed,
         player_one_board: Board,
@@ -1553,6 +1578,32 @@ mod tests {
             }]
         );
         assert_eq!(game.active_piece().unwrap().kind(), PieceKind::Plug);
+    }
+
+    #[test]
+    fn bazaar_fixture_opens_sessions_with_seeded_funds() {
+        let game = TwoPlayerGame::bazaar_fixture(
+            GameSeed::from_u64(1),
+            Board::empty(),
+            650,
+            GameSeed::from_u64(2),
+            Board::empty(),
+            425,
+        );
+
+        assert_eq!(game.phase(), GamePhase::Bazaar);
+        assert_eq!(
+            game.bazaar_session(PlayerId::One).unwrap().staged_funds(),
+            650
+        );
+        assert_eq!(
+            game.bazaar_session(PlayerId::Two).unwrap().staged_funds(),
+            425
+        );
+        assert!(game
+            .event_log()
+            .iter()
+            .any(|logged| matches!(logged.event, BattleEvent::BazaarEntered)));
     }
 
     #[test]
