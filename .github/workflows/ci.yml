@@ -21,6 +21,13 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y pkg-config libasound2-dev
+
       - name: Run full check
         shell: bash
         run: ./scripts/full-check.sh
@@ -35,10 +42,12 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build package
+      - name: Install Linux native dependencies
         shell: bash
-        run: ./scripts/package-release.sh > /tmp/battletris-package-path.txt
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y pkg-config libasound2-dev
 
-      - name: Smoke package
+      - name: Run package check
         shell: bash
-        run: ./scripts/smoke-package.sh "$(cat /tmp/battletris-package-path.txt)"
+        run: ./scripts/package-check.sh

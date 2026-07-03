@@ -12,6 +12,9 @@ different installed target.
 Run `./scripts/smoke-package.sh dist/<archive>.tar.gz` to verify the archive
 layout before publishing.
 
+Run `./scripts/package-check.sh` to match the CI package job locally: it builds
+the host release archive, then runs package smoke against that archive.
+
 ## User Paths
 
 The client follows ADR 0005 and uses

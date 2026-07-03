@@ -45,10 +45,25 @@ rendering, networking, or tools.
 
 ## Local Quality Gate
 
-Run these commands before handing off a phase:
+On Linux, the Bevy client audio stack needs `pkg-config` and ALSA development
+files before Cargo can build the workspace. Run the native dependency preflight
+when setting up a workstation or when CI reports a missing system library:
+
+```sh
+./scripts/check-native-deps.sh
+```
+
+Run the full gate before handing off a phase:
 
 ```sh
 ./scripts/full-check.sh
 ```
 
-Linux CI runs the same gate for every push and pull request.
+Run the package CI job locally when release packaging or bundled assets change:
+
+```sh
+./scripts/package-check.sh
+```
+
+CI installs the same Linux native packages, runs the same full gate for every
+push and pull request, and uses `./scripts/package-check.sh` for package smoke.

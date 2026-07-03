@@ -17,6 +17,8 @@ version="${BATTLETRIS_VERSION:-${package_id##*#}}"
 package_name="battletris-${version}-${target_triple}"
 package_dir="dist/${package_name}"
 
+./scripts/check-native-deps.sh
+
 cargo_args=(build --release --locked -p battletris-client -p battletris-server -p battletris-tools)
 target_dir="target/release"
 if [[ "$target_triple" != "$host_target" ]]; then

@@ -143,11 +143,22 @@ pub fn board_to_text(board: &Board) -> String {
 
 fn split_front_matter(contents: &str) -> Result<(&str, &str), FixtureError> {
     let contents = contents
-        .strip_prefix("+++\n")
+        .strip_prefix("+++\r\n")
+        .or_else(|| contents.strip_prefix("+++\n"))
         .ok_or(FixtureError::MissingFrontMatter)?;
-    let (metadata, body) = contents
-        .split_once("\n+++\n")
+
+    let (delimiter_start, delimiter_len) = contents
+        .find("\r\n+++\r\n")
+        .map(|index| (index, "\r\n+++\r\n".len()))
+        .or_else(|| {
+            contents
+                .find("\n+++\n")
+                .map(|index| (index, "\n+++\n".len()))
+        })
         .ok_or(FixtureError::MissingFrontMatter)?;
+
+    let metadata = &contents[..delimiter_start];
+    let body = &contents[delimiter_start + delimiter_len..];
     Ok((metadata, body))
 }
 
@@ -288,6 +299,20 @@ mod tests {
         assert_eq!(rows.next(), Some("XS123456HF"));
         assert_eq!(rows.next(), Some("GIT......."));
         assert_eq!(text.lines().count(), BOARD_HEIGHT);
+    }
+
+    #[test]
+    fn board_fixture_accepts_crlf_line_endings() {
+        let contents = include_str!("../fixtures/board/mixed-cells.btfix")
+            .replace("\r\n", "\n")
+            .replace('\n', "\r\n");
+        let fixture = TextFixture::new("mixed-cells-crlf", &contents);
+
+        let board = parse_board_fixture(fixture).expect("CRLF fixture should parse");
+
+        assert_eq!(board.width(), BOARD_WIDTH);
+        assert_eq!(board.height(), BOARD_HEIGHT);
+        assert_eq!(board.get(Coord::new(0, 0).unwrap()), Some(Cell::visible()));
     }
 
     #[test]

@@ -10,6 +10,7 @@ run() {
     "$@"
 }
 
+run ./scripts/check-native-deps.sh
 run cargo fmt --all -- --check
 run cargo clippy --workspace --all-targets -- -D warnings
 run cargo test --workspace --all-targets
