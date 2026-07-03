@@ -9,3 +9,6 @@ description = "BattleTris player profiles, ranking, statistics, and persistence.
 workspace = true
 
 [dependencies]
+directories = "6.0.0"
+refinery = { version = "0.9.2", default-features = false, features = ["rusqlite-bundled"] }
+rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }

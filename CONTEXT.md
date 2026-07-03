@@ -114,6 +114,14 @@ _Avoid_: P2P when the exact transport has not been chosen
 Network play that depends on a lobby, relay, dedicated server, or server-verified ranking service.
 _Avoid_: Internet play when authority and relay responsibilities matter
 
+**Self-Hosted Lobby**:
+A community-owned hosted play service that lists available games, issues session ids and seeds, and verifies ranked results without requiring a global service.
+_Avoid_: Matchmaking when the service only lists joinable games
+
+**Result Claim**:
+A participant's server-submitted summary of a completed ranked game. Hosted ranked writes require matching claims from both players.
+_Avoid_: Score report when the payload includes the full winner/loser result
+
 ## Relationships
 
 - A **BattleTris Game** has exactly two **Players**.
@@ -126,6 +134,7 @@ _Avoid_: Internet play when authority and relay responsibilities matter
 - A **Timed Weapon** creates an **Active Effect** that expires by **Line Duration**.
 - A **Computer Opponent** participates in a **BattleTris Game** but never creates a **Ranked Game**.
 - A **Community** owns the scope for **Player Records** and rankings.
+- A **Self-Hosted Lobby** owns hosted session discovery and server-verified **Result Claims** for its **Community**.
 
 ## Example Dialogue
 

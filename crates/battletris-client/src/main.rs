@@ -944,7 +944,7 @@ fn menu_label(game: &TwoPlayerGame, settings: &ClientSettings) -> String {
     match settings.screen {
         ClientScreen::Startup => "BattleTris\nH local human-vs-human\nC unranked human-vs-computer\nF2 challenge placeholder  F3 settings  F4 about  F5 roster  F6 sleep".to_string(),
         ClientScreen::Game => String::new(),
-        ClientScreen::Challenge => "Challenge\nDirect-connect challenge setup lands in the protocol/networking phases.\nEsc returns to the active local game.".to_string(),
+        ClientScreen::Challenge => "Challenge\nDirect-connect challenge setup is not wired into this client yet.\nEsc returns to the active local game.".to_string(),
         ClientScreen::Sleep => "Sleep\nPlaceholder for legacy sleep/biff presence behavior.\nEsc returns to the active local game.".to_string(),
         ClientScreen::About => "About\nBattleTris Rust/Bevy rewrite. Core rules are deterministic Rust; this client is an adapter.\nEsc returns to the active local game.".to_string(),
         ClientScreen::Roster => roster_label(game),
@@ -965,7 +965,7 @@ fn roster_label(game: &TwoPlayerGame) -> String {
         "unranked"
     };
     format!(
-        "Roster\nPlayer 1: local human\nPlayer 2: {}\nCurrent game is {ranked}. Persistent records arrive in Phase 16.\nEsc returns to game.",
+        "Roster\nPlayer 1: local human\nPlayer 2: {}\nCurrent game is {ranked}. Persistent records are not shown here.\nEsc returns to game.",
         match game.mode() {
             GameMode::HumanVsHuman => "local human",
             GameMode::HumanVsComputer { .. } => "computer Ernie",

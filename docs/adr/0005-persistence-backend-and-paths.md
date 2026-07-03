@@ -16,7 +16,7 @@ The persistence backend and path conventions affect `battletris-db`,
 
 ## Decision
 
-Use SQLite through `rusqlite = "0.40.1"` with bundled SQLite for consistent
+Use SQLite through `rusqlite = "0.39.0"` with bundled SQLite for consistent
 desktop builds. Use `refinery = "0.9.2"` for schema migrations and
 `directories = "6.0.0"` for cross-platform project directories. Store
 user-editable client settings as TOML.
@@ -24,7 +24,7 @@ user-editable client settings as TOML.
 Initial dependencies:
 
 ```toml
-rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
+rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
 refinery = { version = "0.9.2", default-features = false, features = ["rusqlite-bundled"] }
 directories = "6.0.0"
 toml = "1.1.2+spec-1.1.0"
@@ -56,3 +56,6 @@ if real legacy `.idx`/`.dat` files appear.
 - Migrations are testable from an empty database and previous schema versions.
 - Identity model and ranked trust scope still need the Phase 16 decision before
   implementation writes ranked records.
+- Phase 16 implementation uses `rusqlite 0.39.0` because `refinery 0.9.2`'s
+  rusqlite integration rejects `rusqlite 0.40.1` through the `libsqlite3-sys`
+  links constraint.

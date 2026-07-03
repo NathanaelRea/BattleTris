@@ -37,8 +37,8 @@ Resolved product decisions:
 | Persistence        | Start with a new schema and migrations. No known legacy records are required for v1, but keep an import/export path available if old DB records surface.                                                |
 | Platforms          | V1 targets Linux, macOS, and Windows. Web is out of v1 unless a later ADR adds it.                                                                                                                      |
 | Networking MVP     | Start with local networking: LAN/direct-IP or local-host flows before hosted infrastructure.                                                                                                            |
-| Networking MVP+    | Put hosted/self-hosted server, relay, lobby, and internet play behind a later MVP+ phase.                                                                                                               |
-| Ranked trust       | Local/P2P play can assume friendly participants. Hosted or self-hosted ranked play should be server-verified.                                                                                           |
+| Networking MVP+    | ADR 0007 selects a self-hosted lobby plus ranked-result authority foundation. Relay transport, NAT traversal, reconnect tokens, and fully authoritative per-tick simulation remain later scope.          |
+| Ranked trust       | Local/direct-connect play can assume friendly participants. Hosted or self-hosted ranked play is server-verified by matching result claims from both players before records mutate.                     |
 | Spectators/replays | Defer spectators and replays to MVP++ or later.                                                                                                                                                         |
 | Identity           | V1 has no account requirement. MVP+ can add server-issued identity for hosted/self-hosted servers.                                                                                                      |
 | Rankings           | Rankings are scoped to a server/community, not globally hard-coded. A "main" network can emerge operationally if one deployment becomes canonical.                                                      |
@@ -68,7 +68,7 @@ Modernization decisions for the rewrite:
 | Rendering/UI        | Replace Motif/X11 with Bevy while preserving screens and flows. Current external recommendation is Bevy `0.19.0`, sprite/atlas board rendering, Bevy UI for player screens, and a local action map. Motif internals should not leak into core rules or data models. |
 | Assets              | Treat art, fonts, themes, and sounds as data packs. Use generated/source-controlled audio first; recovered original sounds are optional. See `docs/external-research.md` for the theme and sound-pack layout.              |
 | Network format      | Do not preserve C++ ABI details like `unsigned long` packet sizes. ADR 0003 selects a fixed-width frame envelope with postcard payloads and compatibility fixtures.                                                            |
-| Networking topology | Preserve challenge/start/play/bazaar/game-over flow, but do not require the old server/slave direct-peer architecture. ADR 0004 selects direct TCP connect plus best-effort LAN discovery for Phase 15.                    |
+| Networking topology | Preserve challenge/start/play/bazaar/game-over flow, but do not require the old server/slave direct-peer architecture. ADR 0004 selects direct TCP connect plus best-effort LAN discovery for Phase 15; ADR 0007 adds self-hosted lobby discovery and ranked-result authority for Phase 17. |
 | Identity            | Do not bind new identity to Unix login/GECOS/plan files. V1 should not require accounts; MVP+ hosted/self-hosted servers can issue identities.                                                                               |
 | Persistence         | Do not port the hash-file DB implementation unless needed for import. ADR 0005 selects SQLite, migrations, and cross-platform project paths for the fresh schema.                                                              |
 | Build               | Replace Make/autoconf and custom containers with Cargo workspace, CI, tests, clippy, formatting, and idiomatic Rust collections.                                                                                             |
@@ -98,6 +98,7 @@ Known quirks that need explicit tests or ADRs before changing:
 | Bazaar start is a local/ring event derived from score wrap, not a peer wire packet.                                              | Protocol design should not require a `BT_START_BAZ` wire message unless an ADR intentionally changes the flow.       |
 | Randomness mixes `rand`, `drand48`, and `lrand48`.                                                                               | Do not preserve RNG implementation; preserve distributions and outcomes through seedable Rust RNG fixtures.          |
 | Protocol comments are stale in places.                                                                                           | Treat implementation as authoritative over comments.                                                                 |
+| Legacy player records depend on Unix login/GECOS/plan files and contain named-player high-funds caps.                           | ADR 0006 intentionally fixes these fresh-schema bugs while preserving rank/stat concepts and tests.                  |
 
 ## Legacy Source Inventory By Domain
 
@@ -176,7 +177,17 @@ sound-event mapping while gameplay decisions remain in `battletris-core`.
 | `BT_CHALL` comments are stale; implementation sends `BTNetworkEntry`.                                               | `usr/src/game/BTProtocol.H:36`, `usr/src/game/BTNetManager.C:238-290`                                           | Capture real payloads in protocol tests.                     |
 | Board snapshots carry motivation, height, width, and cell IDs.                                                      | `usr/src/game/BTCommManager.C:332-364`, `usr/src/game/BTBoard.C:14-36`                                          | Replace negative/invisible casts with typed cells.           |
 | Arsenal snapshots carry length plus `(weaponToken, quantity)` pairs.                                                | `usr/src/game/BTCommManager.C:366-409`                                                                          | Use for Lazy Susan and protocol fixtures.                    |
-| Remote weapons are queued, then flushed after current piece placement/scoring/recon and before next-piece creation. | `usr/src/game/BTCommManager.C:419-424`, `usr/src/game/BTCommManager.C:573-589`, `usr/src/game/BTGame.C:776-803` | Core FIFO and event ordering are implemented in `battletris-core::game`; exact wire payloads remain Phase 14. |
+| Remote weapons are queued, then flushed after current piece placement/scoring/recon and before next-piece creation. | `usr/src/game/BTCommManager.C:419-424`, `usr/src/game/BTCommManager.C:573-589`, `usr/src/game/BTGame.C:776-803` | Core FIFO and event ordering are implemented in `battletris-core::game`; Phase 14 adds protocol-owned launch/active/expired wire payloads without exposing local event enums. |
+
+### Rust Protocol Boundary
+
+Phase 14 implements `battletris-protocol` as a standalone wire boundary. Frames use the ADR 0003 16-byte big-endian envelope with magic `BTRS`, protocol version `1.0`, message kind, flags, and payload length. Payloads are postcard-encoded serde structs, and decoders validate magic, major version, maximum payload length, and exact frame length before deserializing.
+
+The first public message set covers direct-connect foundations: hello/version advertisement, challenge, accept, deny, deterministic start, player input, board/score/arsenal snapshots, weapon launch/active/expired messages, bazaar done/state, game-over, pause/resume state, and graceful disconnect. These are intentionally protocol-owned types rather than `battletris-core::BattleEvent` values so local ring events such as bazaar start remain derived locally unless a later protocol ADR changes that boundary.
+
+Phase 15 adds the first transport adapter in `battletris-protocol`: Tokio direct TCP frame I/O plus host/join helpers for hello, challenge, accept, deterministic start, scripted inputs, score snapshots, bazaar completion, game-over, and disconnect. LAN discovery remains best-effort metadata using `_battletris._tcp.local.` with TXT fields for protocol version, display name, port, and availability; manual direct connect is the required path. Integration tests run two headless clients over loopback and treat mismatched snapshots as desync evidence without introducing hosted authority or server-verified ranked play.
+
+Phase 17 adds hosted/self-hosted protocol messages for lobby registration, lobby listing, server-issued game starts, ranked result claims, and result accept/reject responses. ADR 0007 selects a self-hosted lobby plus ranked-result authority: direct gameplay transport can remain peer-to-peer, while the server owns session ids, deterministic seeds, protocol-major admission, stale/completed session rejection, and ranked record writes. Ranked writes require both players to submit matching result claims for the same live session before `battletris-server` adapts the result into `battletris-db`.
 
 ### Legacy Message Groups
 
@@ -219,6 +230,23 @@ Legacy DB shape inputs for the modern schema:
 | Legacy storage          | Hash database split across `.idx` and `.dat` files with binary record payloads. Use only as an optional import source, not as the new persistence model.              | `usr/src/db/BTDB.H:21-24`, `usr/src/db/BTDB.H:32-90`                                                           |
 
 There are no known legacy DB files to migrate. The modern schema should be designed from these record shapes and migrations should start fresh. If old `.idx`/`.dat` files appear, build a one-time importer unless repeated import becomes a real requirement.
+
+### Rust Persistence Boundary
+
+Phase 16 implements `battletris-db` as a SQLite-backed fresh schema with embedded
+`refinery` migrations. Player identity uses explicit BattleTris player ids plus
+display names and community labels rather than Unix login, GECOS, or plan-file
+lookups. The default community label is `local`; future hosted/self-hosted
+deployments can select their own labels without creating a hard-coded global
+ranking service.
+
+Ranked human-vs-human results update both players in one transaction: legacy
+starting rank `1200`, the legacy integer rank formula with average game value
+`5`, wins/losses, current streak, best score/lines/funds, fastest kill,
+quickest death, longest game, result history, and reciprocal head-to-head rows.
+Computer games and explicitly unranked games do not mutate player records. ADR
+0006 documents the compatibility choice to preserve ranking concepts while
+fixing fresh-schema bugs such as named-player high-funds caps.
 
 ## Weapon Catalog
 

@@ -292,7 +292,7 @@ impl ActiveEffects {
     }
 }
 
-/// Returns whether a token has line duration and belongs to the Phase 9 timed set.
+/// Returns whether a token is one of the standard line-duration attack weapons.
 #[must_use]
 pub const fn is_timed_weapon(token: WeaponToken) -> bool {
     matches!(
@@ -317,9 +317,9 @@ pub const fn is_timed_weapon(token: WeaponToken) -> bool {
     )
 }
 
-/// Returns whether a token is one of the Phase 10 line-duration weapons.
+/// Returns whether a token is a recon or Mirror line-duration weapon.
 #[must_use]
-pub const fn is_phase_10_timed_weapon(token: WeaponToken) -> bool {
+pub const fn is_recon_or_mirror_timed_weapon(token: WeaponToken) -> bool {
     matches!(
         token,
         WeaponToken::Ames | WeaponToken::Ace | WeaponToken::Condor | WeaponToken::Mirror

@@ -13,7 +13,7 @@ use crate::{
     rng::{GameSeed, RngStream},
     score::{BazaarTracker, PlayerScore},
     weapons::{
-        is_phase_10_timed_weapon, is_timed_weapon, mirror_nullifies, ActiveEffects, Arsenal,
+        is_recon_or_mirror_timed_weapon, is_timed_weapon, mirror_nullifies, ActiveEffects, Arsenal,
         ArsenalError, Bazaar, BazaarError, WeaponToken,
     },
 };
@@ -112,7 +112,7 @@ pub enum LaunchError {
     NotPlaying,
     /// The numbered arsenal slot could not be consumed.
     Arsenal(ArsenalError),
-    /// The selected weapon is neither a Phase 8 one-shot nor a Phase 9 timed weapon.
+    /// The selected weapon is neither one-shot nor line-duration.
     UnsupportedWeapon(WeaponToken),
 }
 
@@ -1125,7 +1125,7 @@ impl TwoPlayerGame {
                 | WeaponToken::Keating
                 | WeaponToken::NiceDay
                 | WeaponToken::Susan => unreachable!("mirror nullifies this one-shot"),
-                _ => unreachable!("checked by is_phase_8_one_shot"),
+                _ => unreachable!("checked by is_one_shot_weapon"),
             }
             return;
         }
@@ -1172,7 +1172,7 @@ impl TwoPlayerGame {
             WeaponToken::Gimp => {
                 target.board.gimp_removable_cells();
             }
-            _ => unreachable!("checked by is_phase_8_one_shot"),
+            _ => unreachable!("checked by is_one_shot_weapon"),
         }
     }
 
@@ -1205,7 +1205,7 @@ impl TwoPlayerGame {
     }
 
     fn apply_weapon_effect(&mut self, launcher: PlayerId, target: PlayerId, token: WeaponToken) {
-        if is_phase_8_one_shot(token) {
+        if is_one_shot_weapon(token) {
             self.apply_one_shot_weapon(launcher, target, token);
             self.record(BattleEvent::OneShotWeaponApplied {
                 launcher,
@@ -1467,7 +1467,7 @@ const fn player_index(player: PlayerId) -> usize {
     }
 }
 
-const fn is_phase_8_one_shot(token: WeaponToken) -> bool {
+const fn is_one_shot_weapon(token: WeaponToken) -> bool {
     matches!(
         token,
         WeaponToken::Swap
@@ -1487,7 +1487,7 @@ const fn is_phase_8_one_shot(token: WeaponToken) -> bool {
 }
 
 const fn is_supported_launch_weapon(token: WeaponToken) -> bool {
-    is_phase_8_one_shot(token) || is_timed_weapon(token) || is_phase_10_timed_weapon(token)
+    is_one_shot_weapon(token) || is_timed_weapon(token) || is_recon_or_mirror_timed_weapon(token)
 }
 
 const fn timed_effect_target(launcher: PlayerId, target: PlayerId, token: WeaponToken) -> PlayerId {
@@ -1875,7 +1875,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_8_one_shot_weapons_apply_deterministic_scenarios() {
+    fn one_shot_weapons_apply_deterministic_scenarios() {
         assert_swap_meet_swaps_boards();
         assert_rise_up_inserts_garbage_line();
         assert_flip_out_mirrors_board();
@@ -1924,7 +1924,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_9_timed_weapons_apply_activation_effects() {
+    fn timed_attack_weapons_apply_activation_effects() {
         for token in [
             WeaponToken::FearedWeird,
             WeaponToken::FourByFour,
@@ -2012,7 +2012,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_10_spy_weapons_activate_on_launcher_and_emit_recon_after_placement() {
+    fn recon_weapons_activate_on_launcher_and_emit_recon_after_placement() {
         let mut game = TwoPlayerGame::with_boards(
             GameSeed::from_u64(100),
             Board::empty(),
