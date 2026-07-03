@@ -16,7 +16,9 @@ use battletris_core::{
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured};
-use std::{ffi::OsStr, fmt::Write as _, path::PathBuf};
+use directories::ProjectDirs;
+use serde::{Deserialize, Serialize};
+use std::{ffi::OsStr, fmt::Write as _, fs, path::PathBuf};
 
 const CELL_SIZE: f32 = 18.0;
 const CELL_GAP: f32 = 1.5;
@@ -25,13 +27,15 @@ const PLAYER_ONE_LEFT: f32 = -360.0;
 const PLAYER_TWO_LEFT: f32 = 120.0;
 const SMOKE_SCREENSHOT_CAPTURE_DELAY_FRAMES: u16 = 5;
 const SMOKE_SCREENSHOT_TIMEOUT_FRAMES: u16 = 300;
+const SETTINGS_FILE_NAME: &str = "settings.toml";
 
 fn main() {
     let smoke_screenshot = smoke_screenshot_path().map(SmokeScreenshot::new);
+    let settings = ClientSettings::load_or_default();
     let mut app = App::new();
     app.insert_resource(ClearColor(Color::srgb(0.045, 0.05, 0.065)))
         .insert_resource(LocalGame::new_human_vs_human())
-        .insert_resource(ClientSettings::default())
+        .insert_resource(settings)
         .insert_resource(SoundEventState::default())
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
@@ -72,19 +76,22 @@ enum ClientScreen {
     Settings,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 enum ThemeChoice {
     OriginalInspired,
     HighContrast,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 enum SoundPackChoice {
     GeneratedDefault,
     Muted,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 enum ControlScheme {
     ModernSplit,
     LegacyInspired,
@@ -97,12 +104,102 @@ struct ClientSettings {
     sound_pack: SoundPackChoice,
     controls: ControlScheme,
     pixel_scale: f32,
+    settings_path: Option<PathBuf>,
+    assets_dir: PathBuf,
 }
 
 impl Default for ClientSettings {
     fn default() -> Self {
         Self {
             screen: ClientScreen::Startup,
+            theme: ThemeChoice::OriginalInspired,
+            sound_pack: SoundPackChoice::GeneratedDefault,
+            controls: ControlScheme::ModernSplit,
+            pixel_scale: 1.0,
+            settings_path: settings_path(),
+            assets_dir: assets_dir(),
+        }
+    }
+}
+
+impl ClientSettings {
+    fn load_or_default() -> Self {
+        let mut settings = Self::default();
+        let Some(path) = &settings.settings_path else {
+            return settings;
+        };
+
+        let Ok(contents) = fs::read_to_string(path) else {
+            return settings;
+        };
+
+        match toml::from_str::<PersistedClientSettings>(&contents) {
+            Ok(persisted) => settings.apply_persisted(persisted),
+            Err(error) => warn!(
+                "BattleTris settings file {} could not be parsed: {error}",
+                path.display()
+            ),
+        }
+        settings
+    }
+
+    fn save(&self) {
+        let Some(path) = &self.settings_path else {
+            return;
+        };
+
+        if let Some(parent) = path.parent() {
+            if let Err(error) = fs::create_dir_all(parent) {
+                warn!(
+                    "BattleTris settings directory {} could not be created: {error}",
+                    parent.display()
+                );
+                return;
+            }
+        }
+
+        match toml::to_string_pretty(&self.persisted()) {
+            Ok(contents) => {
+                if let Err(error) = fs::write(path, contents) {
+                    warn!(
+                        "BattleTris settings file {} could not be written: {error}",
+                        path.display()
+                    );
+                }
+            }
+            Err(error) => warn!("BattleTris settings could not be serialized: {error}"),
+        }
+    }
+
+    fn persisted(&self) -> PersistedClientSettings {
+        PersistedClientSettings {
+            theme: self.theme,
+            sound_pack: self.sound_pack,
+            controls: self.controls,
+            pixel_scale: self.pixel_scale,
+        }
+    }
+
+    fn apply_persisted(&mut self, persisted: PersistedClientSettings) {
+        self.theme = persisted.theme;
+        self.sound_pack = persisted.sound_pack;
+        self.controls = persisted.controls;
+        self.pixel_scale = sanitize_pixel_scale(persisted.pixel_scale);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+struct PersistedClientSettings {
+    theme: ThemeChoice,
+    sound_pack: SoundPackChoice,
+    controls: ControlScheme,
+    pixel_scale: f32,
+}
+
+impl Default for PersistedClientSettings {
+    fn default() -> Self {
+        Self {
             theme: ThemeChoice::OriginalInspired,
             sound_pack: SoundPackChoice::GeneratedDefault,
             controls: ControlScheme::ModernSplit,
@@ -379,6 +476,8 @@ fn handle_settings_input(
     settings: &mut ClientSettings,
     sound: &mut SoundEventState,
 ) {
+    let previous = settings.persisted();
+
     if keys.just_pressed(KeyCode::KeyT) {
         settings.theme = match settings.theme {
             ThemeChoice::OriginalInspired => ThemeChoice::HighContrast,
@@ -401,12 +500,16 @@ fn handle_settings_input(
         sound.last_event = Some(SoundEvent::MenuAction);
     }
     if keys.just_pressed(KeyCode::Equal) {
-        settings.pixel_scale = (settings.pixel_scale + 0.25).min(2.0);
+        settings.pixel_scale = sanitize_pixel_scale(settings.pixel_scale + 0.25).min(2.0);
         sound.last_event = Some(SoundEvent::MenuAction);
     }
     if keys.just_pressed(KeyCode::Minus) {
-        settings.pixel_scale = (settings.pixel_scale - 0.25).max(0.75);
+        settings.pixel_scale = sanitize_pixel_scale(settings.pixel_scale - 0.25).max(0.75);
         sound.last_event = Some(SoundEvent::MenuAction);
+    }
+
+    if settings.persisted() != previous {
+        settings.save();
     }
 }
 
@@ -949,13 +1052,51 @@ fn menu_label(game: &TwoPlayerGame, settings: &ClientSettings) -> String {
         ClientScreen::About => "About\nBattleTris Rust/Bevy rewrite. Core rules are deterministic Rust; this client is an adapter.\nEsc returns to the active local game.".to_string(),
         ClientScreen::Roster => roster_label(game),
         ClientScreen::Settings => format!(
-            "Settings\nT theme: {:?}\nO sound pack: {:?}\nM controls: {}\n-/= scale: {:.2}x\nEsc returns to game",
+            "Settings\nT theme: {:?}\nO sound pack: {:?}\nM controls: {}\n-/= scale: {:.2}x\nassets: {}\nsettings: {}\nEsc returns to game",
             settings.theme,
             settings.sound_pack,
             controls_label(settings.controls),
-            settings.pixel_scale
+            settings.pixel_scale,
+            settings.assets_dir.display(),
+            settings
+                .settings_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "unavailable".to_string()),
         ),
     }
+}
+
+fn sanitize_pixel_scale(pixel_scale: f32) -> f32 {
+    if pixel_scale.is_finite() {
+        pixel_scale.clamp(0.75, 2.0)
+    } else {
+        1.0
+    }
+}
+
+fn settings_path() -> Option<PathBuf> {
+    ProjectDirs::from("org", "BattleTris", "BattleTris")
+        .map(|dirs| dirs.config_dir().join(SETTINGS_FILE_NAME))
+}
+
+fn assets_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("BATTLETRIS_ASSETS_DIR") {
+        return PathBuf::from(path);
+    }
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(package_root) = exe_path.parent().and_then(|bin_dir| bin_dir.parent()) {
+            let packaged_assets = package_root.join("assets");
+            if packaged_assets.join("manifest.toml").is_file() {
+                return packaged_assets;
+            }
+        }
+    }
+
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("assets")
 }
 
 fn roster_label(game: &TwoPlayerGame) -> String {
@@ -1292,5 +1433,38 @@ mod tests {
             sound_event_for(&BattleEvent::BazaarEntered),
             Some(SoundEvent::BazaarEntered)
         );
+    }
+
+    #[test]
+    fn client_settings_round_trip_as_toml() {
+        let settings = PersistedClientSettings {
+            theme: ThemeChoice::HighContrast,
+            sound_pack: SoundPackChoice::Muted,
+            controls: ControlScheme::LegacyInspired,
+            pixel_scale: 1.5,
+        };
+
+        let encoded = toml::to_string_pretty(&settings).expect("settings encode");
+        let decoded: PersistedClientSettings = toml::from_str(&encoded).expect("settings decode");
+
+        assert_eq!(decoded, settings);
+        assert!(encoded.contains("high-contrast"));
+        assert!(encoded.contains("legacy-inspired"));
+    }
+
+    #[test]
+    fn persisted_pixel_scale_is_sanitized() {
+        let mut settings = ClientSettings::default();
+        settings.apply_persisted(PersistedClientSettings {
+            pixel_scale: f32::NAN,
+            ..Default::default()
+        });
+        assert_eq!(settings.pixel_scale, 1.0);
+
+        settings.apply_persisted(PersistedClientSettings {
+            pixel_scale: 99.0,
+            ..Default::default()
+        });
+        assert_eq!(settings.pixel_scale, 2.0);
     }
 }

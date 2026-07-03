@@ -1,0 +1,15 @@
+schema_version = 1
+name = "BattleTris default assets"
+version = "0.1.0"
+
+[themes.original-inspired]
+path = "themes/original-inspired/theme.toml"
+description = "Scalable original-inspired default colors used by the Bevy client."
+
+[themes.high-contrast]
+path = "themes/high-contrast/theme.toml"
+description = "High-contrast accessibility validation theme."
+
+[sounds.generated-default]
+path = "sounds/generated-default/sound-pack.toml"
+description = "Semantic generated sound-pack manifest; synthesized audio files can be added without changing client events."

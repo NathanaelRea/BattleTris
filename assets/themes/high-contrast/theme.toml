@@ -1,0 +1,4 @@
+name = "High Contrast"
+kind = "theme"
+format_version = 1
+description = "High-contrast color theme compiled into the current Bevy renderer."

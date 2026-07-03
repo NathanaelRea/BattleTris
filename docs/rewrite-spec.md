@@ -159,9 +159,28 @@ sound-event mapping while gameplay decisions remain in `battletris-core`.
 | --- | --- |
 | Startup/menu flow | `battletris-client` exposes startup, challenge placeholder, settings, about placeholder, roster placeholder, sleep placeholder, and game screens through keyboard shortcuts. Challenge remains a placeholder until protocol/networking phases. |
 | Local modes | Startup can launch local human-vs-human or unranked human-vs-computer. Computer play uses the deterministic core `ComputerOpponent` for placement commands and the core `HumanVsComputer` mode for unranked status. |
-| Settings | Runtime settings cover theme, sound-pack selection, control layout, and pixel scale. Persistence to platform config paths remains Phase 16/18 polish. |
-| Themes/assets | The default theme is original-inspired scalable sprites; a high-contrast theme validates the swappable theme boundary without blocking on final art packs. |
-| Audio | The client maps core `BattleEvent`/`CoreEvent` values to semantic `SoundEvent` categories such as menu action, line clear, bazaar, weapon launch, warning, and game over. The generated-default versus muted pack setting validates a swappable sound-pack boundary before recovered audio exists. |
+| Settings | Runtime settings cover theme, sound-pack selection, control layout, and pixel scale. Phase 18 persists these settings as TOML at `ProjectDirs::config_dir()/settings.toml` using the ADR 0005 app id, while gameplay state remains core-owned. |
+| Themes/assets | The default theme is original-inspired scalable sprites; a high-contrast theme validates the swappable theme boundary without blocking on final art packs. Phase 18 packages source-controlled asset manifests under `assets/` next to the release binaries. |
+| Audio | The client maps core `BattleEvent`/`CoreEvent` values to semantic `SoundEvent` categories such as menu action, line clear, bazaar, weapon launch, warning, and game over. The generated-default versus muted pack setting validates a swappable sound-pack boundary before recovered audio exists, and Phase 18 bundles a generated-default sound-pack manifest. |
+
+## Distribution And Release
+
+Phase 18 ships source-built GitHub Release archives for the v1 target platforms:
+Linux, macOS, and Windows. `scripts/package-release.sh` builds release binaries
+for the selected target, creates a `battletris-<version>-<target>.tar.gz`
+archive under `dist/`, bundles `assets/`, documentation snapshots, `Cargo.lock`,
+and a `release-manifest.toml`, then writes a SHA-256 sidecar when the host has a
+hashing tool. `scripts/smoke-package.sh` unpacks an archive and checks the
+minimum shippable layout: client/server/tools binaries, asset manifests, release
+metadata, and docs.
+
+Packaged assets live at `assets/` next to the archive README, and the client can
+also use `BATTLETRIS_ASSETS_DIR` for development overrides. User settings follow
+ADR 0005: `directories::ProjectDirs::from("org", "BattleTris", "BattleTris")`
+with TOML settings at `config_dir()/settings.toml`; local player DB, user theme
+packs, sound packs, and logs keep the paths selected by that ADR. Storefront and
+package-manager distribution remains later scope after GitHub Releases are
+validated.
 
 ## Protocol And Networking
 

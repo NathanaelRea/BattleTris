@@ -122,6 +122,12 @@ _Avoid_: Matchmaking when the service only lists joinable games
 A participant's server-submitted summary of a completed ranked game. Hosted ranked writes require matching claims from both players.
 _Avoid_: Score report when the payload includes the full winner/loser result
 
+### Distribution
+
+**Release Package**:
+A versioned archive containing BattleTris binaries, bundled assets, release metadata, and documentation snapshots for one target platform.
+_Avoid_: Installer when the artifact is only an unpack-and-run archive
+
 ## Relationships
 
 - A **BattleTris Game** has exactly two **Players**.
@@ -135,6 +141,7 @@ _Avoid_: Score report when the payload includes the full winner/loser result
 - A **Computer Opponent** participates in a **BattleTris Game** but never creates a **Ranked Game**.
 - A **Community** owns the scope for **Player Records** and rankings.
 - A **Self-Hosted Lobby** owns hosted session discovery and server-verified **Result Claims** for its **Community**.
+- A **Release Package** bundles the client, optional server/tools binaries, default assets, and release metadata for one platform.
 
 ## Example Dialogue
 

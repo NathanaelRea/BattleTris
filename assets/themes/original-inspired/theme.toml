@@ -1,0 +1,4 @@
+name = "Original Inspired"
+kind = "theme"
+format_version = 1
+description = "Default scalable color theme compiled into the current Bevy renderer."

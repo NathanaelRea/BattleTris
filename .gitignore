@@ -34,3 +34,5 @@ usr/src/btref/btref.tmpdb*
 
 plan*.md
 target/
+dist/*
+!dist/README.md

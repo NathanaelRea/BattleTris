@@ -1,0 +1,13 @@
+name = "Generated Default"
+kind = "sound-pack"
+format_version = 1
+events = [
+    "menu_action",
+    "piece_locked",
+    "line_clear",
+    "bazaar_entered",
+    "purchase",
+    "weapon_launch",
+    "warning",
+    "game_over",
+]
