@@ -230,13 +230,13 @@ pub struct GameResult {
     /// Winner line count.
     pub winner_lines: u64,
     /// Winner funds.
-    pub winner_funds: u64,
+    pub winner_funds: i64,
     /// Loser score.
     pub loser_score: u64,
     /// Loser line count.
     pub loser_lines: u64,
     /// Loser funds.
-    pub loser_funds: u64,
+    pub loser_funds: i64,
     /// Game duration in seconds.
     pub duration_secs: u64,
     /// Whether the game was intended to be ranked.
@@ -400,10 +400,10 @@ impl PlayerStore {
                 result.loser_id.as_str(),
                 to_db(result.winner_score),
                 to_db(result.winner_lines),
-                to_db(result.winner_funds),
+                result.winner_funds,
                 to_db(result.loser_score),
                 to_db(result.loser_lines),
-                to_db(result.loser_funds),
+                result.loser_funds,
                 to_db(result.duration_secs),
                 to_db(now),
             ],
@@ -471,7 +471,7 @@ fn update_winner(
             ":rank": to_db(rank),
             ":score": to_db(result.winner_score),
             ":lines": to_db(result.winner_lines),
-            ":funds": to_db(result.winner_funds),
+            ":funds": result.winner_funds,
             ":duration": to_db(result.duration_secs),
             ":streak_count": to_db(streak_count),
             ":now": to_db(now),
@@ -517,7 +517,7 @@ fn update_loser(
             ":rank": to_db(rank),
             ":score": to_db(result.loser_score),
             ":lines": to_db(result.loser_lines),
-            ":funds": to_db(result.loser_funds),
+            ":funds": result.loser_funds,
             ":duration": to_db(result.duration_secs),
             ":streak_count": to_db(streak_count),
             ":now": to_db(now),
@@ -739,6 +739,26 @@ mod tests {
             .head_to_head(&human, &computer, &community)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn ranked_results_store_negative_final_funds() {
+        let mut store = PlayerStore::open_in_memory().unwrap();
+        let community = CommunityLabel::local();
+        let alice = PlayerId::new("alice").unwrap();
+        let bob = PlayerId::new("bob").unwrap();
+        store
+            .create_or_update_player(&alice, "Alice", &community)
+            .unwrap();
+        store
+            .create_or_update_player(&bob, "Bob", &community)
+            .unwrap();
+
+        let mut result = sample_result(&community, &alice, &bob, OpponentKind::Human, true);
+        result.winner_funds = -125;
+        result.loser_funds = -500;
+
+        assert!(store.record_game_result(&result).unwrap());
     }
 
     #[test]

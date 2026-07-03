@@ -1,13 +1,44 @@
 name = "Generated Default"
 kind = "sound-pack"
 format_version = 1
-events = [
-    "menu_action",
-    "piece_locked",
-    "line_clear",
-    "bazaar_entered",
-    "purchase",
-    "weapon_launch",
-    "warning",
-    "game_over",
-]
+description = "Generated short WAV cues for semantic BattleTris client events."
+
+[[event]]
+id = "menu_action"
+files = ["menu-action.wav"]
+volume = 0.55
+
+[[event]]
+id = "piece_locked"
+files = ["piece-locked.wav"]
+volume = 0.45
+
+[[event]]
+id = "line_clear"
+files = ["line-clear.wav"]
+volume = 0.65
+
+[[event]]
+id = "bazaar_entered"
+files = ["bazaar-entered.wav"]
+volume = 0.65
+
+[[event]]
+id = "purchase"
+files = ["purchase.wav"]
+volume = 0.55
+
+[[event]]
+id = "weapon_launch"
+files = ["weapon-launch.wav"]
+volume = 0.75
+
+[[event]]
+id = "warning"
+files = ["warning.wav"]
+volume = 0.75
+
+[[event]]
+id = "game_over"
+files = ["game-over.wav"]
+volume = 0.75

@@ -4,12 +4,12 @@ version = "0.1.0"
 
 [themes.original-inspired]
 path = "themes/original-inspired/theme.toml"
-description = "Scalable original-inspired default colors used by the Bevy client."
+description = "Data-driven original-inspired theme schema, palette, layout, and required sprites."
 
 [themes.high-contrast]
 path = "themes/high-contrast/theme.toml"
-description = "High-contrast accessibility validation theme."
+description = "Data-driven high-contrast validation theme schema, palette, layout, and required sprites."
 
 [sounds.generated-default]
 path = "sounds/generated-default/sound-pack.toml"
-description = "Semantic generated sound-pack manifest; synthesized audio files can be added without changing client events."
+description = "Semantic generated sound-pack manifest and synthesized WAV cues."

@@ -5,42 +5,52 @@
 //! state and events instead of owning gameplay rules.
 
 use battletris_core::{
-    ai::{computer_difficulty, ComputerOpponent, BAZAAR_LEAVE_DELAY_MS},
+    ai::{computer_difficulty, ComputerOpponent, BAZAAR_LEAVE_DELAY_MS, COMPUTER_DIFFICULTIES},
     board::{Board, Coord, BOARD_HEIGHT, BOARD_WIDTH},
     cell::Cell,
     game::{BattleEvent, Command, CoreEvent, GameMode, GamePhase, PlayerId, TwoPlayerGame},
     piece::PieceKind,
+    recon::ReconSnapshot,
     rng::GameSeed,
-    weapons::{WeaponToken, WEAPON_CATALOG},
+    weapons::{weapon_spec, WeaponToken, WEAPON_CATALOG},
 };
+use battletris_db::{CommunityLabel, PersistencePaths, PlayerStore, StreakKind};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured};
+use bevy::window::PrimaryWindow;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::{ffi::OsStr, fmt::Write as _, fs, path::PathBuf};
 
-const CELL_SIZE: f32 = 18.0;
-const CELL_GAP: f32 = 1.5;
-const BOARD_TOP: f32 = 255.0;
-const PLAYER_ONE_LEFT: f32 = -360.0;
-const PLAYER_TWO_LEFT: f32 = 120.0;
 const SMOKE_SCREENSHOT_CAPTURE_DELAY_FRAMES: u16 = 5;
 const SMOKE_SCREENSHOT_TIMEOUT_FRAMES: u16 = 300;
 const SETTINGS_FILE_NAME: &str = "settings.toml";
+const CLIENT_FIXED_TICK_MS: u64 = 10;
+const INPUT_REPEAT_INITIAL_MS: u64 = 150;
+const INPUT_REPEAT_MS: u64 = 50;
+const DEFAULT_ERNIE_LEVEL: usize = 7;
 
 fn main() {
     let smoke_screenshot = smoke_screenshot_path().map(SmokeScreenshot::new);
     let settings = ClientSettings::load_or_default();
+    let themes = ThemePacks::load(&settings.assets_dir);
+    let window = themes.get(settings.theme).layout.window;
     let mut app = App::new();
-    app.insert_resource(ClearColor(Color::srgb(0.045, 0.05, 0.065)))
+    app.insert_resource(ClearColor(themes.get(settings.theme).palette.background))
         .insert_resource(LocalGame::new_human_vs_human())
+        .insert_resource(ClientTickClock::default())
+        .insert_resource(InputRepeatState::default())
+        .insert_resource(ReconPanel::default())
+        .insert_resource(BazaarUiState::default())
+        .insert_resource(themes)
         .insert_resource(settings)
         .insert_resource(SoundEventState::default())
+        .insert_resource(RosterRecords::load())
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "BattleTris".into(),
-                resolution: (1040, 720).into(),
+                resolution: (window.width as u32, window.height as u32).into(),
                 ..default()
             }),
             ..default()
@@ -50,10 +60,14 @@ fn main() {
             Update,
             (
                 handle_keyboard_input,
+                handle_mouse_buttons,
                 drive_computer_opponent,
                 tick_game,
+                update_recon_panel,
                 collect_sound_events,
                 render_game,
+                update_screen_visibility,
+                update_menu_button_visuals,
             ),
         );
 
@@ -90,6 +104,307 @@ enum SoundPackChoice {
     Muted,
 }
 
+impl ThemeChoice {
+    const fn directory(self) -> &'static str {
+        match self {
+            Self::OriginalInspired => "original-inspired",
+            Self::HighContrast => "high-contrast",
+        }
+    }
+}
+
+#[derive(Resource, Debug, Clone)]
+struct ThemePacks {
+    original_inspired: LoadedTheme,
+    high_contrast: LoadedTheme,
+}
+
+impl ThemePacks {
+    fn load(assets_dir: &std::path::Path) -> Self {
+        Self {
+            original_inspired: LoadedTheme::load(assets_dir, ThemeChoice::OriginalInspired),
+            high_contrast: LoadedTheme::load(assets_dir, ThemeChoice::HighContrast),
+        }
+    }
+
+    const fn get(&self, choice: ThemeChoice) -> &LoadedTheme {
+        match choice {
+            ThemeChoice::OriginalInspired => &self.original_inspired,
+            ThemeChoice::HighContrast => &self.high_contrast,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LoadedTheme {
+    sprites: LoadedThemeSprites,
+    cell: ThemeCell,
+    layout: ThemeLayout,
+    palette: ThemePalette,
+    button: ThemeButtonStyle,
+}
+
+impl LoadedTheme {
+    fn load(assets_dir: &std::path::Path, choice: ThemeChoice) -> Self {
+        let theme_dir = assets_dir.join("themes").join(choice.directory());
+        let manifest_path = theme_dir.join("theme.toml");
+        let contents = fs::read_to_string(&manifest_path).unwrap_or_else(|error| {
+            panic!(
+                "BattleTris theme manifest {} could not be read: {error}",
+                manifest_path.display()
+            )
+        });
+        let raw: RawTheme = toml::from_str(&contents).unwrap_or_else(|error| {
+            panic!(
+                "BattleTris theme manifest {} could not be parsed: {error}",
+                manifest_path.display()
+            )
+        });
+        raw.validate(&theme_dir, &manifest_path);
+        Self {
+            sprites: raw.sprites.loaded(choice),
+            cell: raw.cell,
+            layout: raw.layout,
+            palette: raw.palette.into_palette(&manifest_path),
+            button: raw.button.into_style(&manifest_path),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTheme {
+    name: String,
+    kind: String,
+    format_version: u32,
+    sprites: ThemeSprites,
+    fonts: ThemeFonts,
+    cell: ThemeCell,
+    layout: ThemeLayout,
+    palette: RawThemePalette,
+    button: RawThemeButtonStyle,
+}
+
+impl RawTheme {
+    fn validate(&self, theme_dir: &std::path::Path, manifest_path: &std::path::Path) {
+        if self.kind != "theme" || self.format_version != 1 {
+            panic!(
+                "BattleTris theme manifest {} has unsupported kind/version: kind={} format_version={}",
+                manifest_path.display(),
+                self.kind,
+                self.format_version
+            );
+        }
+        if self.name.is_empty()
+            || self.cell.size <= 0.0
+            || self.cell.gap < 0.0
+            || self.cell.shadow < 0.0
+            || self.layout.window.width <= 0.0
+            || self.layout.window.height <= 0.0
+            || self.layout.board.spacing <= 0.0
+        {
+            panic!(
+                "BattleTris theme manifest {} has invalid name or layout values",
+                manifest_path.display()
+            );
+        }
+        for relative in [
+            &self.sprites.atlas,
+            &self.sprites.startup,
+            &self.sprites.bazaar,
+            &self.sprites.biff,
+            &self.sprites.gimp,
+        ] {
+            let path = theme_dir.join(relative);
+            if !path.is_file() {
+                panic!(
+                    "BattleTris theme manifest {} requires missing asset {}",
+                    manifest_path.display(),
+                    path.display()
+                );
+            }
+        }
+        if !self.fonts.default.is_empty() {
+            let path = theme_dir.join(&self.fonts.default);
+            if !path.is_file() {
+                panic!(
+                    "BattleTris theme manifest {} requires missing font {}",
+                    manifest_path.display(),
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ThemeSprites {
+    atlas: String,
+    startup: String,
+    bazaar: String,
+    biff: String,
+    gimp: String,
+}
+
+impl ThemeSprites {
+    fn loaded(&self, choice: ThemeChoice) -> LoadedThemeSprites {
+        let prefix = format!("themes/{}/", choice.directory());
+        LoadedThemeSprites {
+            startup: format!("{prefix}{}", self.startup),
+            bazaar: format!("{prefix}{}", self.bazaar),
+            biff: format!("{prefix}{}", self.biff),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LoadedThemeSprites {
+    startup: String,
+    bazaar: String,
+    biff: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThemeFonts {
+    default: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct ThemeCell {
+    size: f32,
+    gap: f32,
+    shadow: f32,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct ThemeLayout {
+    window: ThemeWindowLayout,
+    board: ThemeBoardLayout,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct ThemeWindowLayout {
+    width: f32,
+    height: f32,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct ThemeBoardLayout {
+    top: f32,
+    player_one_left: f32,
+    player_two_left: f32,
+    spacing: f32,
+}
+
+#[derive(Debug, Clone)]
+struct ThemePalette {
+    background: Color,
+    board_background: Color,
+    empty: Color,
+    structure: Color,
+    happy: Color,
+    frown: Color,
+    gimp: Color,
+    die: Color,
+    invisible: Color,
+    hidden: Color,
+    text_primary: Color,
+    text_secondary: Color,
+    text_accent: Color,
+    visible_colors: Vec<Color>,
+}
+
+#[derive(Debug, Clone)]
+struct ThemeButtonStyle {
+    normal: Color,
+    hover: Color,
+    pressed: Color,
+    text: Color,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawThemePalette {
+    background: String,
+    board_background: String,
+    empty: String,
+    structure: String,
+    happy: String,
+    frown: String,
+    gimp: String,
+    die: String,
+    invisible: String,
+    hidden: String,
+    text_primary: String,
+    text_secondary: String,
+    text_accent: String,
+    visible_colors: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawThemeButtonStyle {
+    normal: String,
+    hover: String,
+    pressed: String,
+    text: String,
+}
+
+impl RawThemeButtonStyle {
+    fn into_style(self, manifest_path: &std::path::Path) -> ThemeButtonStyle {
+        ThemeButtonStyle {
+            normal: parse_hex_color(&self.normal, manifest_path),
+            hover: parse_hex_color(&self.hover, manifest_path),
+            pressed: parse_hex_color(&self.pressed, manifest_path),
+            text: parse_hex_color(&self.text, manifest_path),
+        }
+    }
+}
+
+impl RawThemePalette {
+    fn into_palette(self, manifest_path: &std::path::Path) -> ThemePalette {
+        ThemePalette {
+            background: parse_hex_color(&self.background, manifest_path),
+            board_background: parse_hex_color(&self.board_background, manifest_path),
+            empty: parse_hex_color(&self.empty, manifest_path),
+            structure: parse_hex_color(&self.structure, manifest_path),
+            happy: parse_hex_color(&self.happy, manifest_path),
+            frown: parse_hex_color(&self.frown, manifest_path),
+            gimp: parse_hex_color(&self.gimp, manifest_path),
+            die: parse_hex_color(&self.die, manifest_path),
+            invisible: parse_hex_color(&self.invisible, manifest_path),
+            hidden: parse_hex_color(&self.hidden, manifest_path),
+            text_primary: parse_hex_color(&self.text_primary, manifest_path),
+            text_secondary: parse_hex_color(&self.text_secondary, manifest_path),
+            text_accent: parse_hex_color(&self.text_accent, manifest_path),
+            visible_colors: self
+                .visible_colors
+                .iter()
+                .map(|color| parse_hex_color(color, manifest_path))
+                .collect(),
+        }
+    }
+}
+
+fn parse_hex_color(value: &str, manifest_path: &std::path::Path) -> Color {
+    let Some(hex) = value.strip_prefix('#') else {
+        panic!(
+            "BattleTris theme manifest {} has non-hex color {value}",
+            manifest_path.display()
+        );
+    };
+    let (rgb, alpha) = match hex.len() {
+        6 => (hex, "ff"),
+        8 => hex.split_at(6),
+        _ => panic!(
+            "BattleTris theme manifest {} has invalid color {value}",
+            manifest_path.display()
+        ),
+    };
+    let red = u8::from_str_radix(&rgb[0..2], 16).expect("validated hex red");
+    let green = u8::from_str_radix(&rgb[2..4], 16).expect("validated hex green");
+    let blue = u8::from_str_radix(&rgb[4..6], 16).expect("validated hex blue");
+    let alpha = u8::from_str_radix(alpha, 16).expect("validated hex alpha");
+    Color::srgba_u8(red, green, blue, alpha)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum ControlScheme {
@@ -104,6 +419,7 @@ struct ClientSettings {
     sound_pack: SoundPackChoice,
     controls: ControlScheme,
     pixel_scale: f32,
+    ernie_level: usize,
     settings_path: Option<PathBuf>,
     assets_dir: PathBuf,
 }
@@ -116,6 +432,7 @@ impl Default for ClientSettings {
             sound_pack: SoundPackChoice::GeneratedDefault,
             controls: ControlScheme::ModernSplit,
             pixel_scale: 1.0,
+            ernie_level: DEFAULT_ERNIE_LEVEL,
             settings_path: settings_path(),
             assets_dir: assets_dir(),
         }
@@ -177,6 +494,7 @@ impl ClientSettings {
             sound_pack: self.sound_pack,
             controls: self.controls,
             pixel_scale: self.pixel_scale,
+            ernie_level: self.ernie_level,
         }
     }
 
@@ -185,6 +503,7 @@ impl ClientSettings {
         self.sound_pack = persisted.sound_pack;
         self.controls = persisted.controls;
         self.pixel_scale = sanitize_pixel_scale(persisted.pixel_scale);
+        self.ernie_level = sanitize_ernie_level(persisted.ernie_level);
     }
 }
 
@@ -195,6 +514,7 @@ struct PersistedClientSettings {
     sound_pack: SoundPackChoice,
     controls: ControlScheme,
     pixel_scale: f32,
+    ernie_level: usize,
 }
 
 impl Default for PersistedClientSettings {
@@ -204,6 +524,7 @@ impl Default for PersistedClientSettings {
             sound_pack: SoundPackChoice::GeneratedDefault,
             controls: ControlScheme::ModernSplit,
             pixel_scale: 1.0,
+            ernie_level: DEFAULT_ERNIE_LEVEL,
         }
     }
 }
@@ -212,6 +533,78 @@ impl Default for PersistedClientSettings {
 struct LocalGame {
     game: TwoPlayerGame,
     computer: Option<ComputerController>,
+    local_player: PlayerId,
+    status_message: Option<String>,
+}
+
+#[derive(Resource, Debug, Clone)]
+struct RosterRecords {
+    rows: Vec<RosterRow>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RosterRow {
+    rank: u64,
+    display_name: String,
+    wins: u64,
+    losses: u64,
+    high_score: u64,
+    high_lines: u64,
+    high_funds: u64,
+    streak: String,
+}
+
+impl RosterRecords {
+    fn load() -> Self {
+        let paths = match PersistencePaths::new() {
+            Ok(paths) => paths,
+            Err(error) => {
+                return Self {
+                    rows: Vec::new(),
+                    error: Some(error.to_string()),
+                };
+            }
+        };
+        if let Some(parent) = paths.player_db_file.parent() {
+            if let Err(error) = fs::create_dir_all(parent) {
+                return Self {
+                    rows: Vec::new(),
+                    error: Some(format!(
+                        "record directory {} could not be created: {error}",
+                        parent.display()
+                    )),
+                };
+            }
+        }
+        match PlayerStore::open(&paths.player_db_file)
+            .and_then(|store| store.roster_by_rank(&CommunityLabel::local()))
+        {
+            Ok(rows) => Self {
+                rows: rows
+                    .into_iter()
+                    .map(|profile| RosterRow {
+                        rank: profile.rank,
+                        display_name: profile.display_name,
+                        wins: profile.wins,
+                        losses: profile.losses,
+                        high_score: profile.high_score,
+                        high_lines: profile.high_lines,
+                        high_funds: profile.high_funds,
+                        streak: streak_label(profile.streak_kind, profile.streak_count),
+                    })
+                    .collect(),
+                error: None,
+            },
+            Err(error) => Self {
+                rows: Vec::new(),
+                error: Some(format!(
+                    "record store {} could not be read: {error}",
+                    paths.player_db_file.display()
+                )),
+            },
+        }
+    }
 }
 
 impl LocalGame {
@@ -219,11 +612,14 @@ impl LocalGame {
         Self {
             game: TwoPlayerGame::new(GameSeed::from_u64(1), GameSeed::from_u64(2)),
             computer: None,
+            local_player: PlayerId::One,
+            status_message: None,
         }
     }
 
-    fn new_human_vs_computer() -> Self {
-        let difficulty = computer_difficulty(7).expect("legacy AI difficulty exists");
+    fn new_human_vs_computer(level: usize) -> Self {
+        let difficulty =
+            computer_difficulty(sanitize_ernie_level(level)).expect("legacy AI difficulty exists");
         Self {
             game: TwoPlayerGame::human_vs_computer(
                 GameSeed::from_u64(1),
@@ -238,14 +634,89 @@ impl LocalGame {
                 GameSeed::from_u64(42),
                 difficulty.level,
             )),
+            local_player: PlayerId::One,
+            status_message: Some(format!("Playing {} Ernie", difficulty.name)),
         }
     }
 
     fn restart(&mut self) {
         *self = match self.game.mode() {
             GameMode::HumanVsHuman => Self::new_human_vs_human(),
-            GameMode::HumanVsComputer { .. } => Self::new_human_vs_computer(),
+            GameMode::HumanVsComputer { difficulty, .. } => {
+                Self::new_human_vs_computer(difficulty.level)
+            }
         };
+    }
+}
+
+#[derive(Resource, Debug, Default)]
+struct ClientTickClock {
+    gameplay_elapsed_ms: u64,
+    computer_elapsed_ms: u64,
+}
+
+#[derive(Resource, Debug, Default)]
+struct InputRepeatState {
+    left: [HeldKeyRepeat; 2],
+    right: [HeldKeyRepeat; 2],
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct HeldKeyRepeat {
+    held_ms: u64,
+    next_repeat_ms: u64,
+}
+
+impl HeldKeyRepeat {
+    fn observe(self, pressed: bool, just_pressed: bool, elapsed_ms: u64) -> (Self, bool) {
+        if !pressed {
+            return (Self::default(), false);
+        }
+        if just_pressed {
+            return (
+                Self {
+                    held_ms: 0,
+                    next_repeat_ms: INPUT_REPEAT_INITIAL_MS,
+                },
+                true,
+            );
+        }
+
+        let held_ms = self.held_ms.saturating_add(elapsed_ms);
+        if held_ms >= self.next_repeat_ms {
+            return (
+                Self {
+                    held_ms,
+                    next_repeat_ms: self.next_repeat_ms.saturating_add(INPUT_REPEAT_MS),
+                },
+                true,
+            );
+        }
+
+        (Self { held_ms, ..self }, false)
+    }
+}
+
+#[derive(Resource, Debug, Default)]
+struct ReconPanel {
+    next_log_index: usize,
+    manual_condor: bool,
+    snapshot: Option<ReconSnapshot>,
+}
+
+#[derive(Resource, Debug)]
+struct BazaarUiState {
+    selected: WeaponToken,
+    last_message: String,
+}
+
+impl Default for BazaarUiState {
+    fn default() -> Self {
+        Self {
+            selected: WeaponToken::Gimp,
+            last_message: "Select a weapon, then Add. Click staged arsenal slots to remove."
+                .to_string(),
+        }
     }
 }
 
@@ -332,57 +803,335 @@ struct PhaseText;
 #[derive(Component)]
 struct MenuText;
 
-fn setup(mut commands: Commands) {
-    commands.spawn(Camera2d);
+#[derive(Component)]
+struct GameEntity;
 
-    spawn_player_view(&mut commands, PlayerId::One, PLAYER_ONE_LEFT, "Player 1");
+#[derive(Component)]
+struct BazaarEntity;
+
+#[derive(Component)]
+struct BazaarText;
+
+#[derive(Component)]
+struct PlayerViewEntity {
+    player: PlayerId,
+}
+
+#[derive(Component)]
+struct ScreenShell;
+
+#[derive(Component)]
+struct ScreenText;
+
+#[derive(Component)]
+struct ButtonFace;
+
+#[derive(Component)]
+struct MenuButton {
+    screen: ClientScreen,
+    rect: Rect,
+    action: MenuAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuAction {
+    StartHumanVsHuman,
+    StartHumanVsComputer,
+    AdjustErnieDifficulty(isize),
+    GoTo(ClientScreen),
+    Quit,
+}
+
+fn setup(
+    mut commands: Commands,
+    settings: Res<ClientSettings>,
+    themes: Res<ThemePacks>,
+    asset_server: Res<AssetServer>,
+) {
+    commands.spawn(Camera2d);
+    let theme = themes.get(settings.theme);
+
+    spawn_screen_shell(&mut commands, theme, &asset_server);
+
     spawn_player_view(
         &mut commands,
+        theme,
+        PlayerId::One,
+        theme.layout.board.player_one_left,
+        "Player 1",
+    );
+    spawn_player_view(
+        &mut commands,
+        theme,
         PlayerId::Two,
-        PLAYER_TWO_LEFT,
+        theme.layout.board.player_two_left,
         "Player 2 / Computer",
     );
+    spawn_bazaar_overlay(&mut commands, theme, &asset_server);
 
     commands.spawn((
         Text2d::new("BattleTris"),
         TextFont::from_font_size(22.0),
-        TextColor(Color::srgb(0.86, 0.88, 0.82)),
+        TextColor(theme.palette.text_primary),
         Transform::from_xyz(0.0, -300.0, 5.0),
         PhaseText,
+        GameEntity,
     ));
 
     commands.spawn((
         Text2d::new(""),
         TextFont::from_font_size(18.0),
-        TextColor(Color::srgb(0.9, 0.88, 0.74)),
+        TextColor(theme.palette.text_accent),
         Transform::from_xyz(0.0, 245.0, 10.0),
         MenuText,
+        ScreenShell,
     ));
 }
 
-fn spawn_player_view(commands: &mut Commands, player: PlayerId, left: f32, label: &str) {
-    let width = BOARD_WIDTH as f32 * CELL_SIZE;
-    let height = BOARD_HEIGHT as f32 * CELL_SIZE;
+fn spawn_bazaar_overlay(commands: &mut Commands, theme: &LoadedTheme, asset_server: &AssetServer) {
+    commands.spawn((
+        Sprite::from_image(asset_server.load(theme.sprites.bazaar.clone())),
+        Transform::from_xyz(0.0, 0.0, 20.0),
+        Visibility::Hidden,
+        BazaarEntity,
+        GameEntity,
+    ));
+    commands.spawn((
+        Text2d::new(""),
+        TextFont::from_font_size(12.0),
+        TextColor(theme.palette.text_primary),
+        Transform::from_xyz(-370.0, 350.0, 21.0),
+        Visibility::Hidden,
+        BazaarEntity,
+        BazaarText,
+        GameEntity,
+    ));
+}
+
+fn spawn_screen_shell(commands: &mut Commands, theme: &LoadedTheme, asset_server: &AssetServer) {
+    commands.spawn((
+        Sprite::from_image(asset_server.load(theme.sprites.startup.clone())),
+        Transform::from_xyz(0.0, 34.0, -2.0),
+        ScreenShell,
+    ));
+
+    commands.spawn((
+        Sprite::from_image(asset_server.load(theme.sprites.biff.clone())),
+        Transform::from_xyz(-220.0, -155.0, 1.0),
+        ScreenShell,
+    ));
+
+    commands.spawn((
+        Text2d::new(""),
+        TextFont::from_font_size(18.0),
+        TextColor(theme.palette.text_primary),
+        Transform::from_xyz(55.0, 70.0, 4.0),
+        ScreenText,
+        ScreenShell,
+    ));
+
+    for spec in startup_buttons() {
+        spawn_menu_button(commands, theme, spec);
+    }
+    for spec in secondary_screen_buttons() {
+        spawn_menu_button(commands, theme, spec);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MenuButtonSpec {
+    screen: ClientScreen,
+    label: &'static str,
+    center: Vec2,
+    size: Vec2,
+    action: MenuAction,
+}
+
+fn spawn_menu_button(commands: &mut Commands, theme: &LoadedTheme, spec: MenuButtonSpec) {
+    commands.spawn((
+        Sprite::from_color(theme.button.normal, spec.size),
+        Transform::from_xyz(spec.center.x, spec.center.y, 3.0),
+        ButtonFace,
+        MenuButton {
+            screen: spec.screen,
+            rect: Rect::from_center_size(spec.center, spec.size),
+            action: spec.action,
+        },
+        ScreenShell,
+    ));
+    commands.spawn((
+        Text2d::new(spec.label),
+        TextFont::from_font_size(17.0),
+        TextColor(theme.button.text),
+        Transform::from_xyz(spec.center.x, spec.center.y - 5.0, 4.0),
+        MenuButton {
+            screen: spec.screen,
+            rect: spec.rect(),
+            action: spec.action,
+        },
+        ScreenShell,
+    ));
+}
+
+impl MenuButtonSpec {
+    fn rect(self) -> Rect {
+        Rect::from_center_size(self.center, self.size)
+    }
+}
+
+fn startup_buttons() -> [MenuButtonSpec; 7] {
+    let size = Vec2::new(150.0, 34.0);
+    [
+        MenuButtonSpec {
+            screen: ClientScreen::Startup,
+            label: "Challenge",
+            center: Vec2::new(210.0, 120.0),
+            size,
+            action: MenuAction::GoTo(ClientScreen::Challenge),
+        },
+        MenuButtonSpec {
+            screen: ClientScreen::Startup,
+            label: "Sleep",
+            center: Vec2::new(210.0, 75.0),
+            size,
+            action: MenuAction::GoTo(ClientScreen::Sleep),
+        },
+        MenuButtonSpec {
+            screen: ClientScreen::Startup,
+            label: "About",
+            center: Vec2::new(210.0, 30.0),
+            size,
+            action: MenuAction::GoTo(ClientScreen::About),
+        },
+        MenuButtonSpec {
+            screen: ClientScreen::Startup,
+            label: "Roster",
+            center: Vec2::new(210.0, -15.0),
+            size,
+            action: MenuAction::GoTo(ClientScreen::Roster),
+        },
+        MenuButtonSpec {
+            screen: ClientScreen::Startup,
+            label: "Quit",
+            center: Vec2::new(210.0, -60.0),
+            size,
+            action: MenuAction::Quit,
+        },
+        MenuButtonSpec {
+            screen: ClientScreen::Startup,
+            label: "Local Game",
+            center: Vec2::new(210.0, -125.0),
+            size,
+            action: MenuAction::StartHumanVsHuman,
+        },
+        MenuButtonSpec {
+            screen: ClientScreen::Startup,
+            label: "Play Ernie",
+            center: Vec2::new(210.0, -170.0),
+            size,
+            action: MenuAction::StartHumanVsComputer,
+        },
+    ]
+}
+
+fn secondary_screen_buttons() -> [MenuButtonSpec; 8] {
+    let size = Vec2::new(132.0, 32.0);
+    [
+        MenuButtonSpec {
+            screen: ClientScreen::Challenge,
+            label: "Level -",
+            center: Vec2::new(-85.0, -118.0),
+            size,
+            action: MenuAction::AdjustErnieDifficulty(-1),
+        },
+        MenuButtonSpec {
+            screen: ClientScreen::Challenge,
+            label: "Level +",
+            center: Vec2::new(52.0, -118.0),
+            size,
+            action: MenuAction::AdjustErnieDifficulty(1),
+        },
+        MenuButtonSpec {
+            screen: ClientScreen::Challenge,
+            label: "Play Ernie",
+            center: Vec2::new(200.0, -168.0),
+            size,
+            action: MenuAction::StartHumanVsComputer,
+        },
+        MenuButtonSpec {
+            screen: ClientScreen::Challenge,
+            label: "Back",
+            center: Vec2::new(52.0, -168.0),
+            size,
+            action: MenuAction::GoTo(ClientScreen::Startup),
+        },
+        MenuButtonSpec {
+            screen: ClientScreen::Sleep,
+            label: "Wake",
+            center: Vec2::new(52.0, -168.0),
+            size,
+            action: MenuAction::GoTo(ClientScreen::Startup),
+        },
+        MenuButtonSpec {
+            screen: ClientScreen::About,
+            label: "OK",
+            center: Vec2::new(52.0, -168.0),
+            size,
+            action: MenuAction::GoTo(ClientScreen::Startup),
+        },
+        MenuButtonSpec {
+            screen: ClientScreen::Roster,
+            label: "Back",
+            center: Vec2::new(52.0, -168.0),
+            size,
+            action: MenuAction::GoTo(ClientScreen::Startup),
+        },
+        MenuButtonSpec {
+            screen: ClientScreen::Settings,
+            label: "Back",
+            center: Vec2::new(52.0, -168.0),
+            size,
+            action: MenuAction::GoTo(ClientScreen::Startup),
+        },
+    ]
+}
+
+fn spawn_player_view(
+    commands: &mut Commands,
+    theme: &LoadedTheme,
+    player: PlayerId,
+    left: f32,
+    label: &str,
+) {
+    let width = BOARD_WIDTH as f32 * theme.cell.size;
+    let height = BOARD_HEIGHT as f32 * theme.cell.size;
     let center_x = left + width / 2.0;
-    let center_y = BOARD_TOP - height / 2.0;
+    let center_y = theme.layout.board.top - height / 2.0;
 
     commands.spawn((
         Sprite::from_color(
-            Color::srgb(0.11, 0.13, 0.15),
-            Vec2::new(width + 12.0, height + 12.0),
+            theme.palette.board_background,
+            Vec2::new(
+                width + theme.cell.shadow * 4.0,
+                height + theme.cell.shadow * 4.0,
+            ),
         ),
         Transform::from_xyz(center_x, center_y, -1.0),
+        PlayerViewEntity { player },
+        GameEntity,
     ));
 
     for y in 0..BOARD_HEIGHT {
         for x in 0..BOARD_WIDTH {
             commands.spawn((
                 Sprite::from_color(
-                    empty_cell_color(ThemeChoice::OriginalInspired),
-                    Vec2::splat((CELL_SIZE - CELL_GAP).max(1.0)),
+                    theme.palette.empty,
+                    Vec2::splat((theme.cell.size - theme.cell.gap).max(1.0)),
                 ),
-                Transform::from_xyz(cell_x(left, x), cell_y(y), 0.0),
+                Transform::from_xyz(cell_x(theme, left, x), cell_y(theme, y), 0.0),
                 BoardCell { player, x, y },
+                PlayerViewEntity { player },
+                GameEntity,
             ));
         }
     }
@@ -390,36 +1139,140 @@ fn spawn_player_view(commands: &mut Commands, player: PlayerId, left: f32, label
     commands.spawn((
         Text2d::new(label),
         TextFont::from_font_size(24.0),
-        TextColor(Color::srgb(0.88, 0.9, 0.86)),
-        Transform::from_xyz(center_x, BOARD_TOP + 34.0, 5.0),
+        TextColor(theme.palette.text_primary),
+        Transform::from_xyz(center_x, theme.layout.board.top + 34.0, 5.0),
+        PlayerViewEntity { player },
+        GameEntity,
     ));
 
     commands.spawn((
         Text2d::new(""),
         TextFont::from_font_size(15.0),
-        TextColor(Color::srgb(0.74, 0.78, 0.72)),
-        Transform::from_xyz(center_x, BOARD_TOP - height - 44.0, 5.0),
+        TextColor(theme.palette.text_secondary),
+        Transform::from_xyz(center_x, theme.layout.board.top - height - 44.0, 5.0),
         HudText { player },
+        PlayerViewEntity { player },
+        GameEntity,
     ));
 }
 
-fn handle_keyboard_input(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut local: ResMut<LocalGame>,
-    mut settings: ResMut<ClientSettings>,
-    mut sound: ResMut<SoundEventState>,
-) {
-    handle_screen_shortcuts(&keys, &mut settings, &mut sound);
+#[derive(SystemParam)]
+struct KeyboardInputParams<'w> {
+    time: Res<'w, Time>,
+    keys: Res<'w, ButtonInput<KeyCode>>,
+    local: ResMut<'w, LocalGame>,
+    settings: ResMut<'w, ClientSettings>,
+    sound: ResMut<'w, SoundEventState>,
+    repeat: ResMut<'w, InputRepeatState>,
+    recon: ResMut<'w, ReconPanel>,
+    bazaar_ui: ResMut<'w, BazaarUiState>,
+}
 
-    match settings.screen {
-        ClientScreen::Startup => handle_startup_input(&keys, &mut local, &mut settings, &mut sound),
-        ClientScreen::Settings => handle_settings_input(&keys, &mut settings, &mut sound),
-        ClientScreen::Game => handle_game_input(&keys, &mut local, &settings),
-        ClientScreen::Challenge
-        | ClientScreen::Sleep
-        | ClientScreen::About
-        | ClientScreen::Roster => {}
+fn handle_keyboard_input(mut input: KeyboardInputParams) {
+    handle_screen_shortcuts(&input.keys, &mut input.settings, &mut input.sound);
+    let elapsed_ms = input.time.delta().as_millis().min(u128::from(u64::MAX)) as u64;
+
+    match input.settings.screen {
+        ClientScreen::Startup => handle_startup_input(
+            &input.keys,
+            &mut input.local,
+            &mut input.settings,
+            &mut input.sound,
+        ),
+        ClientScreen::Challenge => handle_challenge_input(
+            &input.keys,
+            &mut input.local,
+            &mut input.settings,
+            &mut input.sound,
+        ),
+        ClientScreen::Settings => {
+            handle_settings_input(&input.keys, &mut input.settings, &mut input.sound);
+        }
+        ClientScreen::Game => handle_game_input(
+            &input.keys,
+            &mut input.local,
+            &input.settings,
+            &mut input.repeat,
+            &mut input.recon,
+            &mut input.bazaar_ui,
+            elapsed_ms,
+        ),
+        ClientScreen::Sleep | ClientScreen::About | ClientScreen::Roster => {}
     }
+}
+
+#[derive(SystemParam)]
+struct MouseButtonParams<'w, 's> {
+    mouse: Res<'w, ButtonInput<MouseButton>>,
+    window: Single<'w, 's, &'static Window, With<PrimaryWindow>>,
+    buttons: Query<'w, 's, &'static MenuButton>,
+    local: ResMut<'w, LocalGame>,
+    settings: ResMut<'w, ClientSettings>,
+    sound: ResMut<'w, SoundEventState>,
+    bazaar_ui: ResMut<'w, BazaarUiState>,
+    app_exit: MessageWriter<'w, AppExit>,
+}
+
+fn handle_mouse_buttons(mut input: MouseButtonParams) {
+    if !input.mouse.just_pressed(MouseButton::Left) {
+        return;
+    }
+    let Some(cursor) = input.window.cursor_position() else {
+        return;
+    };
+    let world = Vec2::new(
+        cursor.x - input.window.width() / 2.0,
+        input.window.height() / 2.0 - cursor.y,
+    );
+    if input.settings.screen == ClientScreen::Game && input.local.game.phase() == GamePhase::Bazaar
+    {
+        handle_bazaar_click(world, &mut input.local.game, &mut input.bazaar_ui);
+        return;
+    }
+    let Some(button) = input
+        .buttons
+        .iter()
+        .find(|button| button.screen == input.settings.screen && button.rect.contains(world))
+    else {
+        return;
+    };
+
+    apply_menu_action(
+        button.action,
+        &mut input.local,
+        &mut input.settings,
+        &mut input.sound,
+        &mut input.app_exit,
+    );
+}
+
+fn apply_menu_action(
+    action: MenuAction,
+    local: &mut LocalGame,
+    settings: &mut ClientSettings,
+    sound: &mut SoundEventState,
+    app_exit: &mut MessageWriter<AppExit>,
+) {
+    match action {
+        MenuAction::StartHumanVsHuman => {
+            *local = LocalGame::new_human_vs_human();
+            settings.screen = ClientScreen::Game;
+            sound.next_log_index = 0;
+        }
+        MenuAction::StartHumanVsComputer => {
+            *local = LocalGame::new_human_vs_computer(settings.ernie_level);
+            settings.screen = ClientScreen::Game;
+            sound.next_log_index = 0;
+        }
+        MenuAction::AdjustErnieDifficulty(step) => {
+            adjust_ernie_level(settings, step);
+        }
+        MenuAction::GoTo(screen) => settings.screen = screen,
+        MenuAction::Quit => {
+            app_exit.write(AppExit::Success);
+        }
+    }
+    sound.last_event = Some(SoundEvent::MenuAction);
 }
 
 fn handle_screen_shortcuts(
@@ -464,7 +1317,29 @@ fn handle_startup_input(
         sound.last_event = Some(SoundEvent::MenuAction);
     }
     if keys.just_pressed(KeyCode::KeyC) {
-        *local = LocalGame::new_human_vs_computer();
+        *local = LocalGame::new_human_vs_computer(settings.ernie_level);
+        settings.screen = ClientScreen::Game;
+        sound.next_log_index = 0;
+        sound.last_event = Some(SoundEvent::MenuAction);
+    }
+}
+
+fn handle_challenge_input(
+    keys: &ButtonInput<KeyCode>,
+    local: &mut LocalGame,
+    settings: &mut ClientSettings,
+    sound: &mut SoundEventState,
+) {
+    if keys.just_pressed(KeyCode::ArrowLeft) || keys.just_pressed(KeyCode::KeyJ) {
+        adjust_ernie_level(settings, -1);
+        sound.last_event = Some(SoundEvent::MenuAction);
+    }
+    if keys.just_pressed(KeyCode::ArrowRight) || keys.just_pressed(KeyCode::KeyL) {
+        adjust_ernie_level(settings, 1);
+        sound.last_event = Some(SoundEvent::MenuAction);
+    }
+    if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::KeyC) {
+        *local = LocalGame::new_human_vs_computer(settings.ernie_level);
         settings.screen = ClientScreen::Game;
         sound.next_log_index = 0;
         sound.last_event = Some(SoundEvent::MenuAction);
@@ -517,6 +1392,10 @@ fn handle_game_input(
     keys: &ButtonInput<KeyCode>,
     local: &mut LocalGame,
     settings: &ClientSettings,
+    repeat: &mut InputRepeatState,
+    recon: &mut ReconPanel,
+    bazaar_ui: &mut BazaarUiState,
+    elapsed_ms: u64,
 ) {
     if keys.just_pressed(KeyCode::KeyR) {
         local.restart();
@@ -531,8 +1410,20 @@ fn handle_game_input(
         }
     }
 
+    if keys.just_pressed(KeyCode::KeyQ) {
+        local.status_message =
+            Some("BattleTris is owned and operated by the legacy crew.".to_string());
+    }
+
+    if keys.just_pressed(KeyCode::KeyC) && local.computer.is_some() {
+        recon.manual_condor = !recon.manual_condor;
+        if !recon.manual_condor {
+            recon.snapshot = None;
+        }
+    }
+
     if local.game.phase() == GamePhase::Bazaar {
-        handle_bazaar_input(keys, &mut local.game);
+        handle_bazaar_input(keys, &mut local.game, bazaar_ui);
         return;
     }
 
@@ -548,7 +1439,14 @@ fn handle_game_input(
         {
             continue;
         }
-        send_player_controls(keys, &mut local.game, player, settings.controls);
+        send_player_controls(
+            keys,
+            &mut local.game,
+            player,
+            settings.controls,
+            repeat,
+            elapsed_ms,
+        );
     }
 
     for (label, key) in slot_keys() {
@@ -574,10 +1472,28 @@ fn send_player_controls(
     game: &mut TwoPlayerGame,
     player: PlayerId,
     scheme: ControlScheme,
+    repeat: &mut InputRepeatState,
+    elapsed_ms: u64,
 ) {
     let controls = controls_for(player, scheme);
-    send_press_command(keys, game, player, controls.left, Command::MoveLeft);
-    send_press_command(keys, game, player, controls.right, Command::MoveRight);
+    send_repeat_command(
+        keys,
+        game,
+        player,
+        controls.left,
+        Command::MoveLeft,
+        &mut repeat.left[client_player_index(player)],
+        elapsed_ms,
+    );
+    send_repeat_command(
+        keys,
+        game,
+        player,
+        controls.right,
+        Command::MoveRight,
+        &mut repeat.right[client_player_index(player)],
+        elapsed_ms,
+    );
     send_press_command(
         keys,
         game,
@@ -637,39 +1553,82 @@ fn controls_for(player: PlayerId, scheme: ControlScheme) -> PlayerControls {
     }
 }
 
-fn handle_bazaar_input(keys: &ButtonInput<KeyCode>, game: &mut TwoPlayerGame) {
+fn handle_bazaar_input(
+    keys: &ButtonInput<KeyCode>,
+    game: &mut TwoPlayerGame,
+    bazaar_ui: &mut BazaarUiState,
+) {
     if keys.just_pressed(KeyCode::Enter) {
-        let _ = game.bazaar_done(PlayerId::One);
+        match game.bazaar_done(PlayerId::One) {
+            events if events.is_empty() => {
+                bazaar_ui.last_message = "Player 1 is already waiting.".to_string()
+            }
+            _ => bazaar_ui.last_message = "Player 1 done. Waiting for opponent.".to_string(),
+        }
     }
     if keys.just_pressed(KeyCode::Space) {
-        let _ = game.bazaar_done(PlayerId::Two);
+        match game.bazaar_done(PlayerId::Two) {
+            events if events.is_empty() => {
+                bazaar_ui.last_message = "Player 2 is already waiting.".to_string()
+            }
+            _ => bazaar_ui.last_message = "Player 2 done. Waiting for opponent.".to_string(),
+        }
     }
 
-    for (token, key) in bazaar_buy_keys() {
+    if keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::KeyW) {
+        bazaar_ui.selected = adjacent_catalog_token(bazaar_ui.selected, -1);
+    }
+    if keys.just_pressed(KeyCode::ArrowDown) || keys.just_pressed(KeyCode::KeyS) {
+        bazaar_ui.selected = adjacent_catalog_token(bazaar_ui.selected, 1);
+    }
+    if keys.just_pressed(KeyCode::KeyA) || keys.just_pressed(KeyCode::Equal) {
+        buy_selected_bazaar_weapon(game, bazaar_ui, PlayerId::One);
+    }
+    if keys.just_pressed(KeyCode::KeyX) || keys.just_pressed(KeyCode::Minus) {
+        remove_selected_bazaar_weapon(game, bazaar_ui, PlayerId::One);
+    }
+
+    for (token, key) in bazaar_catalog_keys() {
         if keys.just_pressed(key) {
             let player = if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
                 PlayerId::Two
             } else {
                 PlayerId::One
             };
-            let _ = game.bazaar_buy(player, token);
+            bazaar_ui.selected = token;
+            buy_bazaar_weapon(game, bazaar_ui, player, token);
         }
     }
 }
 
-fn drive_computer_opponent(time: Res<Time>, mut local: ResMut<LocalGame>) {
-    let elapsed_ms = time.delta().as_millis().min(u128::from(u64::MAX)) as u64;
+fn drive_computer_opponent(
+    time: Res<Time>,
+    settings: Res<ClientSettings>,
+    mut local: ResMut<LocalGame>,
+    mut clock: ResMut<ClientTickClock>,
+) {
+    if settings.screen != ClientScreen::Game {
+        return;
+    }
+    clock.computer_elapsed_ms = clock
+        .computer_elapsed_ms
+        .saturating_add(time.delta().as_millis().min(u128::from(u64::MAX)) as u64);
     let Some(mut computer) = local.computer.take() else {
         return;
     };
 
-    match local.game.phase() {
-        GamePhase::Playing => {
-            computer.reset_for_play();
-            drive_computer_play(elapsed_ms, &mut local.game, &mut computer);
+    while clock.computer_elapsed_ms >= CLIENT_FIXED_TICK_MS {
+        clock.computer_elapsed_ms -= CLIENT_FIXED_TICK_MS;
+        match local.game.phase() {
+            GamePhase::Playing => {
+                computer.reset_for_play();
+                drive_computer_play(CLIENT_FIXED_TICK_MS, &mut local.game, &mut computer);
+            }
+            GamePhase::Bazaar => {
+                drive_computer_bazaar(CLIENT_FIXED_TICK_MS, &mut local.game, &mut computer);
+            }
+            GamePhase::Paused | GamePhase::GameOver => {}
         }
-        GamePhase::Bazaar => drive_computer_bazaar(elapsed_ms, &mut local.game, &mut computer),
-        GamePhase::Paused | GamePhase::GameOver => {}
     }
 
     local.computer = Some(computer);
@@ -688,7 +1647,7 @@ fn drive_computer_play(
         game.player(computer.player).arsenal(),
         game.player(computer.player).lines(),
         game.player(opponent_player(computer.player)).lines(),
-        game.player(opponent_player(computer.player)).lines(),
+        computer_bazaar_line_value(game, computer.player),
     ) {
         let _ = game.launch_weapon_slot(computer.player, label);
     }
@@ -737,7 +1696,19 @@ fn drive_computer_bazaar(
     computer: &mut ComputerController,
 ) {
     if !computer.shopped_this_bazaar {
-        for token in computer_bazaar_tokens() {
+        let bought = game
+            .bazaar_session(computer.player)
+            .map(|bazaar| {
+                let mut simulated = bazaar.clone();
+                computer.opponent.shop(
+                    &mut simulated,
+                    game.player(computer.player).lines(),
+                    game.player(opponent_player(computer.player)).lines(),
+                    game.player(computer.player).board(),
+                )
+            })
+            .unwrap_or_default();
+        for token in bought {
             let _ = game.bazaar_buy(computer.player, token);
         }
         computer.shopped_this_bazaar = true;
@@ -749,14 +1720,55 @@ fn drive_computer_bazaar(
     }
 }
 
-fn tick_game(time: Res<Time>, mut local: ResMut<LocalGame>) {
-    let elapsed_ms = time.delta().as_millis().min(u128::from(u64::MAX)) as u64;
-    if elapsed_ms == 0 || local.game.phase() != GamePhase::Playing {
+fn tick_game(
+    time: Res<Time>,
+    settings: Res<ClientSettings>,
+    mut local: ResMut<LocalGame>,
+    mut clock: ResMut<ClientTickClock>,
+) {
+    if settings.screen != ClientScreen::Game {
+        return;
+    }
+    clock.gameplay_elapsed_ms = clock
+        .gameplay_elapsed_ms
+        .saturating_add(time.delta().as_millis().min(u128::from(u64::MAX)) as u64);
+    if clock.gameplay_elapsed_ms < CLIENT_FIXED_TICK_MS || local.game.phase() != GamePhase::Playing
+    {
         return;
     }
 
-    let _ = local.game.tick_player(PlayerId::One, elapsed_ms);
-    let _ = local.game.tick_player(PlayerId::Two, elapsed_ms);
+    while clock.gameplay_elapsed_ms >= CLIENT_FIXED_TICK_MS {
+        clock.gameplay_elapsed_ms -= CLIENT_FIXED_TICK_MS;
+        let _ = local.game.tick_player(PlayerId::One, CLIENT_FIXED_TICK_MS);
+        let _ = local.game.tick_player(PlayerId::Two, CLIENT_FIXED_TICK_MS);
+        if local.game.phase() != GamePhase::Playing {
+            break;
+        }
+    }
+}
+
+fn update_recon_panel(mut recon: ResMut<ReconPanel>, local: Res<LocalGame>) {
+    for logged in &local.game.event_log()[recon.next_log_index..] {
+        match &logged.event {
+            BattleEvent::ReconUpdated {
+                viewer,
+                target,
+                snapshot,
+            } if *viewer == local.local_player
+                && *target == opponent_player(local.local_player) =>
+            {
+                recon.snapshot = Some(snapshot.clone());
+            }
+            BattleEvent::ReconDisabled { viewer, target, .. }
+                if *viewer == local.local_player
+                    && *target == opponent_player(local.local_player) =>
+            {
+                recon.snapshot = None;
+            }
+            _ => {}
+        }
+    }
+    recon.next_log_index = local.game.event_log().len();
 }
 
 fn collect_sound_events(
@@ -764,6 +1776,9 @@ fn collect_sound_events(
     settings: Res<ClientSettings>,
     mut sound: ResMut<SoundEventState>,
 ) {
+    if settings.screen != ClientScreen::Game {
+        return;
+    }
     if settings.sound_pack == SoundPackChoice::Muted {
         sound.next_log_index = local.game.event_log().len();
         sound.last_event = None;
@@ -787,50 +1802,171 @@ type PhaseTextSingle<'w, 's> =
 type MenuTextSingle<'w, 's> =
     Single<'w, 's, &'static mut Text2d, (With<MenuText>, Without<HudText>, Without<PhaseText>)>;
 
+type ScreenTextSingle<'w, 's> = Single<
+    'w,
+    's,
+    &'static mut Text2d,
+    (
+        With<ScreenText>,
+        Without<MenuText>,
+        Without<HudText>,
+        Without<PhaseText>,
+    ),
+>;
+
+type BazaarTextSingle<'w, 's> = Single<
+    'w,
+    's,
+    &'static mut Text2d,
+    (
+        With<BazaarText>,
+        Without<MenuText>,
+        Without<HudText>,
+        Without<PhaseText>,
+        Without<ScreenText>,
+    ),
+>;
+
+type ShellVisibilityQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static mut Visibility, Option<&'static MenuButton>),
+    (With<ScreenShell>, Without<GameEntity>),
+>;
+
+type GameVisibilityQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static mut Visibility,
+        Option<&'static PlayerViewEntity>,
+        Option<&'static BazaarEntity>,
+    ),
+    With<GameEntity>,
+>;
+
 #[derive(SystemParam)]
 struct RenderGameParams<'w, 's> {
     local: Res<'w, LocalGame>,
     settings: Res<'w, ClientSettings>,
+    roster: Res<'w, RosterRecords>,
+    themes: Res<'w, ThemePacks>,
     sound: Res<'w, SoundEventState>,
+    bazaar_ui: Res<'w, BazaarUiState>,
     clear_color: ResMut<'w, ClearColor>,
+    recon: Res<'w, ReconPanel>,
     cells: Query<'w, 's, (&'static BoardCell, &'static mut Sprite)>,
     hud: HudTextQuery<'w, 's>,
     phase_text: PhaseTextSingle<'w, 's>,
     menu_text: MenuTextSingle<'w, 's>,
+    screen_text: ScreenTextSingle<'w, 's>,
+    bazaar_text: BazaarTextSingle<'w, 's>,
     reported_startup_render: Local<'s, bool>,
 }
 
 fn render_game(mut render: RenderGameParams) {
+    let theme = render.themes.get(render.settings.theme);
     for (cell, mut sprite) in &mut render.cells {
         sprite.color = render_cell_color(
-            &render.local.game,
+            &render.local,
+            &render.recon,
             cell.player,
             cell.x,
             cell.y,
-            render.settings.theme,
+            theme,
         );
         sprite.custom_size = Some(Vec2::splat(
-            ((CELL_SIZE - CELL_GAP) * render.settings.pixel_scale).max(1.0),
+            ((theme.cell.size - theme.cell.gap) * render.settings.pixel_scale).max(1.0),
         ));
     }
 
     for (hud, mut text) in &mut render.hud {
-        text.0 = player_hud(&render.local.game, hud.player);
+        text.0 = player_hud(&render.local, &render.recon, hud.player);
     }
 
-    render.phase_text.0 = phase_label(&render.local.game, &render.settings, &render.sound);
+    render.phase_text.0 = phase_label(&render.local, &render.settings, &render.sound);
     render.menu_text.0 = menu_label(&render.local.game, &render.settings);
-    let menu_label_chars = render.menu_text.0.chars().count();
+    render.screen_text.0 = screen_body_label(&render.local.game, &render.settings, &render.roster);
+    render.bazaar_text.0 = bazaar_overlay_label(&render.local, &render.bazaar_ui);
+    let menu_label_chars =
+        render.menu_text.0.chars().count() + render.screen_text.0.chars().count();
     let menu_is_unhealthy = render.settings.screen != ClientScreen::Game && menu_label_chars == 0;
     render.clear_color.0 = if menu_is_unhealthy {
         Color::srgb(0.5, 0.0, 0.28)
     } else {
-        Color::srgb(0.045, 0.05, 0.065)
+        theme.palette.background
     };
 
     if !*render.reported_startup_render {
         report_startup_render_health(render.settings.screen, menu_label_chars);
         *render.reported_startup_render = true;
+    }
+}
+
+fn update_screen_visibility(
+    settings: Res<ClientSettings>,
+    local: Res<LocalGame>,
+    recon: Res<ReconPanel>,
+    mut game_entities: GameVisibilityQuery,
+    mut shell_entities: ShellVisibilityQuery,
+) {
+    let game_visible = settings.screen == ClientScreen::Game;
+    let bazaar_visible = game_visible && local.game.phase() == GamePhase::Bazaar;
+    for (mut visibility, player_view, bazaar_entity) in &mut game_entities {
+        let entity_visible = if bazaar_entity.is_some() {
+            bazaar_visible
+        } else {
+            player_view.is_none_or(|view| player_view_visible(&local, &recon, view.player))
+        };
+        *visibility = if game_visible && entity_visible {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+    }
+
+    for (mut visibility, button) in &mut shell_entities {
+        let visible = !game_visible && button.is_none_or(|button| button.screen == settings.screen);
+        *visibility = if visible {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+    }
+}
+
+fn player_view_visible(local: &LocalGame, recon: &ReconPanel, player: PlayerId) -> bool {
+    player == local.local_player
+        || local.computer.is_none()
+        || recon.manual_condor
+        || recon.snapshot.is_some()
+}
+
+fn update_menu_button_visuals(
+    settings: Res<ClientSettings>,
+    themes: Res<ThemePacks>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    mut buttons: Query<(&MenuButton, &mut Sprite), With<ButtonFace>>,
+) {
+    let theme = themes.get(settings.theme);
+    let cursor = window.cursor_position().map(|cursor| {
+        Vec2::new(
+            cursor.x - window.width() / 2.0,
+            window.height() / 2.0 - cursor.y,
+        )
+    });
+
+    for (button, mut sprite) in &mut buttons {
+        let hovered = button.screen == settings.screen
+            && cursor.is_some_and(|cursor| button.rect.contains(cursor));
+        sprite.color = if hovered && mouse.pressed(MouseButton::Left) {
+            theme.button.pressed
+        } else if hovered {
+            theme.button.hover
+        } else {
+            theme.button.normal
+        };
     }
 }
 
@@ -933,6 +2069,22 @@ fn send_press_command(
     }
 }
 
+fn send_repeat_command(
+    keys: &ButtonInput<KeyCode>,
+    game: &mut TwoPlayerGame,
+    player: PlayerId,
+    key: KeyCode,
+    command: Command,
+    repeat: &mut HeldKeyRepeat,
+    elapsed_ms: u64,
+) {
+    let (next, emit) = repeat.observe(keys.pressed(key), keys.just_pressed(key), elapsed_ms);
+    *repeat = next;
+    if emit {
+        let _ = game.command(player, command);
+    }
+}
+
 fn send_fast_drop(
     keys: &ButtonInput<KeyCode>,
     game: &mut TwoPlayerGame,
@@ -948,13 +2100,42 @@ fn send_fast_drop(
 }
 
 fn render_cell_color(
-    game: &TwoPlayerGame,
+    local: &LocalGame,
+    recon: &ReconPanel,
     player: PlayerId,
     x: usize,
     y: usize,
-    theme: ThemeChoice,
+    theme: &LoadedTheme,
 ) -> Color {
-    let piece_cell = game
+    if player != local.local_player && local.computer.is_some() {
+        if recon.manual_condor {
+            return local
+                .game
+                .player(player)
+                .board()
+                .get(Coord { x, y })
+                .map_or_else(
+                    || empty_cell_color(theme),
+                    |cell| cell_color(cell, false, theme),
+                );
+        }
+        if let Some(snapshot) = &recon.snapshot {
+            return snapshot
+                .board
+                .cells
+                .get(y * snapshot.board.width + x)
+                .copied()
+                .flatten()
+                .map_or_else(
+                    || empty_cell_color(theme),
+                    |cell| cell_color(cell, false, theme),
+                );
+        }
+        return empty_cell_color(theme);
+    }
+
+    let piece_cell = local
+        .game
         .player(player)
         .active_piece()
         .and_then(|piece| {
@@ -972,19 +2153,25 @@ fn render_cell_color(
     let Some(coord) = Coord::new(x, y) else {
         return empty_cell_color(theme);
     };
-    game.player(player).board().get(coord).map_or_else(
+    local.game.player(player).board().get(coord).map_or_else(
         || empty_cell_color(theme),
         |cell| cell_color(cell, false, theme),
     )
 }
 
-fn player_hud(game: &TwoPlayerGame, player: PlayerId) -> String {
+fn player_hud(local: &LocalGame, recon: &ReconPanel, player: PlayerId) -> String {
+    let game = &local.game;
+    if player != local.local_player && local.computer.is_some() {
+        return recon_hud(game, recon, player);
+    }
+
     let loop_state = game.player(player);
     let mut text = format!(
-        "score {}  funds {}  lines {}\nnext {}\narsenal {}\neffects {}",
+        "score {}  funds {}  lines {}  bazaar in {}\nnext {}\narsenal {}\neffects {}",
         loop_state.score(),
         loop_state.funds(),
         loop_state.lines(),
+        game.lines_until_bazaar(),
         piece_label(loop_state.next_piece_kind_preview()),
         arsenal_label(game, player),
         active_effects_label(game, player),
@@ -1007,7 +2194,32 @@ fn player_hud(game: &TwoPlayerGame, player: PlayerId) -> String {
     text
 }
 
-fn phase_label(game: &TwoPlayerGame, settings: &ClientSettings, sound: &SoundEventState) -> String {
+fn recon_hud(game: &TwoPlayerGame, recon: &ReconPanel, player: PlayerId) -> String {
+    if recon.manual_condor {
+        return format!(
+            "Condor recon\nopponent score {}  funds {}  lines {}",
+            game.player(player).score(),
+            game.player(player).funds(),
+            game.player(player).lines()
+        );
+    }
+    if let Some(snapshot) = &recon.snapshot {
+        return format!(
+            "{:?} recon snapshot\nopponent funds {}  lines {}",
+            snapshot.level,
+            snapshot.funds,
+            game.player(player).lines()
+        );
+    }
+    "opponent hidden\nuse Ames/Ace/Condor or press C for Condor in computer mode".to_string()
+}
+
+fn phase_label(local: &LocalGame, settings: &ClientSettings, sound: &SoundEventState) -> String {
+    if settings.screen != ClientScreen::Game {
+        return String::new();
+    }
+    let game = &local.game;
+
     let sound_label = sound
         .last_event
         .map(|event| format!("  sound {:?}", event))
@@ -1016,7 +2228,17 @@ fn phase_label(game: &TwoPlayerGame, settings: &ClientSettings, sound: &SoundEve
         GameMode::HumanVsHuman => "human vs human",
         GameMode::HumanVsComputer { .. } => "human vs computer (unranked)",
     };
-    let common = format!("F1 menu  F2 challenge  F3 settings  Esc game  {mode}{sound_label}");
+    let status = local
+        .status_message
+        .as_ref()
+        .map(|message| format!("  {message}"))
+        .unwrap_or_default();
+    let weapon_status = latest_weapon_feedback(game)
+        .map(|message| format!("  {message}"))
+        .unwrap_or_default();
+    let common = format!(
+        "F1 menu  F2 challenge  F3 settings  Esc game  {mode}{sound_label}{status}{weapon_status}"
+    );
 
     match game.phase() {
         GamePhase::Playing => format!(
@@ -1026,7 +2248,7 @@ fn phase_label(game: &TwoPlayerGame, settings: &ClientSettings, sound: &SoundEve
         ),
         GamePhase::Paused => format!("{common}\npaused  P resume  R restart"),
         GamePhase::Bazaar => format!(
-            "{}\nbazaar  A/S/D/F/G buy, Shift+key P2  Enter P1 done  Space P2 done",
+            "{}\nbazaar  click rows/Add/Remove/DONE  Up/Down select  A add  X remove  Enter done",
             common
         ),
         GamePhase::GameOver => game
@@ -1043,16 +2265,52 @@ fn phase_label(game: &TwoPlayerGame, settings: &ClientSettings, sound: &SoundEve
     }
 }
 
-fn menu_label(game: &TwoPlayerGame, settings: &ClientSettings) -> String {
+fn menu_label(_game: &TwoPlayerGame, settings: &ClientSettings) -> String {
     match settings.screen {
-        ClientScreen::Startup => "BattleTris\nH local human-vs-human\nC unranked human-vs-computer\nF2 challenge placeholder  F3 settings  F4 about  F5 roster  F6 sleep".to_string(),
+        ClientScreen::Startup => {
+            "BattleTris\nLegacy shell: Challenge, Sleep, About, Roster, Quit".to_string()
+        }
         ClientScreen::Game => String::new(),
-        ClientScreen::Challenge => "Challenge\nDirect-connect challenge setup is not wired into this client yet.\nEsc returns to the active local game.".to_string(),
-        ClientScreen::Sleep => "Sleep\nPlaceholder for legacy sleep/biff presence behavior.\nEsc returns to the active local game.".to_string(),
-        ClientScreen::About => "About\nBattleTris Rust/Bevy rewrite. Core rules are deterministic Rust; this client is an adapter.\nEsc returns to the active local game.".to_string(),
-        ClientScreen::Roster => roster_label(game),
+        ClientScreen::Challenge => "Challenge".to_string(),
+        ClientScreen::Sleep => "Sleep".to_string(),
+        ClientScreen::About => "About BattleTris".to_string(),
+        ClientScreen::Roster => "Roster".to_string(),
         ClientScreen::Settings => format!(
-            "Settings\nT theme: {:?}\nO sound pack: {:?}\nM controls: {}\n-/= scale: {:.2}x\nassets: {}\nsettings: {}\nEsc returns to game",
+            "Settings\nT theme: {:?}  O sound: {:?}  M controls\n-/= scale: {:.2}x",
+            settings.theme, settings.sound_pack, settings.pixel_scale,
+        ),
+    }
+}
+
+fn screen_body_label(
+    game: &TwoPlayerGame,
+    settings: &ClientSettings,
+    roster: &RosterRecords,
+) -> String {
+    match settings.screen {
+        ClientScreen::Startup => {
+            "Click the legacy startup buttons. Keyboard: H local game, C Play Ernie, F2/F3/F4/F5/F6 screens.".to_string()
+        }
+        ClientScreen::Challenge => {
+            let difficulty = selected_ernie_difficulty(settings);
+            format!(
+                "Network challenges are reserved for the networking phase.\nErnie difficulty: level {} of {}  {}  {}ms action delay\nUse J/Left and L/Right or Level -/+ as the slider.\nClick Play {} Ernie or press Enter/C for unranked computer play.",
+                difficulty.level,
+                COMPUTER_DIFFICULTIES.len() - 1,
+                difficulty.name,
+                difficulty.delay_ms,
+                difficulty.name,
+            )
+        }
+        ClientScreen::Sleep => {
+            "Biff is standing by for incoming challenges.\nAvailability and challenge wake-up state will attach to the networking adapter.\nClick Wake to return to Startup.".to_string()
+        }
+        ClientScreen::About => {
+            "BattleTris\nRust/Bevy rewrite of the legacy X11 game.\nAuthors: legacy BattleTris team; Rust rewrite preserves deterministic core rules and data-driven presentation.\nThanks to the original players, testers, and Biff.\nClick OK to return.".to_string()
+        }
+        ClientScreen::Roster => roster_label(game, roster),
+        ClientScreen::Settings => format!(
+            "Theme: {:?}\nSound pack: {:?}\nControls: {}\nScale: {:.2}x\nAssets: {}\nSettings: {}",
             settings.theme,
             settings.sound_pack,
             controls_label(settings.controls),
@@ -1064,6 +2322,7 @@ fn menu_label(game: &TwoPlayerGame, settings: &ClientSettings) -> String {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "unavailable".to_string()),
         ),
+        ClientScreen::Game => String::new(),
     }
 }
 
@@ -1073,6 +2332,26 @@ fn sanitize_pixel_scale(pixel_scale: f32) -> f32 {
     } else {
         1.0
     }
+}
+
+fn sanitize_ernie_level(level: usize) -> usize {
+    level.min(COMPUTER_DIFFICULTIES.len() - 1)
+}
+
+fn adjust_ernie_level(settings: &mut ClientSettings, step: isize) {
+    let max = COMPUTER_DIFFICULTIES.len() as isize - 1;
+    settings.ernie_level = (settings.ernie_level as isize + step).clamp(0, max) as usize;
+    settings.save();
+}
+
+fn selected_ernie_difficulty(settings: &ClientSettings) -> battletris_core::ai::ComputerDifficulty {
+    computer_difficulty(settings.ernie_level).expect("sanitized legacy AI difficulty exists")
+}
+
+fn computer_bazaar_line_value(game: &TwoPlayerGame, computer: PlayerId) -> u32 {
+    game.player(computer)
+        .lines()
+        .saturating_add(game.player(opponent_player(computer)).lines())
 }
 
 fn settings_path() -> Option<PathBuf> {
@@ -1099,19 +2378,68 @@ fn assets_dir() -> PathBuf {
         .join("assets")
 }
 
-fn roster_label(game: &TwoPlayerGame) -> String {
+fn roster_label(game: &TwoPlayerGame, roster: &RosterRecords) -> String {
     let ranked = if game.is_ranked_game() {
         "ranked"
     } else {
         "unranked"
     };
-    format!(
-        "Roster\nPlayer 1: local human\nPlayer 2: {}\nCurrent game is {ranked}. Persistent records are not shown here.\nEsc returns to game.",
+    let mut label = format!(
+        "Roster\nPlayer 1: local human\nPlayer 2: {}\nCurrent game is {ranked}. Local records sorted by rank.\n",
         match game.mode() {
             GameMode::HumanVsHuman => "local human",
             GameMode::HumanVsComputer { .. } => "computer Ernie",
         }
-    )
+    );
+    if let Some(error) = &roster.error {
+        let _ = writeln!(label, "Records unavailable: {error}");
+    } else if roster.rows.is_empty() {
+        label.push_str("No ranked human-vs-human results have been recorded yet.\n");
+    } else {
+        for row in roster.rows.iter().take(8) {
+            let _ = writeln!(
+                label,
+                "#{:<4} {:<16} {:>3}-{:>3} score {} lines {} funds {} streak {}",
+                row.rank,
+                truncate_label(&row.display_name, 16),
+                row.wins,
+                row.losses,
+                row.high_score,
+                row.high_lines,
+                row.high_funds,
+                row.streak,
+            );
+        }
+        if roster.rows.len() > 8 {
+            let _ = writeln!(label, "... and {} more", roster.rows.len() - 8);
+        }
+    }
+    label.push_str("Esc returns to game.");
+    label
+}
+
+fn streak_label(kind: StreakKind, count: u64) -> String {
+    match kind {
+        StreakKind::None => "none".to_string(),
+        StreakKind::Wins => format!("W{count}"),
+        StreakKind::Losses => format!("L{count}"),
+    }
+}
+
+fn truncate_label(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!(
+            "{}~",
+            truncated
+                .chars()
+                .take(max_chars.saturating_sub(1))
+                .collect::<String>()
+        )
+    } else {
+        truncated
+    }
 }
 
 fn controls_label(scheme: ControlScheme) -> &'static str {
@@ -1136,6 +2464,72 @@ fn active_effects_label(game: &TwoPlayerGame, player: PlayerId) -> String {
     } else {
         labels.join(", ")
     }
+}
+
+fn latest_weapon_feedback(game: &TwoPlayerGame) -> Option<String> {
+    game.event_log()
+        .iter()
+        .rev()
+        .find_map(|logged| match &logged.event {
+            BattleEvent::WeaponLaunched {
+                launcher,
+                target,
+                token,
+            } => Some(format!(
+                "{:?} launched {} at {:?}",
+                launcher,
+                weapon_spec(*token).name,
+                target,
+            )),
+            BattleEvent::OneShotWeaponApplied {
+                launcher,
+                target,
+                token,
+            } => Some(format!(
+                "{} from {:?} hit {:?}",
+                weapon_spec(*token).name,
+                launcher,
+                target,
+            )),
+            BattleEvent::TimedWeaponActivated {
+                launcher,
+                target,
+                token,
+                remaining_lines,
+            } => Some(format!(
+                "{} active on {:?} for {} lines from {:?}",
+                weapon_spec(*token).name,
+                target,
+                remaining_lines,
+                launcher,
+            )),
+            BattleEvent::TimedWeaponExpired { player, token } => Some(format!(
+                "{} expired for {:?}",
+                weapon_spec(*token).name,
+                player,
+            )),
+            BattleEvent::IncomingWeaponQueued {
+                launcher,
+                target,
+                token,
+            } => Some(format!(
+                "{} incoming from {:?} to {:?}",
+                weapon_spec(*token).name,
+                launcher,
+                target,
+            )),
+            BattleEvent::WeaponReflected { player, token } => Some(format!(
+                "Mirror reflected {} back onto {:?}",
+                weapon_spec(*token).name,
+                player,
+            )),
+            BattleEvent::WeaponNullified { player, token } => Some(format!(
+                "Mirror nullified {} for {:?}",
+                weapon_spec(*token).name,
+                player,
+            )),
+            _ => None,
+        })
 }
 
 fn arsenal_label(game: &TwoPlayerGame, player: PlayerId) -> String {
@@ -1171,7 +2565,7 @@ fn arsenal_slots_label(arsenal: &battletris_core::weapons::Arsenal) -> String {
 }
 
 fn bazaar_catalog_label(bazaar: &battletris_core::weapons::Bazaar) -> String {
-    bazaar_buy_keys()
+    bazaar_catalog_keys()
         .into_iter()
         .map(|(token, key)| {
             format!(
@@ -1183,6 +2577,71 @@ fn bazaar_catalog_label(bazaar: &battletris_core::weapons::Bazaar) -> String {
         })
         .collect::<Vec<_>>()
         .join("  ")
+}
+
+fn bazaar_overlay_label(local: &LocalGame, ui: &BazaarUiState) -> String {
+    if local.game.phase() != GamePhase::Bazaar {
+        return String::new();
+    }
+
+    let Some(bazaar) = local.game.bazaar_session(local.local_player) else {
+        return "Bazaar closed".to_string();
+    };
+    let selected = weapon_spec(ui.selected);
+    let done = local.game.bazaar_player_done(local.local_player);
+    let mut text = format!(
+        "BATTLETRIS BAZAAR\nFunds: {}{}  Arsenal: {}\n{}\n\n",
+        bazaar.staged_funds(),
+        if bazaar.carter_prices() {
+            "  CARTER PRICES"
+        } else {
+            ""
+        },
+        arsenal_slots_label(bazaar.staged_arsenal()),
+        if done {
+            "Done selected. Waiting for opponent; shopping controls are dimmed."
+        } else {
+            "Click a row to inspect. Click Add/Remove/DONE. Number slots launch in game, remove staged here."
+        }
+    );
+
+    for (row, spec) in sorted_weapon_catalog().into_iter().enumerate() {
+        let marker = if spec.token == ui.selected { '>' } else { ' ' };
+        let duration = if spec.line_duration == 0 {
+            "one-shot".to_string()
+        } else {
+            format!("{} lines", spec.line_duration)
+        };
+        let _ = writeln!(
+            text,
+            "{marker}{:02}. {:<21} ${:<4} {:<8}",
+            row + 1,
+            spec.name,
+            bazaar.price(spec.token),
+            duration,
+        );
+    }
+
+    let _ = write!(
+        text,
+        "\nSelected: {}  ${}  {}\n{}\n\n[Add] [Remove staged] [DONE]\n{}",
+        selected.name,
+        bazaar.price(selected.token),
+        if selected.line_duration == 0 {
+            "one-shot".to_string()
+        } else {
+            format!("{} target lines", selected.line_duration)
+        },
+        selected.description,
+        ui.last_message,
+    );
+    text
+}
+
+fn sorted_weapon_catalog() -> Vec<&'static battletris_core::weapons::WeaponSpec> {
+    let mut rows = WEAPON_CATALOG.iter().collect::<Vec<_>>();
+    rows.sort_by_key(|spec| (spec.price, spec.token.legacy_id()));
+    rows
 }
 
 fn short_weapon_name(token: WeaponToken) -> &'static str {
@@ -1247,46 +2706,30 @@ fn piece_label(kind: PieceKind) -> &'static str {
     }
 }
 
-fn cell_color(cell: Cell, active: bool, theme: ThemeChoice) -> Color {
-    if theme == ThemeChoice::HighContrast {
-        return match cell {
-            Cell::Visible { color } => {
-                let hue = (color.get() as f32 % 7.0) / 7.0;
-                Color::hsl(360.0 * hue, 0.92, if active { 0.74 } else { 0.56 })
-            }
-            Cell::Structure => Color::srgb(0.8, 0.82, 0.86),
-            Cell::Happy => Color::srgb(1.0, 0.92, 0.0),
-            Cell::Frown => Color::srgb(0.82, 0.47, 0.16),
-            Cell::Gimp { .. } => Color::srgb(1.0, 0.1, 0.9),
-            Cell::Die { .. } => Color::srgb(0.78, 0.84, 1.0),
-            Cell::Invisible => Color::srgba(0.2, 0.22, 0.26, 0.35),
-            Cell::Hidden { .. } => Color::srgb(0.0, 0.0, 0.0),
-        };
-    }
-
+fn cell_color(cell: Cell, _active: bool, theme: &LoadedTheme) -> Color {
     match cell {
         Cell::Visible { color } => {
-            let hue = (color.get() as f32 % 7.0) / 7.0;
-            Color::hsl(360.0 * hue, 0.62, if active { 0.66 } else { 0.48 })
+            let index = usize::from(color.get().saturating_sub(1))
+                % theme.palette.visible_colors.len().max(1);
+            theme
+                .palette
+                .visible_colors
+                .get(index)
+                .copied()
+                .unwrap_or(theme.palette.text_accent)
         }
-        Cell::Structure => Color::srgb(0.46, 0.47, 0.49),
-        Cell::Happy => Color::srgb(0.97, 0.79, 0.22),
-        Cell::Frown => Color::srgb(0.5, 0.42, 0.34),
-        Cell::Gimp { .. } => Color::srgb(0.78, 0.18, 0.73),
-        Cell::Die { pip } => {
-            let lightness = 0.34 + f32::from(pip.get()) * 0.055;
-            Color::srgb(lightness, lightness, 0.93)
-        }
-        Cell::Invisible => Color::srgba(0.09, 0.1, 0.11, 0.22),
-        Cell::Hidden { .. } => Color::srgb(0.025, 0.028, 0.032),
+        Cell::Structure => theme.palette.structure,
+        Cell::Happy => theme.palette.happy,
+        Cell::Frown => theme.palette.frown,
+        Cell::Gimp { .. } => theme.palette.gimp,
+        Cell::Die { .. } => theme.palette.die,
+        Cell::Invisible => theme.palette.invisible,
+        Cell::Hidden { .. } => theme.palette.hidden,
     }
 }
 
-fn empty_cell_color(theme: ThemeChoice) -> Color {
-    match theme {
-        ThemeChoice::OriginalInspired => Color::srgb(0.075, 0.085, 0.095),
-        ThemeChoice::HighContrast => Color::srgb(0.015, 0.018, 0.022),
-    }
+fn empty_cell_color(theme: &LoadedTheme) -> Color {
+    theme.palette.empty
 }
 
 fn sound_event_for(event: &BattleEvent) -> Option<SoundEvent> {
@@ -1309,25 +2752,35 @@ fn sound_event_for(event: &BattleEvent) -> Option<SoundEvent> {
         }
         BattleEvent::WeaponLaunched { .. }
         | BattleEvent::OneShotWeaponApplied { .. }
-        | BattleEvent::TimedWeaponActivated { .. } => Some(SoundEvent::WeaponLaunch),
+        | BattleEvent::TimedWeaponActivated { .. }
+        | BattleEvent::WeaponReflected { .. }
+        | BattleEvent::WeaponNullified { .. } => Some(SoundEvent::WeaponLaunch),
+        BattleEvent::TimedWeaponExpired { .. } => Some(SoundEvent::Purchase),
         BattleEvent::PlayerDied { .. } | BattleEvent::GameOver { .. } => Some(SoundEvent::GameOver),
         BattleEvent::Paused | BattleEvent::Resumed => Some(SoundEvent::MenuAction),
         _ => None,
     }
 }
 
-fn cell_x(left: f32, x: usize) -> f32 {
-    left + x as f32 * CELL_SIZE + CELL_SIZE / 2.0
+fn cell_x(theme: &LoadedTheme, left: f32, x: usize) -> f32 {
+    left + x as f32 * theme.cell.size + theme.cell.size / 2.0
 }
 
-fn cell_y(y: usize) -> f32 {
-    BOARD_TOP - y as f32 * CELL_SIZE - CELL_SIZE / 2.0
+fn cell_y(theme: &LoadedTheme, y: usize) -> f32 {
+    theme.layout.board.top - y as f32 * theme.cell.size - theme.cell.size / 2.0
 }
 
 const fn opponent_player(player: PlayerId) -> PlayerId {
     match player {
         PlayerId::One => PlayerId::Two,
         PlayerId::Two => PlayerId::One,
+    }
+}
+
+const fn client_player_index(player: PlayerId) -> usize {
+    match player {
+        PlayerId::One => 0,
+        PlayerId::Two => 1,
     }
 }
 
@@ -1346,24 +2799,161 @@ fn slot_keys() -> [(u8, KeyCode); 10] {
     ]
 }
 
-fn bazaar_buy_keys() -> [(WeaponToken, KeyCode); 5] {
+fn bazaar_catalog_keys() -> [(WeaponToken, KeyCode); 10] {
     [
-        (WeaponToken::FlipOut, KeyCode::KeyA),
-        (WeaponToken::Gimp, KeyCode::KeyS),
-        (WeaponToken::Missing, KeyCode::KeyD),
-        (WeaponToken::RiseUp, KeyCode::KeyF),
-        (WeaponToken::NiceDay, KeyCode::KeyG),
+        (WeaponToken::FlipOut, KeyCode::Digit1),
+        (WeaponToken::Gimp, KeyCode::Digit2),
+        (WeaponToken::Missing, KeyCode::Digit3),
+        (WeaponToken::NiceDay, KeyCode::Digit4),
+        (WeaponToken::RiseUp, KeyCode::Digit5),
+        (WeaponToken::PieceIt, KeyCode::Digit6),
+        (WeaponToken::Ace, KeyCode::Digit7),
+        (WeaponToken::SoLong, KeyCode::Digit8),
+        (WeaponToken::Upbyside, KeyCode::Digit9),
+        (WeaponToken::NoSlide, KeyCode::Digit0),
     ]
 }
 
-fn computer_bazaar_tokens() -> [WeaponToken; 5] {
-    [
-        WeaponToken::NiceDay,
-        WeaponToken::Missing,
-        WeaponToken::RiseUp,
-        WeaponToken::FlipOut,
-        WeaponToken::Gimp,
-    ]
+fn handle_bazaar_click(world: Vec2, game: &mut TwoPlayerGame, ui: &mut BazaarUiState) {
+    let player = PlayerId::One;
+    if let Some(token) = bazaar_catalog_token_at(world) {
+        ui.selected = token;
+        ui.last_message = format!("Selected {}.", weapon_spec(token).name);
+        return;
+    }
+    if bazaar_add_rect().contains(world) {
+        buy_selected_bazaar_weapon(game, ui, player);
+        return;
+    }
+    if bazaar_remove_rect().contains(world) {
+        remove_selected_bazaar_weapon(game, ui, player);
+        return;
+    }
+    if bazaar_done_rect().contains(world) {
+        match game.bazaar_done(player) {
+            events if events.is_empty() => {
+                ui.last_message = "Already waiting for opponent.".to_string()
+            }
+            _ => ui.last_message = "Done. Waiting for opponent.".to_string(),
+        }
+        return;
+    }
+    if let Some(token) = bazaar_arsenal_token_at(world, game, player) {
+        ui.selected = token;
+        remove_selected_bazaar_weapon(game, ui, player);
+    }
+}
+
+fn buy_selected_bazaar_weapon(game: &mut TwoPlayerGame, ui: &mut BazaarUiState, player: PlayerId) {
+    buy_bazaar_weapon(game, ui, player, ui.selected);
+}
+
+fn buy_bazaar_weapon(
+    game: &mut TwoPlayerGame,
+    ui: &mut BazaarUiState,
+    player: PlayerId,
+    token: WeaponToken,
+) {
+    match game.bazaar_buy(player, token) {
+        Ok(index) => {
+            ui.last_message = format!(
+                "Added {} to slot {}.",
+                weapon_spec(token).name,
+                arsenal_slot_label(index),
+            );
+        }
+        Err(error) => {
+            ui.last_message = format!("Could not add {}: {error:?}.", weapon_spec(token).name);
+        }
+    }
+}
+
+fn remove_selected_bazaar_weapon(
+    game: &mut TwoPlayerGame,
+    ui: &mut BazaarUiState,
+    player: PlayerId,
+) {
+    let token = ui.selected;
+    match game.bazaar_remove_staged(player, token) {
+        Ok(()) => {
+            ui.last_message = format!(
+                "Removed staged {} and refunded its entry price.",
+                weapon_spec(token).name
+            );
+        }
+        Err(error) => {
+            ui.last_message = format!(
+                "Could not remove {}: only newly staged purchases can be refunded ({error:?}).",
+                weapon_spec(token).name,
+            );
+        }
+    }
+}
+
+fn adjacent_catalog_token(current: WeaponToken, step: isize) -> WeaponToken {
+    let rows = sorted_weapon_catalog();
+    let index = rows
+        .iter()
+        .position(|spec| spec.token == current)
+        .unwrap_or_default() as isize;
+    let next = (index + step).rem_euclid(rows.len() as isize) as usize;
+    rows[next].token
+}
+
+fn bazaar_catalog_token_at(world: Vec2) -> Option<WeaponToken> {
+    const LEFT: f32 = -390.0;
+    const RIGHT: f32 = 95.0;
+    const TOP: f32 = 284.0;
+    const ROW_HEIGHT: f32 = 13.5;
+    if world.x < LEFT || world.x > RIGHT || world.y > TOP || world.y < TOP - ROW_HEIGHT * 34.0 {
+        return None;
+    }
+    let row = ((TOP - world.y) / ROW_HEIGHT).floor() as usize;
+    sorted_weapon_catalog().get(row).map(|spec| spec.token)
+}
+
+fn bazaar_arsenal_token_at(
+    world: Vec2,
+    game: &TwoPlayerGame,
+    player: PlayerId,
+) -> Option<WeaponToken> {
+    const LEFT: f32 = -75.0;
+    const TOP: f32 = 338.0;
+    const SLOT_WIDTH: f32 = 44.0;
+    const SLOT_HEIGHT: f32 = 24.0;
+    if world.x < LEFT
+        || world.x > LEFT + SLOT_WIDTH * 10.0
+        || world.y > TOP
+        || world.y < TOP - SLOT_HEIGHT
+    {
+        return None;
+    }
+    let index = ((world.x - LEFT) / SLOT_WIDTH).floor() as usize;
+    game.bazaar_session(player)
+        .and_then(|bazaar| bazaar.staged_arsenal().slots().get(index))
+        .copied()
+        .flatten()
+        .map(|slot| slot.token)
+}
+
+fn bazaar_add_rect() -> Rect {
+    Rect::from_center_size(Vec2::new(170.0, -310.0), Vec2::new(82.0, 32.0))
+}
+
+fn bazaar_remove_rect() -> Rect {
+    Rect::from_center_size(Vec2::new(275.0, -310.0), Vec2::new(118.0, 32.0))
+}
+
+fn bazaar_done_rect() -> Rect {
+    Rect::from_center_size(Vec2::new(360.0, -310.0), Vec2::new(72.0, 32.0))
+}
+
+fn arsenal_slot_label(index: usize) -> String {
+    if index == 9 {
+        "0".to_string()
+    } else {
+        (index + 1).to_string()
+    }
 }
 
 #[cfg(test)]
@@ -1381,20 +2971,41 @@ mod tests {
 
     #[test]
     fn hud_mentions_core_state_and_preview() {
-        let game = TwoPlayerGame::new(GameSeed::from_u64(1), GameSeed::from_u64(2));
-        let hud = player_hud(&game, PlayerId::One);
+        let local = LocalGame::new_human_vs_human();
+        let recon = ReconPanel::default();
+        let hud = player_hud(&local, &recon, PlayerId::One);
 
         assert!(hud.contains("score 0"));
         assert!(hud.contains("funds 0"));
+        assert!(hud.contains("bazaar in 20"));
         assert!(hud.contains("next "));
         assert!(hud.contains("arsenal empty"));
     }
 
     #[test]
-    fn bazaar_keys_are_affordable_intro_weapons() {
-        for (token, _) in bazaar_buy_keys() {
-            assert!(battletris_core::weapons::weapon_spec(token).price <= 100);
+    fn bazaar_shortcut_keys_are_affordable_intro_weapons() {
+        for (token, _) in bazaar_catalog_keys() {
+            assert!(battletris_core::weapons::weapon_spec(token).price <= 125);
         }
+    }
+
+    #[test]
+    fn bazaar_sorted_catalog_exposes_every_weapon_by_price() {
+        let rows = sorted_weapon_catalog();
+
+        assert_eq!(rows.len(), WEAPON_CATALOG.len());
+        assert_eq!(rows.first().unwrap().token, WeaponToken::FlipOut);
+        assert_eq!(rows.last().unwrap().token, WeaponToken::Swap);
+        assert!(rows.windows(2).all(|pair| pair[0].price <= pair[1].price));
+    }
+
+    #[test]
+    fn bazaar_mouse_rows_select_any_catalog_weapon() {
+        let first = bazaar_catalog_token_at(Vec2::new(-380.0, 283.0));
+        let last = bazaar_catalog_token_at(Vec2::new(-380.0, 284.0 - 13.5 * 33.0));
+
+        assert_eq!(first, Some(WeaponToken::FlipOut));
+        assert_eq!(last, Some(WeaponToken::Swap));
     }
 
     #[test]
@@ -1415,10 +3026,56 @@ mod tests {
 
     #[test]
     fn human_vs_computer_client_game_is_unranked() {
-        let local = LocalGame::new_human_vs_computer();
+        let local = LocalGame::new_human_vs_computer(14);
 
         assert!(!local.game.is_ranked_game());
         assert!(local.computer.is_some());
+        assert!(matches!(
+            local.game.mode(),
+            GameMode::HumanVsComputer { difficulty, .. } if difficulty.level == 14
+        ));
+    }
+
+    #[test]
+    fn computer_opponent_view_is_hidden_until_recon() {
+        let local = LocalGame::new_human_vs_computer(DEFAULT_ERNIE_LEVEL);
+        let mut recon = ReconPanel::default();
+
+        assert!(player_view_visible(&local, &recon, PlayerId::One));
+        assert!(!player_view_visible(&local, &recon, PlayerId::Two));
+
+        recon.manual_condor = true;
+        assert!(player_view_visible(&local, &recon, PlayerId::Two));
+    }
+
+    #[test]
+    fn ernie_difficulty_selection_clamps_to_legacy_table() {
+        let mut settings = ClientSettings {
+            ernie_level: 0,
+            settings_path: None,
+            ..Default::default()
+        };
+        adjust_ernie_level(&mut settings, -1);
+        assert_eq!(settings.ernie_level, 0);
+
+        adjust_ernie_level(&mut settings, 99);
+        assert_eq!(settings.ernie_level, COMPUTER_DIFFICULTIES.len() - 1);
+        assert_eq!(selected_ernie_difficulty(&settings).name, "Bionic");
+    }
+
+    #[test]
+    fn held_key_repeat_uses_initial_delay_then_fixed_interval() {
+        let (repeat, emit) = HeldKeyRepeat::default().observe(true, true, 0);
+        assert!(emit);
+
+        let (repeat, emit) = repeat.observe(true, false, INPUT_REPEAT_INITIAL_MS - 1);
+        assert!(!emit);
+
+        let (repeat, emit) = repeat.observe(true, false, 1);
+        assert!(emit);
+
+        let (_, emit) = repeat.observe(true, false, INPUT_REPEAT_MS);
+        assert!(emit);
     }
 
     #[test]
@@ -1442,6 +3099,7 @@ mod tests {
             sound_pack: SoundPackChoice::Muted,
             controls: ControlScheme::LegacyInspired,
             pixel_scale: 1.5,
+            ernie_level: 12,
         };
 
         let encoded = toml::to_string_pretty(&settings).expect("settings encode");
@@ -1466,5 +3124,11 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(settings.pixel_scale, 2.0);
+
+        settings.apply_persisted(PersistedClientSettings {
+            ernie_level: 99,
+            ..Default::default()
+        });
+        assert_eq!(settings.ernie_level, COMPUTER_DIFFICULTIES.len() - 1);
     }
 }

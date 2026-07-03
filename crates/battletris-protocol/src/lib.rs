@@ -519,13 +519,13 @@ pub struct RankedResultClaim {
     /// Winner final line count.
     pub winner_lines: u64,
     /// Winner final funds.
-    pub winner_funds: u64,
+    pub winner_funds: i64,
     /// Loser final score.
     pub loser_score: u64,
     /// Loser final line count.
     pub loser_lines: u64,
     /// Loser final funds.
-    pub loser_funds: u64,
+    pub loser_funds: i64,
     /// Game duration in seconds.
     pub duration_secs: u64,
     /// Deterministic event count observed by the reporter.
@@ -1440,10 +1440,10 @@ mod tests {
                 loser_player_id: "ben".to_string(),
                 winner_score: 2000,
                 winner_lines: 24,
-                winner_funds: 400,
+                winner_funds: -400,
                 loser_score: 1500,
                 loser_lines: 18,
-                loser_funds: 250,
+                loser_funds: -250,
                 duration_secs: 300,
                 event_count: 75,
             }),

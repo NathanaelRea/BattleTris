@@ -9,3 +9,4 @@ description = "BattleTris asset, audio, replay, protocol, and legacy extraction 
 workspace = true
 
 [dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }

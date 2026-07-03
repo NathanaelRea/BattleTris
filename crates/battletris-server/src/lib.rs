@@ -420,10 +420,10 @@ mod tests {
             loser_player_id: "ben".to_string(),
             winner_score: 12_000,
             winner_lines: 40,
-            winner_funds: 900,
+            winner_funds: -900,
             loser_score: 8_000,
             loser_lines: 24,
-            loser_funds: 500,
+            loser_funds: -500,
             duration_secs: 180,
             event_count: 88,
         }

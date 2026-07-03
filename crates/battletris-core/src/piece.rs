@@ -6,7 +6,7 @@
 
 use crate::{
     board::{Board, BOARD_WIDTH},
-    cell::{Cell, Pip},
+    cell::{Cell, Pip, VisibleColor},
 };
 
 /// Width and height of the legacy piece map.
@@ -441,8 +441,21 @@ fn cell_for_piece(kind: PieceKind) -> Cell {
     match kind {
         PieceKind::Die => Cell::die(Pip::new(1).expect("literal pip is valid")),
         PieceKind::Happy => Cell::Happy,
-        _ => Cell::visible(),
+        _ => Cell::visible_with_color(piece_color(kind)),
     }
+}
+
+const fn piece_color(kind: PieceKind) -> VisibleColor {
+    let color = match kind {
+        PieceKind::El | PieceKind::Wall | PieceKind::WeirdLong => 1,
+        PieceKind::ReverseEl | PieceKind::Tower | PieceKind::LongDong => 2,
+        PieceKind::SlantRight | PieceKind::Star => 3,
+        PieceKind::SlantLeft | PieceKind::FourByFour => 4,
+        PieceKind::Long | PieceKind::Dog => 5,
+        PieceKind::Plug | PieceKind::ReverseDog => 6,
+        PieceKind::Box | PieceKind::Cap | PieceKind::Die | PieceKind::Happy => 7,
+    };
+    VisibleColor::new(color).expect("piece color id is in the legacy visible range")
 }
 
 fn cells_for_coords(coords: &[LocalCoord], cell: Cell) -> Vec<PieceCell> {

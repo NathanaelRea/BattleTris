@@ -1,4 +1,55 @@
 name = "High Contrast"
 kind = "theme"
 format_version = 1
-description = "High-contrast color theme compiled into the current Bevy renderer."
+description = "High-contrast data-driven validation theme."
+default_scale = 1.0
+
+[legacy_sources]
+notes = "Accessibility-oriented validation pack using the same schema as original-inspired."
+
+[sprites]
+atlas = "images/blocks.png"
+startup = "images/startup.png"
+bazaar = "images/bazaar.png"
+biff = "images/biff.png"
+gimp = "images/gimp.png"
+
+[fonts]
+default = ""
+
+[cell]
+size = 23.0
+gap = 1.5
+shadow = 3.0
+
+[layout.window]
+width = 1040.0
+height = 720.0
+
+[layout.board]
+top = 255.0
+player_one_left = -360.0
+player_two_left = 120.0
+spacing = 480.0
+
+[palette]
+background = "#000000"
+board_background = "#111111"
+empty = "#040507"
+structure = "#ccd1db"
+happy = "#ffea00"
+frown = "#d17829"
+gimp = "#ff1ae8"
+die = "#c7d6ff"
+invisible = "#33384260"
+hidden = "#000000"
+text_primary = "#ffffff"
+text_secondary = "#d6f7ff"
+text_accent = "#fff200"
+visible_colors = ["#ff3939", "#30b7ff", "#fff233", "#47ff6d", "#ff55ff", "#ffffff", "#ffc400"]
+
+[button]
+normal = "#ffffff"
+hover = "#fff200"
+pressed = "#30b7ff"
+text = "#000000"

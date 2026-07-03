@@ -28,8 +28,26 @@ required_files=(
     "$package_dir/Cargo.lock"
     "$package_dir/assets/manifest.toml"
     "$package_dir/assets/themes/original-inspired/theme.toml"
+    "$package_dir/assets/themes/original-inspired/images/blocks.png"
+    "$package_dir/assets/themes/original-inspired/images/startup.png"
+    "$package_dir/assets/themes/original-inspired/images/bazaar.png"
+    "$package_dir/assets/themes/original-inspired/images/biff.png"
+    "$package_dir/assets/themes/original-inspired/images/gimp.png"
     "$package_dir/assets/themes/high-contrast/theme.toml"
+    "$package_dir/assets/themes/high-contrast/images/blocks.png"
+    "$package_dir/assets/themes/high-contrast/images/startup.png"
+    "$package_dir/assets/themes/high-contrast/images/bazaar.png"
+    "$package_dir/assets/themes/high-contrast/images/biff.png"
+    "$package_dir/assets/themes/high-contrast/images/gimp.png"
     "$package_dir/assets/sounds/generated-default/sound-pack.toml"
+    "$package_dir/assets/sounds/generated-default/menu-action.wav"
+    "$package_dir/assets/sounds/generated-default/piece-locked.wav"
+    "$package_dir/assets/sounds/generated-default/line-clear.wav"
+    "$package_dir/assets/sounds/generated-default/bazaar-entered.wav"
+    "$package_dir/assets/sounds/generated-default/purchase.wav"
+    "$package_dir/assets/sounds/generated-default/weapon-launch.wav"
+    "$package_dir/assets/sounds/generated-default/warning.wav"
+    "$package_dir/assets/sounds/generated-default/game-over.wav"
     "$package_dir/docs/rewrite-spec.md"
     "$package_dir/docs/traceability-checklist.md"
     "$package_dir/docs/distribution.md"
@@ -40,6 +58,23 @@ for required in "${required_files[@]}"; do
         printf 'package missing required file: %s\n' "$required" >&2
         exit 1
     fi
+done
+
+for sound in menu-action.wav piece-locked.wav line-clear.wav bazaar-entered.wav purchase.wav weapon-launch.wav warning.wav game-over.wav; do
+    if ! grep -q "$sound" "$package_dir/assets/sounds/generated-default/sound-pack.toml"; then
+        printf 'sound-pack manifest does not declare required sound %s\n' "$sound" >&2
+        exit 1
+    fi
+done
+
+for theme in original-inspired high-contrast; do
+    theme_manifest="$package_dir/assets/themes/$theme/theme.toml"
+    for asset in images/blocks.png images/startup.png images/bazaar.png images/biff.png images/gimp.png; do
+        if ! grep -q "$asset" "$theme_manifest"; then
+            printf 'theme manifest %s does not declare required asset %s\n' "$theme_manifest" "$asset" >&2
+            exit 1
+        fi
+    done
 done
 
 binary_count=0

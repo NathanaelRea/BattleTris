@@ -94,6 +94,12 @@ impl Cell {
         }
     }
 
+    /// Creates a visible cell with a specific legacy color ID.
+    #[must_use]
+    pub const fn visible_with_color(color: VisibleColor) -> Self {
+        Self::Visible { color }
+    }
+
     /// Creates a die cell for a valid pip value.
     #[must_use]
     pub const fn die(pip: Pip) -> Self {

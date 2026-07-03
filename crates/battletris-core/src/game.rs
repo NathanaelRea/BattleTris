@@ -27,6 +27,8 @@ pub const DEFAULT_FAST_DROP_MS: u64 = 10;
 pub const DEFAULT_DROP_MS: u64 = 512;
 /// Legacy default slide grace interval in milliseconds.
 pub const DEFAULT_SLIDE_MS: u64 = 150;
+/// Legacy Hatter/Slick effect timer interval in milliseconds.
+pub const DEFAULT_EFFECT_TICK_MS: u64 = 20;
 
 /// Input commands accepted by the headless core loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,6 +347,7 @@ pub struct PieceLoop {
     slide_elapsed_ms: Option<u64>,
     fast_drop: bool,
     fast_drop_scored: bool,
+    effect_elapsed_ms: u64,
     score: PlayerScore,
     arsenal: Arsenal,
     active_effects: ActiveEffects,
@@ -373,6 +376,7 @@ impl PieceLoop {
             slide_elapsed_ms: None,
             fast_drop: false,
             fast_drop_scored: false,
+            effect_elapsed_ms: 0,
             score: PlayerScore::default(),
             arsenal: Arsenal::new(),
             active_effects: ActiveEffects::new(),
@@ -514,11 +518,21 @@ impl PieceLoop {
             events.extend(self.drop_or_start_slide());
         }
 
-        if self.active_effects.is_active(WeaponToken::Hatter) {
-            events.extend(self.rotate_active(false));
-        }
-        if self.active_effects.is_active(WeaponToken::Slick) {
-            events.extend(self.slick_step());
+        if self.active_effects.is_active(WeaponToken::Hatter)
+            || self.active_effects.is_active(WeaponToken::Slick)
+        {
+            self.effect_elapsed_ms += elapsed_ms;
+            while self.effect_elapsed_ms >= DEFAULT_EFFECT_TICK_MS {
+                self.effect_elapsed_ms -= DEFAULT_EFFECT_TICK_MS;
+                if self.active_effects.is_active(WeaponToken::Hatter) {
+                    events.extend(self.rotate_active(false));
+                }
+                if self.active_effects.is_active(WeaponToken::Slick) {
+                    events.extend(self.slick_step());
+                }
+            }
+        } else {
+            self.effect_elapsed_ms = 0;
         }
 
         if let Some(slide_elapsed) = self.slide_elapsed_ms.as_mut().filter(|_| slide_was_active) {
@@ -909,6 +923,12 @@ impl TwoPlayerGame {
         }
     }
 
+    /// Returns combined lines remaining until the next bazaar entry.
+    #[must_use]
+    pub const fn lines_until_bazaar(&self) -> u32 {
+        self.bazaar.lines_until_bazaar()
+    }
+
     /// Pauses playing or bazaar state. Repeated pauses are ignored.
     pub fn pause(&mut self) -> Vec<LoggedEvent> {
         if matches!(self.phase, GamePhase::Paused | GamePhase::GameOver) {
@@ -997,6 +1017,12 @@ impl TwoPlayerGame {
     #[must_use]
     pub fn bazaar_session(&self, player: PlayerId) -> Option<&Bazaar> {
         self.bazaar_sessions[player_index(player)].as_ref()
+    }
+
+    /// Returns whether a player has committed their current bazaar session.
+    #[must_use]
+    pub const fn bazaar_player_done(&self, player: PlayerId) -> bool {
+        self.bazaar_done[player_index(player)]
     }
 
     /// Launches one arsenal slot and applies supported weapon effects.
@@ -1503,7 +1529,8 @@ const fn timed_effect_target(launcher: PlayerId, target: PlayerId, token: Weapon
 mod tests {
     use super::{
         BattleEvent, Command, CoreEvent, GameMode, GamePhase, PieceLoop, PlayerId, ShoppingError,
-        TwoPlayerGame, DEFAULT_DROP_MS, DEFAULT_SLIDE_MS,
+        TwoPlayerGame, DEFAULT_DROP_MS, DEFAULT_EFFECT_TICK_MS, DEFAULT_FAST_DROP_MS,
+        DEFAULT_SLIDE_MS,
     };
     use crate::{
         ai::computer_difficulty,
@@ -1561,6 +1588,38 @@ mod tests {
         );
         assert!(game.command(Command::StartFastDrop).is_empty());
         assert_eq!(game.score(), BOARD_HEIGHT as i32);
+    }
+
+    #[test]
+    fn fast_drop_remains_steerable_until_slide_grace_expires() {
+        let mut board = Board::empty();
+        for x in 0..10 {
+            board.set(Coord::new(x, 3).unwrap(), Some(Cell::visible()));
+        }
+        let (mut game, _) = PieceLoop::with_board(GameSeed::from_u64(42), board);
+
+        assert_eq!(
+            game.command(Command::StartFastDrop),
+            vec![CoreEvent::FastDropStarted { score_delta: 28 }]
+        );
+        assert_eq!(
+            game.tick(DEFAULT_FAST_DROP_MS),
+            vec![CoreEvent::PieceLanded]
+        );
+        assert_eq!(
+            game.command(Command::MoveLeft),
+            vec![CoreEvent::PieceMoved { anchor: (3, 0) }]
+        );
+        assert_eq!(
+            game.command(Command::RotateClockwise),
+            vec![CoreEvent::PieceRotated { orientation: 1 }]
+        );
+        assert!(game.tick(DEFAULT_SLIDE_MS - 1).is_empty());
+
+        assert!(game
+            .tick(1)
+            .iter()
+            .any(|event| matches!(event, CoreEvent::PieceLocked { .. })));
     }
 
     #[test]
@@ -2009,6 +2068,62 @@ mod tests {
         assert_fallout_clears_middle_columns_on_activation();
         assert_bottle_uses_legacy_wall_rows();
         assert_slick_bounces_between_blockage();
+    }
+
+    #[test]
+    fn hatter_and_slick_use_legacy_twenty_millisecond_timer() {
+        let mut hatter = TwoPlayerGame::new(GameSeed::from_u64(100), GameSeed::from_u64(42));
+        hatter
+            .player_two
+            .active_effects
+            .activate(WeaponToken::Hatter);
+        let before_orientation = hatter
+            .player(PlayerId::Two)
+            .active_piece()
+            .unwrap()
+            .orientation();
+        assert!(hatter
+            .tick_player(PlayerId::Two, DEFAULT_EFFECT_TICK_MS - 1)
+            .is_empty());
+        assert!(hatter
+            .tick_player(PlayerId::Two, 1)
+            .iter()
+            .any(|logged| matches!(
+                logged.event,
+                BattleEvent::PlayerEvent {
+                    event: CoreEvent::PieceRotated { .. },
+                    ..
+                }
+            )));
+        assert_ne!(
+            hatter
+                .player(PlayerId::Two)
+                .active_piece()
+                .unwrap()
+                .orientation(),
+            before_orientation
+        );
+
+        let mut slick = TwoPlayerGame::new(GameSeed::from_u64(100), GameSeed::from_u64(42));
+        slick.player_two.active_effects.activate(WeaponToken::Slick);
+        let before_anchor = slick.player(PlayerId::Two).active_piece().unwrap().anchor();
+        assert!(slick
+            .tick_player(PlayerId::Two, DEFAULT_EFFECT_TICK_MS - 1)
+            .is_empty());
+        assert!(slick
+            .tick_player(PlayerId::Two, 1)
+            .iter()
+            .any(|logged| matches!(
+                logged.event,
+                BattleEvent::PlayerEvent {
+                    event: CoreEvent::PieceMoved { .. },
+                    ..
+                }
+            )));
+        assert_ne!(
+            slick.player(PlayerId::Two).active_piece().unwrap().anchor(),
+            before_anchor
+        );
     }
 
     #[test]
@@ -2633,7 +2748,7 @@ mod tests {
         game.player_two.set_board(board);
 
         let before = game.player(PlayerId::Two).active_piece().unwrap().anchor();
-        game.tick_player(PlayerId::Two, 1);
+        game.tick_player(PlayerId::Two, DEFAULT_EFFECT_TICK_MS);
 
         assert_eq!(
             game.player(PlayerId::Two).active_piece().unwrap().anchor(),

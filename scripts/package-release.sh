@@ -58,8 +58,8 @@ cp Cargo.lock "$package_dir/"
 cat >"$package_dir/README.md" <<README
 # BattleTris ${version}
 
-This archive contains the BattleTris desktop client, optional self-hosted server
-placeholder, developer tools placeholder, default asset manifests, and release
+This archive contains the BattleTris desktop client, optional self-hosted server,
+developer tools, converted/default assets, generated sound cues, and release
 documentation snapshots.
 
 ## Run
