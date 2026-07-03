@@ -6,13 +6,14 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 usage() {
-    printf '%s\n' "Usage: $0 [--theme original-inspired] [--out-dir target/visual/current] [--fixture NAME]"
+    printf '%s\n' "Usage: $0 [--theme original] [--out-dir target/visual/current] [--fixture NAME]"
     printf '%s\n' ""
-    printf '%s\n' "Runs the Bevy visual capture harness on a private Xvfb display when available."
+    printf '%s\n' "Default captures every current visual fixture."
+    printf '%s\n' "Runs the Bevy visual capture harness on a private headless display when available."
     printf '%s\n' "Set BATTLETRIS_VISUAL_ALLOW_DESKTOP=1 to allow use of the current desktop display."
 }
 
-theme="original-inspired"
+theme="original"
 out_dir="target/visual/current"
 fixture=""
 
@@ -72,12 +73,12 @@ else
     command=(cargo run --bin client -- headless capture-all --theme "$theme" --out-dir "$out_dir")
 fi
 
-if command -v xvfb-run >/dev/null 2>&1; then
-    exec xvfb-run -a -s "-screen 0 1280x1024x24" "${command[@]}"
-fi
-
 if command -v gamescope >/dev/null 2>&1; then
     exec gamescope --backend headless -W 1040 -H 720 -w 1040 -h 720 -- "${command[@]}"
+fi
+
+if command -v xvfb-run >/dev/null 2>&1; then
+    exec xvfb-run -a -s "-screen 0 1280x1024x24" "${command[@]}"
 fi
 
 if [[ "${BATTLETRIS_VISUAL_ALLOW_DESKTOP:-}" == "1" ]]; then

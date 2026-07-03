@@ -2,13 +2,13 @@ schema_version = 1
 name = "BattleTris default assets"
 version = "0.1.0"
 
-[themes.original-inspired]
-path = "themes/original-inspired/theme.toml"
-description = "Data-driven original-inspired theme schema, palette, layout, and required sprites."
+[themes.original]
+path = "themes/original/theme.toml"
+description = "Format v1 original theme schema with metadata, semantic tokens, layout rects, and cell atlas mapping."
 
 [themes.high-contrast]
 path = "themes/high-contrast/theme.toml"
-description = "Data-driven high-contrast validation theme schema, palette, layout, and required sprites."
+description = "Format v1 high-contrast validation theme schema with the same semantic and atlas contract."
 
 [sounds.generated-default]
 path = "sounds/generated-default/sound-pack.toml"

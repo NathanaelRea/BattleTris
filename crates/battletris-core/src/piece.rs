@@ -447,13 +447,14 @@ fn cell_for_piece(kind: PieceKind) -> Cell {
 
 const fn piece_color(kind: PieceKind) -> VisibleColor {
     let color = match kind {
-        PieceKind::El | PieceKind::Wall | PieceKind::WeirdLong => 1,
-        PieceKind::ReverseEl | PieceKind::Tower | PieceKind::LongDong => 2,
-        PieceKind::SlantRight | PieceKind::Star => 3,
-        PieceKind::SlantLeft | PieceKind::FourByFour => 4,
-        PieceKind::Long | PieceKind::Dog => 5,
-        PieceKind::Plug | PieceKind::ReverseDog => 6,
-        PieceKind::Box | PieceKind::Cap | PieceKind::Die | PieceKind::Happy => 7,
+        PieceKind::El | PieceKind::Dog => 2,
+        PieceKind::ReverseEl | PieceKind::ReverseDog => 3,
+        PieceKind::SlantRight | PieceKind::Cap => 4,
+        PieceKind::SlantLeft | PieceKind::Wall => 5,
+        PieceKind::Long | PieceKind::Tower | PieceKind::LongDong => 6,
+        PieceKind::Plug | PieceKind::Star => 7,
+        PieceKind::Box | PieceKind::WeirdLong | PieceKind::FourByFour => 8,
+        PieceKind::Die | PieceKind::Happy => 1,
     };
     VisibleColor::new(color).expect("piece color id is in the legacy visible range")
 }
@@ -623,6 +624,34 @@ mod tests {
             assert_eq!(kind.rotation_width(), rot);
             assert_eq!(kind.spawn_anchor(), spawn);
             assert!(spawn_is_horizontally_centered(kind));
+        }
+    }
+
+    #[test]
+    fn visible_piece_color_ids_match_legacy_constructor_offsets() {
+        let expected = [
+            (PieceKind::El, 2),
+            (PieceKind::ReverseEl, 3),
+            (PieceKind::SlantRight, 4),
+            (PieceKind::SlantLeft, 5),
+            (PieceKind::Long, 6),
+            (PieceKind::Plug, 7),
+            (PieceKind::Box, 8),
+            (PieceKind::Dog, 2),
+            (PieceKind::ReverseDog, 3),
+            (PieceKind::Cap, 4),
+            (PieceKind::Wall, 5),
+            (PieceKind::Tower, 6),
+            (PieceKind::Star, 7),
+            (PieceKind::WeirdLong, 8),
+            (PieceKind::FourByFour, 8),
+            (PieceKind::LongDong, 6),
+        ];
+
+        for (kind, id) in expected {
+            for (_, cell) in Piece::spawn(kind).cells() {
+                assert_eq!(cell.legacy_id(), id, "{kind:?}");
+            }
         }
     }
 

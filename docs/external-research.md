@@ -138,7 +138,7 @@ pieces, arsenal, funds, scores, and effects.
 
 Recommendation: use Bevy sprite rendering with texture atlases for board cells,
 pieces, weapon icons, and UI accents. Use Bevy UI/text for labels, menus, and
-settings where it preserves the original-inspired visual language. Keep the core
+settings where it preserves the original visual language. Keep the core
 board snapshot typed and render it through `battletris-client` adapter entities.
 
 Use these Bevy APIs:
@@ -155,7 +155,7 @@ Theme pack proposal:
 ```text
 assets/
   themes/
-    original-inspired/
+    original/
       theme.toml
       sprites/blocks.png
       sprites/ui.png
@@ -218,7 +218,7 @@ Settings persistence shape:
 [video]
 scale = 2
 pixel_filter = "nearest"
-theme = "original-inspired"
+theme = "original"
 
 [audio]
 sound_pack = "generated-default"
@@ -508,7 +508,7 @@ First release artifact shape:
 battletris-<version>-<target>/
   battletris-client(.exe)
   assets/
-    themes/original-inspired/...
+    themes/original/...
     sounds/generated-default/...
   README.md
   LICENSES/

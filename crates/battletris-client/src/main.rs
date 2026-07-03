@@ -20,12 +20,17 @@ use battletris_protocol::{
     PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 use bevy::ecs::system::SystemParam;
+use bevy::image::ImageSampler;
 use bevy::prelude::*;
+use bevy::render::render_resource::TextureFormat;
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured};
+use bevy::sprite::Anchor;
+use bevy::text::{FontSmoothing, FontWeight, LetterSpacing, LineHeight};
 use bevy::window::PrimaryWindow;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     ffi::{OsStr, OsString},
     fmt::Write as _,
     fs,
@@ -39,6 +44,22 @@ const CLIENT_FIXED_TICK_MS: u64 = 10;
 const INPUT_REPEAT_INITIAL_MS: u64 = 150;
 const INPUT_REPEAT_MS: u64 = 50;
 const DEFAULT_ERNIE_LEVEL: usize = 7;
+const LEGACY_GAME_WIDTH: f32 = 934.0;
+const LEGACY_GAME_HEIGHT: f32 = 700.0;
+const LEGACY_GAME_SCORE_X: f32 = 300.0;
+const LEGACY_GAME_SCORE_Y: f32 = 30.0;
+const LEGACY_GAME_SCORE_WIDTH: f32 = 325.0;
+const LEGACY_GAME_SCORE_HEIGHT: f32 = 210.0;
+const LEGACY_GAME_ARSENAL_X: f32 = 300.0;
+const LEGACY_GAME_ARSENAL_Y: f32 = 270.0;
+const LEGACY_GAME_ARSENAL_WIDTH: f32 = 325.0;
+const LEGACY_GAME_ARSENAL_ROW_HEIGHT: f32 = 35.0;
+const LEGACY_BAZAAR_WIDTH: f32 = 800.0;
+const LEGACY_BAZAAR_HEIGHT: f32 = 800.0;
+const LEGACY_ROSTER_WIDTH: f32 = 640.0;
+const LEGACY_ROSTER_HEIGHT: f32 = 600.0;
+const LEGACY_ROSTER_BIFF_WIDTH: f32 = 99.0;
+const LEGACY_ROSTER_BIFF_HEIGHT: f32 = 105.0;
 
 fn main() {
     let run_config = ClientRunConfig::from_env().unwrap_or_else(|error| {
@@ -54,6 +75,7 @@ fn run_client(run_config: ClientRunConfig) {
     } else {
         ClientSettings::load_or_default()
     };
+    settings.content_mode = run_config.content_mode;
     if run_config.deterministic_capture {
         settings.sound_pack = SoundPackChoice::Muted;
         settings.settings_path = None;
@@ -70,7 +92,10 @@ fn run_client(run_config: ClientRunConfig) {
             settings.theme = job.theme;
         }
     }
-    let window = themes.get(settings.theme).layout.window;
+    let window = themes
+        .get(settings.theme)
+        .layout
+        .screen(ClientScreen::Startup);
     let mut local_game = LocalGame::new_human_vs_human();
     let mut recon_panel = ReconPanel::default();
     let mut bazaar_ui = BazaarUiState::default();
@@ -93,7 +118,7 @@ fn run_client(run_config: ClientRunConfig) {
     }
     let asset_file_path = settings.assets_dir.to_string_lossy().into_owned();
     let mut app = App::new();
-    app.insert_resource(ClearColor(themes.get(settings.theme).palette.background))
+    app.insert_resource(ClearColor(themes.get(settings.theme).screen.background))
         .insert_resource(local_game)
         .insert_resource(ClientTickClock::default())
         .insert_resource(InputRepeatState::default())
@@ -120,11 +145,15 @@ fn run_client(run_config: ClientRunConfig) {
                     ..default()
                 }),
         )
-        .add_systems(Startup, setup)
+        .add_systems(
+            Startup,
+            (log_content_mode, load_theme_atlases, setup).chain(),
+        )
         .add_systems(Update, apply_visual_capture_fixture.before(render_game))
         .add_systems(
             Update,
             (
+                update_window_layout.after(apply_visual_capture_fixture),
                 handle_keyboard_input,
                 handle_mouse_buttons,
                 drive_computer_opponent,
@@ -133,6 +162,8 @@ fn run_client(run_config: ClientRunConfig) {
                 collect_sound_events,
                 play_sound_events,
                 render_game,
+                update_theme_entities,
+                update_challenge_logo_texture.after(update_theme_entities),
                 update_screen_visibility,
                 update_menu_button_visuals,
             ),
@@ -164,7 +195,7 @@ enum ClientScreen {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum ThemeChoice {
-    OriginalInspired,
+    Original,
     HighContrast,
 }
 
@@ -173,6 +204,21 @@ enum ThemeChoice {
 enum SoundPackChoice {
     GeneratedDefault,
     Muted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentMode {
+    Normal,
+    Rated,
+}
+
+impl ContentMode {
+    const fn id(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Rated => "rated",
+        }
+    }
 }
 
 impl SoundPackChoice {
@@ -187,13 +233,13 @@ impl SoundPackChoice {
 impl ThemeChoice {
     const fn directory(self) -> &'static str {
         match self {
-            Self::OriginalInspired => "original-inspired",
+            Self::Original => "original",
             Self::HighContrast => "high-contrast",
         }
     }
 
     fn from_id(value: &str) -> Option<Self> {
-        [Self::OriginalInspired, Self::HighContrast]
+        [Self::Original, Self::HighContrast]
             .into_iter()
             .find(|choice| choice.directory() == value)
     }
@@ -203,6 +249,7 @@ impl ThemeChoice {
 struct ClientRunConfig {
     capture: Option<VisualCaptureSpec>,
     deterministic_capture: bool,
+    content_mode: ContentMode,
 }
 
 impl ClientRunConfig {
@@ -221,10 +268,12 @@ impl ClientRunConfig {
     }
 
     fn parse(args: Vec<OsString>, smoke_env: Option<OsString>) -> Result<Self, String> {
+        let (content_mode, args) = parse_content_mode_args(args);
         if args.is_empty() {
             return Ok(Self {
                 capture: smoke_env.map(|path| VisualCaptureSpec::Smoke { path: path.into() }),
                 deterministic_capture: false,
+                content_mode,
             });
         }
 
@@ -232,7 +281,7 @@ impl ClientRunConfig {
             .first()
             .is_some_and(|arg| arg == OsStr::new("headless"))
         {
-            return parse_headless_args(&args[1..]);
+            return parse_headless_args(&args[1..], content_mode);
         }
 
         if args.len() == 1 && is_help_arg(&args[0]) {
@@ -266,8 +315,22 @@ impl ClientRunConfig {
         Ok(Self {
             capture: smoke_path.map(|path| VisualCaptureSpec::Smoke { path }),
             deterministic_capture: false,
+            content_mode,
         })
     }
+}
+
+fn parse_content_mode_args(args: Vec<OsString>) -> (ContentMode, Vec<OsString>) {
+    let mut content_mode = ContentMode::Normal;
+    let mut remaining = Vec::with_capacity(args.len());
+    for arg in args {
+        if arg == OsStr::new("--rated") || arg == OsStr::new("-r") {
+            content_mode = ContentMode::Rated;
+        } else {
+            remaining.push(arg);
+        }
+    }
+    (content_mode, remaining)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,12 +343,13 @@ enum VisualFixture {
     Settings,
     GamePlaying,
     GameBazaar,
+    GameOver,
     GameRecon,
     BoardCells,
 }
 
 impl VisualFixture {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::Startup,
         Self::Challenge,
         Self::Sleep,
@@ -294,6 +358,7 @@ impl VisualFixture {
         Self::Settings,
         Self::GamePlaying,
         Self::GameBazaar,
+        Self::GameOver,
         Self::GameRecon,
         Self::BoardCells,
     ];
@@ -308,6 +373,7 @@ impl VisualFixture {
             Self::Settings => "settings",
             Self::GamePlaying => "game-playing",
             Self::GameBazaar => "game-bazaar",
+            Self::GameOver => "game-over",
             Self::GameRecon => "game-recon",
             Self::BoardCells => "board-cells",
         }
@@ -325,9 +391,11 @@ impl VisualFixture {
             Self::About => ClientScreen::About,
             Self::Roster => ClientScreen::Roster,
             Self::Settings => ClientScreen::Settings,
-            Self::GamePlaying | Self::GameBazaar | Self::GameRecon | Self::BoardCells => {
-                ClientScreen::Game
-            }
+            Self::GamePlaying
+            | Self::GameBazaar
+            | Self::GameOver
+            | Self::GameRecon
+            | Self::BoardCells => ClientScreen::Game,
         }
     }
 }
@@ -416,7 +484,7 @@ fn visual_capture_job(
     path: PathBuf,
     themes: &ThemePacks,
 ) -> VisualCaptureJob {
-    let window = themes.get(theme).layout.window;
+    let window = themes.get(theme).layout.fixture(fixture);
     VisualCaptureJob {
         fixture,
         theme,
@@ -426,7 +494,10 @@ fn visual_capture_job(
     }
 }
 
-fn parse_headless_args(args: &[OsString]) -> Result<ClientRunConfig, String> {
+fn parse_headless_args(
+    args: &[OsString],
+    content_mode: ContentMode,
+) -> Result<ClientRunConfig, String> {
     let Some(command) = args.first() else {
         return Err("headless requires a command: capture or capture-all".to_string());
     };
@@ -435,8 +506,8 @@ fn parse_headless_args(args: &[OsString]) -> Result<ClientRunConfig, String> {
     }
 
     match command.to_str() {
-        Some("capture") => parse_headless_capture_args(&args[1..]),
-        Some("capture-all") => parse_headless_capture_all_args(&args[1..]),
+        Some("capture") => parse_headless_capture_args(&args[1..], content_mode),
+        Some("capture-all") => parse_headless_capture_all_args(&args[1..], content_mode),
         Some(other) => Err(format!("unrecognized headless command: {other}")),
         None => Err(format!(
             "headless command is not valid UTF-8: {}",
@@ -445,9 +516,12 @@ fn parse_headless_args(args: &[OsString]) -> Result<ClientRunConfig, String> {
     }
 }
 
-fn parse_headless_capture_args(args: &[OsString]) -> Result<ClientRunConfig, String> {
+fn parse_headless_capture_args(
+    args: &[OsString],
+    content_mode: ContentMode,
+) -> Result<ClientRunConfig, String> {
     let mut fixture = None;
-    let mut theme = ThemeChoice::OriginalInspired;
+    let mut theme = ThemeChoice::Original;
     let mut output = None;
     let mut index = 0;
 
@@ -488,11 +562,15 @@ fn parse_headless_capture_args(args: &[OsString]) -> Result<ClientRunConfig, Str
             output: output.ok_or_else(|| "headless capture requires --output".to_string())?,
         }),
         deterministic_capture: true,
+        content_mode,
     })
 }
 
-fn parse_headless_capture_all_args(args: &[OsString]) -> Result<ClientRunConfig, String> {
-    let mut theme = ThemeChoice::OriginalInspired;
+fn parse_headless_capture_all_args(
+    args: &[OsString],
+    content_mode: ContentMode,
+) -> Result<ClientRunConfig, String> {
+    let mut theme = ThemeChoice::Original;
     let mut out_dir = None;
     let mut index = 0;
 
@@ -524,6 +602,7 @@ fn parse_headless_capture_all_args(args: &[OsString]) -> Result<ClientRunConfig,
                 .ok_or_else(|| "headless capture-all requires --out-dir".to_string())?,
         }),
         deterministic_capture: true,
+        content_mode,
     })
 }
 
@@ -537,9 +616,8 @@ fn parse_visual_fixture(value: &str) -> Result<VisualFixture, String> {
 }
 
 fn parse_theme_choice(value: &str) -> Result<ThemeChoice, String> {
-    ThemeChoice::from_id(value).ok_or_else(|| {
-        format!("unknown theme '{value}'; expected original-inspired or high-contrast")
-    })
+    ThemeChoice::from_id(value)
+        .ok_or_else(|| format!("unknown theme '{value}'; expected original or high-contrast"))
 }
 
 fn required_arg<'a>(args: &'a [OsString], index: usize, option: &str) -> Result<&'a str, String> {
@@ -587,7 +665,7 @@ fn visual_fixture_list() -> String {
 
 fn client_usage() -> String {
     format!(
-        "Usage:\n  client\n  client --smoke-screenshot <path>\n  client headless capture --fixture <fixture> --theme <theme> --output <path>\n  client headless capture-all --theme <theme> --out-dir <dir>\n\nFixtures: {}\nThemes: original-inspired, high-contrast",
+        "Usage:\n  client [--rated|-r]\n  client [--rated|-r] --smoke-screenshot <path>\n  client [--rated|-r] headless capture --fixture <fixture> --theme <theme> [--rated|-r] --output <path>\n  client [--rated|-r] headless capture-all --theme <theme> [--rated|-r] --out-dir <dir>\n\nFixtures: {}\nThemes: original, high-contrast",
         visual_fixture_list()
     )
 }
@@ -595,19 +673,32 @@ fn client_usage() -> String {
 #[derive(Resource, Debug, Clone)]
 struct SoundPacks {
     generated_default: LoadedSoundPack,
+    generated_rated: LoadedSoundPack,
 }
 
 impl SoundPacks {
     fn load(assets_dir: &std::path::Path) -> Self {
         Self {
             generated_default: LoadedSoundPack::load(assets_dir, SoundPackChoice::GeneratedDefault),
+            generated_rated: LoadedSoundPack::load_overlay(assets_dir, "generated-rated"),
         }
     }
 
-    fn sound_for(&self, choice: SoundPackChoice, event: SoundEvent) -> Option<&LoadedSoundEvent> {
-        match choice {
-            SoundPackChoice::GeneratedDefault => self.generated_default.event(event),
-            SoundPackChoice::Muted => None,
+    fn sound_for(
+        &self,
+        choice: SoundPackChoice,
+        content_mode: ContentMode,
+        event: SoundEvent,
+    ) -> Option<&LoadedSoundEvent> {
+        match (choice, content_mode) {
+            (SoundPackChoice::GeneratedDefault, ContentMode::Rated) => self
+                .generated_rated
+                .event(event)
+                .or_else(|| self.generated_default.event(event)),
+            (SoundPackChoice::GeneratedDefault, ContentMode::Normal) => {
+                self.generated_default.event(event)
+            }
+            (SoundPackChoice::Muted, _) => None,
         }
     }
 }
@@ -619,7 +710,19 @@ struct LoadedSoundPack {
 
 impl LoadedSoundPack {
     fn load(assets_dir: &std::path::Path, choice: SoundPackChoice) -> Self {
-        let sound_dir = assets_dir.join("sounds").join(choice.directory());
+        Self::load_from_dir(assets_dir, choice.directory(), true)
+    }
+
+    fn load_overlay(assets_dir: &std::path::Path, directory: &'static str) -> Self {
+        Self::load_from_dir(assets_dir, directory, false)
+    }
+
+    fn load_from_dir(
+        assets_dir: &std::path::Path,
+        directory: &'static str,
+        require_all_events: bool,
+    ) -> Self {
+        let sound_dir = assets_dir.join("sounds").join(directory);
         let manifest_path = sound_dir.join("sound-pack.toml");
         let contents = fs::read_to_string(&manifest_path).unwrap_or_else(|error| {
             panic!(
@@ -633,8 +736,8 @@ impl LoadedSoundPack {
                 manifest_path.display()
             )
         });
-        raw.validate(&sound_dir, &manifest_path);
-        let prefix = format!("sounds/{}/", choice.directory());
+        raw.validate(&sound_dir, &manifest_path, require_all_events);
+        let prefix = format!("sounds/{directory}/");
         Self {
             events: raw
                 .event
@@ -669,7 +772,12 @@ struct RawSoundPack {
 }
 
 impl RawSoundPack {
-    fn validate(&self, sound_dir: &std::path::Path, manifest_path: &std::path::Path) {
+    fn validate(
+        &self,
+        sound_dir: &std::path::Path,
+        manifest_path: &std::path::Path,
+        require_all_events: bool,
+    ) {
         if self.kind != "sound-pack" || self.format_version != 1 {
             panic!(
                 "BattleTris sound-pack manifest {} has unsupported kind/version: kind={} format_version={}",
@@ -678,13 +786,15 @@ impl RawSoundPack {
                 self.format_version
             );
         }
-        for expected in SoundEvent::ALL {
-            if !self.event.iter().any(|event| event.id == expected.id()) {
-                panic!(
-                    "BattleTris sound-pack manifest {} is missing event {}",
-                    manifest_path.display(),
-                    expected.id()
-                );
+        if require_all_events {
+            for expected in SoundEvent::ALL {
+                if !self.event.iter().any(|event| event.id == expected.id()) {
+                    panic!(
+                        "BattleTris sound-pack manifest {} is missing event {}",
+                        manifest_path.display(),
+                        expected.id()
+                    );
+                }
             }
         }
         for event in &self.event {
@@ -711,8 +821,33 @@ impl RawSoundPack {
                         path.display()
                     );
                 }
+                validate_wav_file(&path, manifest_path);
             }
         }
+    }
+}
+
+fn validate_wav_file(path: &std::path::Path, manifest_path: &std::path::Path) {
+    let bytes = fs::read(path).unwrap_or_else(|error| {
+        panic!(
+            "BattleTris sound-pack manifest {} could not read WAV {}: {error}",
+            manifest_path.display(),
+            path.display()
+        )
+    });
+    if bytes.len() < 44
+        || &bytes[0..4] != b"RIFF"
+        || &bytes[8..12] != b"WAVE"
+        || &bytes[12..16] != b"fmt "
+        || u16::from_le_bytes([bytes[20], bytes[21]]) != 1
+        || u16::from_le_bytes([bytes[34], bytes[35]]) != 16
+        || !bytes.windows(4).any(|chunk| chunk == b"data")
+    {
+        panic!(
+            "BattleTris sound-pack manifest {} references undecodable PCM WAV {}",
+            manifest_path.display(),
+            path.display()
+        );
     }
 }
 
@@ -725,21 +860,21 @@ struct RawSoundEvent {
 
 #[derive(Resource, Debug, Clone)]
 struct ThemePacks {
-    original_inspired: LoadedTheme,
+    original: LoadedTheme,
     high_contrast: LoadedTheme,
 }
 
 impl ThemePacks {
     fn load(assets_dir: &std::path::Path) -> Self {
         Self {
-            original_inspired: LoadedTheme::load(assets_dir, ThemeChoice::OriginalInspired),
+            original: LoadedTheme::load(assets_dir, ThemeChoice::Original),
             high_contrast: LoadedTheme::load(assets_dir, ThemeChoice::HighContrast),
         }
     }
 
     const fn get(&self, choice: ThemeChoice) -> &LoadedTheme {
         match choice {
-            ThemeChoice::OriginalInspired => &self.original_inspired,
+            ThemeChoice::Original => &self.original,
             ThemeChoice::HighContrast => &self.high_contrast,
         }
     }
@@ -748,10 +883,14 @@ impl ThemePacks {
 #[derive(Debug, Clone)]
 struct LoadedTheme {
     sprites: LoadedThemeSprites,
+    fonts: LoadedThemeFonts,
     cell: ThemeCell,
+    cell_atlas: ThemeCellAtlas,
     layout: ThemeLayout,
     palette: ThemePalette,
+    screen: ThemeScreenStyle,
     button: ThemeButtonStyle,
+    about: ThemeAboutStyle,
 }
 
 impl LoadedTheme {
@@ -773,16 +912,21 @@ impl LoadedTheme {
         raw.validate(&theme_dir, &manifest_path);
         Self {
             sprites: raw.sprites.loaded(choice),
+            fonts: raw.fonts.loaded(choice),
             cell: raw.cell,
+            cell_atlas: raw.sprites.cell_atlas,
             layout: raw.layout,
-            palette: raw.palette.into_palette(&manifest_path),
-            button: raw.button.into_style(&manifest_path),
+            palette: raw.semantic.palette(&manifest_path),
+            screen: raw.screen.into_style(&manifest_path),
+            button: raw.semantic.button(&manifest_path),
+            about: raw.about.into_style(&manifest_path),
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
 struct RawTheme {
+    id: String,
     name: String,
     kind: String,
     format_version: u32,
@@ -790,12 +934,21 @@ struct RawTheme {
     fonts: ThemeFonts,
     cell: ThemeCell,
     layout: ThemeLayout,
-    palette: RawThemePalette,
-    button: RawThemeButtonStyle,
+    semantic: RawThemeSemantic,
+    screen: RawThemeScreenStyle,
+    about: RawThemeAboutStyle,
+    description: String,
+    author: String,
+    license: String,
+    default_scale: f32,
+    pixel_filtering: String,
+    supports_high_contrast: bool,
+    provenance: ThemeProvenance,
 }
 
 impl RawTheme {
     fn validate(&self, theme_dir: &std::path::Path, manifest_path: &std::path::Path) {
+        let _accessibility_flag = self.supports_high_contrast;
         if self.kind != "theme" || self.format_version != 1 {
             panic!(
                 "BattleTris theme manifest {} has unsupported kind/version: kind={} format_version={}",
@@ -804,16 +957,33 @@ impl RawTheme {
                 self.format_version
             );
         }
-        if self.name.is_empty()
+        if self.id.trim().is_empty()
+            || self.name.trim().is_empty()
+            || self.description.trim().is_empty()
+            || self.author.trim().is_empty()
+            || self.license.trim().is_empty()
+            || self.default_scale <= 0.0
+            || !matches!(self.pixel_filtering.as_str(), "nearest" | "linear")
             || self.cell.size <= 0.0
             || self.cell.gap < 0.0
             || self.cell.shadow < 0.0
-            || self.layout.window.width <= 0.0
-            || self.layout.window.height <= 0.0
             || self.layout.board.spacing <= 0.0
+            || self.screen.title_font_size <= 0.0
+            || self.screen.body_font_size <= 0.0
+            || self.screen.button_font_size <= 0.0
+            || self.fonts.line_height <= 0.0
         {
             panic!(
-                "BattleTris theme manifest {} has invalid name or layout values",
+                "BattleTris theme manifest {} has invalid metadata or layout values",
+                manifest_path.display()
+            );
+        }
+        self.layout.validate(manifest_path);
+        self.sprites.cell_atlas.validate(manifest_path);
+        self.semantic.validate(manifest_path);
+        if self.provenance.notes.trim().is_empty() || self.provenance.sources.is_empty() {
+            panic!(
+                "BattleTris theme manifest {} requires provenance notes and at least one source",
                 manifest_path.display()
             );
         }
@@ -823,6 +993,7 @@ impl RawTheme {
             &self.sprites.bazaar,
             &self.sprites.biff,
             &self.sprites.gimp,
+            &self.sprites.crest,
         ] {
             let path = theme_dir.join(relative);
             if !path.is_file() {
@@ -833,17 +1004,45 @@ impl RawTheme {
                 );
             }
         }
-        if !self.fonts.default.is_empty() {
-            let path = theme_dir.join(&self.fonts.default);
-            if !path.is_file() {
-                panic!(
-                    "BattleTris theme manifest {} requires missing font {}",
-                    manifest_path.display(),
-                    path.display()
-                );
+        if let Some(rated) = &self.sprites.rated {
+            for relative in [&rated.atlas, &rated.gimp] {
+                let path = theme_dir.join(relative);
+                if !path.is_file() {
+                    panic!(
+                        "BattleTris theme manifest {} requires missing rated asset {}",
+                        manifest_path.display(),
+                        path.display()
+                    );
+                }
+            }
+        }
+        self.sprites
+            .cell_atlas
+            .validate_image(theme_dir, &self.sprites.atlas, manifest_path);
+        if let Some(rated) = &self.sprites.rated {
+            self.sprites
+                .cell_atlas
+                .validate_image(theme_dir, &rated.atlas, manifest_path);
+        }
+        for font in [&self.fonts.ui, &self.fonts.title, &self.fonts.mono] {
+            if !font.is_empty() {
+                let path = theme_dir.join(font);
+                if !path.is_file() {
+                    panic!(
+                        "BattleTris theme manifest {} requires missing font {}",
+                        manifest_path.display(),
+                        path.display()
+                    );
+                }
             }
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ThemeProvenance {
+    notes: String,
+    sources: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -853,29 +1052,120 @@ struct ThemeSprites {
     bazaar: String,
     biff: String,
     gimp: String,
+    crest: String,
+    rated: Option<ThemeRatedSprites>,
+    cell_atlas: ThemeCellAtlas,
 }
 
 impl ThemeSprites {
     fn loaded(&self, choice: ThemeChoice) -> LoadedThemeSprites {
         let prefix = format!("themes/{}/", choice.directory());
         LoadedThemeSprites {
+            atlas: format!("{prefix}{}", self.atlas),
             startup: format!("{prefix}{}", self.startup),
             bazaar: format!("{prefix}{}", self.bazaar),
             biff: format!("{prefix}{}", self.biff),
+            gimp: format!("{prefix}{}", self.gimp),
+            crest: format!("{prefix}{}", self.crest),
+            rated: self.rated.as_ref().map(|rated| LoadedThemeRatedSprites {
+                atlas: format!("{prefix}{}", rated.atlas),
+                gimp: format!("{prefix}{}", rated.gimp),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ThemeRatedSprites {
+    atlas: String,
+    gimp: String,
+}
+
+#[derive(Debug, Clone)]
+struct LoadedThemeSprites {
+    atlas: String,
+    startup: String,
+    bazaar: String,
+    biff: String,
+    gimp: String,
+    crest: String,
+    rated: Option<LoadedThemeRatedSprites>,
+}
+
+impl LoadedThemeSprites {
+    fn atlas_for(&self, content_mode: ContentMode) -> &str {
+        match (content_mode, &self.rated) {
+            (ContentMode::Rated, Some(rated)) => &rated.atlas,
+            _ => &self.atlas,
+        }
+    }
+
+    fn gimp_for(&self, content_mode: ContentMode) -> &str {
+        match (content_mode, &self.rated) {
+            (ContentMode::Rated, Some(rated)) => &rated.gimp,
+            _ => &self.gimp,
+        }
+    }
+
+    const fn supports_rated(&self) -> bool {
+        self.rated.is_some()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LoadedThemeRatedSprites {
+    atlas: String,
+    gimp: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ThemeFonts {
+    ui: String,
+    title: String,
+    mono: String,
+    line_height: f32,
+    tracking: f32,
+}
+
+impl ThemeFonts {
+    fn loaded(&self, choice: ThemeChoice) -> LoadedThemeFonts {
+        LoadedThemeFonts {
+            ui: theme_asset_path(choice, &self.ui),
+            title: theme_asset_path(choice, &self.title),
+            mono: theme_asset_path(choice, &self.mono),
+            line_height: self.line_height,
+            tracking: self.tracking,
         }
     }
 }
 
 #[derive(Debug, Clone)]
-struct LoadedThemeSprites {
-    startup: String,
-    bazaar: String,
-    biff: String,
+struct LoadedThemeFonts {
+    ui: Option<String>,
+    title: Option<String>,
+    mono: Option<String>,
+    line_height: f32,
+    tracking: f32,
 }
 
-#[derive(Debug, Deserialize)]
-struct ThemeFonts {
-    default: String,
+impl LoadedThemeFonts {
+    fn path_for(&self, role: ThemedTextFontRole) -> Option<&str> {
+        match role {
+            ThemedTextFontRole::Title => self.title.as_deref().or(self.ui.as_deref()),
+            ThemedTextFontRole::Body | ThemedTextFontRole::Button => {
+                self.ui.as_deref().or(self.mono.as_deref())
+            }
+            ThemedTextFontRole::Mono => self.mono.as_deref().or(self.ui.as_deref()),
+        }
+    }
+}
+
+fn theme_asset_path(choice: ThemeChoice, relative: &str) -> Option<String> {
+    if relative.is_empty() {
+        None
+    } else {
+        Some(format!("themes/{}/{}", choice.directory(), relative))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -886,9 +1176,191 @@ struct ThemeCell {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
+struct ThemeCellAtlas {
+    tile_width: u32,
+    tile_height: u32,
+    columns: u32,
+    rows: u32,
+    padding_x: u32,
+    padding_y: u32,
+    offset_x: u32,
+    offset_y: u32,
+    cells: ThemeCellAtlasCells,
+}
+
+impl ThemeCellAtlas {
+    fn texture_count(self) -> usize {
+        self.columns as usize * self.rows as usize
+    }
+
+    fn tile_size(self) -> UVec2 {
+        UVec2::new(self.tile_width, self.tile_height)
+    }
+
+    fn padding(self) -> Option<UVec2> {
+        Some(UVec2::new(self.padding_x, self.padding_y))
+    }
+
+    fn offset(self) -> Option<UVec2> {
+        Some(UVec2::new(self.offset_x, self.offset_y))
+    }
+
+    fn validate(self, manifest_path: &std::path::Path) {
+        if self.tile_width == 0 || self.tile_height == 0 || self.columns == 0 || self.rows == 0 {
+            panic!(
+                "BattleTris theme manifest {} has invalid cell atlas dimensions",
+                manifest_path.display()
+            );
+        }
+        if self.cells.visible_colors.len() != 19 || self.cells.die.len() != 6 {
+            panic!(
+                "BattleTris theme manifest {} must map 19 visible colors and 6 die faces",
+                manifest_path.display()
+            );
+        }
+        let texture_count = self.texture_count();
+        let mut indices = Vec::new();
+        indices.push(self.cells.empty);
+        indices.extend(self.cells.visible_colors);
+        indices.push(self.cells.structure);
+        indices.push(self.cells.happy);
+        indices.push(self.cells.frown);
+        indices.push(self.cells.gimp);
+        indices.extend(self.cells.die);
+        indices.push(self.cells.invisible);
+        indices.push(self.cells.hidden);
+        let unique = indices.iter().copied().collect::<HashSet<_>>();
+        if unique.len() != indices.len() || indices.iter().any(|index| *index >= texture_count) {
+            panic!(
+                "BattleTris theme manifest {} has duplicate or out-of-range cell atlas indices",
+                manifest_path.display()
+            );
+        }
+    }
+
+    fn validate_image(
+        self,
+        theme_dir: &std::path::Path,
+        atlas: &str,
+        manifest_path: &std::path::Path,
+    ) {
+        let path = theme_dir.join(atlas);
+        let (width, height) = image::image_dimensions(&path).unwrap_or_else(|error| {
+            panic!(
+                "BattleTris theme manifest {} requires decodable atlas {}: {error}",
+                manifest_path.display(),
+                path.display()
+            )
+        });
+        let expected_width = self.offset_x
+            + self.columns * self.tile_width
+            + self.columns.saturating_sub(1) * self.padding_x;
+        let expected_height = self.offset_y
+            + self.rows * self.tile_height
+            + self.rows.saturating_sub(1) * self.padding_y;
+        if width < expected_width || height < expected_height {
+            panic!(
+                "BattleTris theme manifest {} atlas {} is {}x{}, expected at least {}x{}",
+                manifest_path.display(),
+                path.display(),
+                width,
+                height,
+                expected_width,
+                expected_height
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct ThemeCellAtlasCells {
+    empty: usize,
+    visible_colors: [usize; 19],
+    structure: usize,
+    happy: usize,
+    frown: usize,
+    gimp: usize,
+    die: [usize; 6],
+    invisible: usize,
+    hidden: usize,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
 struct ThemeLayout {
-    window: ThemeWindowLayout,
     board: ThemeBoardLayout,
+    screens: ThemeScreenLayouts,
+    rects: ThemeLayoutRects,
+}
+
+impl ThemeLayout {
+    const fn screen(&self, screen: ClientScreen) -> ThemeWindowLayout {
+        match screen {
+            ClientScreen::Startup => self.screens.startup,
+            ClientScreen::Game => self.screens.game,
+            ClientScreen::Challenge => self.screens.challenge,
+            ClientScreen::Sleep => self.screens.sleep,
+            ClientScreen::About => self.screens.about,
+            ClientScreen::Roster => self.screens.roster,
+            ClientScreen::Settings => self.screens.settings,
+        }
+    }
+
+    const fn fixture(&self, fixture: VisualFixture) -> ThemeWindowLayout {
+        match fixture {
+            VisualFixture::Startup => self.screens.startup,
+            VisualFixture::Challenge => self.screens.challenge,
+            VisualFixture::Sleep => self.screens.sleep,
+            VisualFixture::About => self.screens.about,
+            VisualFixture::Roster => self.screens.roster,
+            VisualFixture::Settings => self.screens.settings,
+            VisualFixture::GamePlaying | VisualFixture::GameOver | VisualFixture::BoardCells => {
+                self.screens.game
+            }
+            VisualFixture::GameBazaar => self.screens.bazaar,
+            VisualFixture::GameRecon => self.screens.game_recon,
+        }
+    }
+
+    fn validate(&self, manifest_path: &std::path::Path) {
+        for (name, window) in self.screens.named() {
+            if window.width <= 0.0 || window.height <= 0.0 {
+                panic!(
+                    "BattleTris theme manifest {} has invalid {name} screen size",
+                    manifest_path.display()
+                );
+            }
+        }
+        self.rects.validate(manifest_path);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct ThemeScreenLayouts {
+    startup: ThemeWindowLayout,
+    challenge: ThemeWindowLayout,
+    sleep: ThemeWindowLayout,
+    about: ThemeWindowLayout,
+    roster: ThemeWindowLayout,
+    settings: ThemeWindowLayout,
+    game: ThemeWindowLayout,
+    game_recon: ThemeWindowLayout,
+    bazaar: ThemeWindowLayout,
+}
+
+impl ThemeScreenLayouts {
+    const fn named(self) -> [(&'static str, ThemeWindowLayout); 9] {
+        [
+            ("startup", self.startup),
+            ("challenge", self.challenge),
+            ("sleep", self.sleep),
+            ("about", self.about),
+            ("roster", self.roster),
+            ("settings", self.settings),
+            ("game", self.game),
+            ("game_recon", self.game_recon),
+            ("bazaar", self.bazaar),
+        ]
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -905,9 +1377,94 @@ struct ThemeBoardLayout {
     spacing: f32,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct ThemeLayoutRects {
+    startup_challenge: ThemeRect,
+    startup_sleep: ThemeRect,
+    startup_about: ThemeRect,
+    startup_roster: ThemeRect,
+    startup_quit: ThemeRect,
+    startup_local_game: ThemeRect,
+    startup_play_ernie: ThemeRect,
+    startup_theme: ThemeRect,
+    challenge_level_down: ThemeRect,
+    challenge_level_up: ThemeRect,
+    challenge_play_ernie: ThemeRect,
+    challenge_back: ThemeRect,
+    sleep_wake: ThemeRect,
+    about_ok: ThemeRect,
+    roster_back: ThemeRect,
+    settings_back: ThemeRect,
+    bazaar_catalog: ThemeRect,
+    bazaar_arsenal: ThemeRect,
+    bazaar_add: ThemeRect,
+    bazaar_remove: ThemeRect,
+    bazaar_done: ThemeRect,
+}
+
+impl ThemeLayoutRects {
+    fn validate(self, manifest_path: &std::path::Path) {
+        for (name, rect) in self.named() {
+            if rect.width <= 0.0 || rect.height <= 0.0 {
+                panic!(
+                    "BattleTris theme manifest {} has invalid rect {name}",
+                    manifest_path.display()
+                );
+            }
+        }
+    }
+
+    const fn named(self) -> [(&'static str, ThemeRect); 21] {
+        [
+            ("startup_challenge", self.startup_challenge),
+            ("startup_sleep", self.startup_sleep),
+            ("startup_about", self.startup_about),
+            ("startup_roster", self.startup_roster),
+            ("startup_quit", self.startup_quit),
+            ("startup_local_game", self.startup_local_game),
+            ("startup_play_ernie", self.startup_play_ernie),
+            ("startup_theme", self.startup_theme),
+            ("challenge_level_down", self.challenge_level_down),
+            ("challenge_level_up", self.challenge_level_up),
+            ("challenge_play_ernie", self.challenge_play_ernie),
+            ("challenge_back", self.challenge_back),
+            ("sleep_wake", self.sleep_wake),
+            ("about_ok", self.about_ok),
+            ("roster_back", self.roster_back),
+            ("settings_back", self.settings_back),
+            ("bazaar_catalog", self.bazaar_catalog),
+            ("bazaar_arsenal", self.bazaar_arsenal),
+            ("bazaar_add", self.bazaar_add),
+            ("bazaar_remove", self.bazaar_remove),
+            ("bazaar_done", self.bazaar_done),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct ThemeRect {
+    center_x: f32,
+    center_y: f32,
+    width: f32,
+    height: f32,
+}
+
+impl ThemeRect {
+    fn center(self) -> Vec2 {
+        Vec2::new(self.center_x, self.center_y)
+    }
+
+    fn size(self) -> Vec2 {
+        Vec2::new(self.width, self.height)
+    }
+
+    fn rect(self) -> Rect {
+        Rect::from_center_size(self.center(), self.size())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ThemePalette {
-    background: Color,
     board_background: Color,
     empty: Color,
     structure: Color,
@@ -917,7 +1474,6 @@ struct ThemePalette {
     die: Color,
     invisible: Color,
     hidden: Color,
-    text_primary: Color,
     text_secondary: Color,
     text_accent: Color,
     visible_colors: Vec<Color>,
@@ -931,10 +1487,141 @@ struct ThemeButtonStyle {
     text: Color,
 }
 
+#[derive(Debug, Clone)]
+struct ThemeScreenStyle {
+    background: Color,
+    title_text: Color,
+    body_text: Color,
+    title_font_size: f32,
+    body_font_size: f32,
+    button_font_size: f32,
+}
+
+#[derive(Debug, Clone)]
+struct ThemeAboutStyle {
+    background: Color,
+    title_text: Color,
+    name_text: Color,
+    credit_text: Color,
+    button_face: Color,
+    button_highlight: Color,
+    button_shadow: Color,
+    button_text: Color,
+}
+
 #[derive(Debug, Deserialize)]
-struct RawThemePalette {
+struct RawThemeScreenStyle {
     background: String,
-    board_background: String,
+    title_text: String,
+    body_text: String,
+    title_font_size: f32,
+    body_font_size: f32,
+    button_font_size: f32,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawThemeAboutStyle {
+    background: String,
+    title_text: String,
+    name_text: String,
+    credit_text: String,
+    button_face: String,
+    button_highlight: String,
+    button_shadow: String,
+    button_text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawThemeSemantic {
+    text: RawThemeSemanticText,
+    board: RawThemeSemanticBoard,
+    button: RawThemeSemanticButton,
+    bazaar: RawThemeSemanticBazaar,
+    weapon: RawThemeSemanticWeapon,
+}
+
+impl RawThemeSemantic {
+    fn validate(&self, manifest_path: &std::path::Path) {
+        for color in [
+            &self.text.primary,
+            &self.text.secondary,
+            &self.text.accent,
+            &self.text.warning,
+            &self.board.background,
+            &self.board.empty,
+            &self.board.structure,
+            &self.board.happy,
+            &self.board.frown,
+            &self.board.gimp,
+            &self.board.die,
+            &self.board.invisible,
+            &self.board.hidden,
+            &self.button.normal,
+            &self.button.hover,
+            &self.button.pressed,
+            &self.button.text,
+            &self.bazaar.affordable,
+            &self.bazaar.unaffordable,
+            &self.bazaar.selected,
+            &self.weapon.active,
+            &self.weapon.expired,
+        ] {
+            let _ = parse_hex_color(color, manifest_path);
+        }
+        if self.board.visible_colors.len() != 19 {
+            panic!(
+                "BattleTris theme manifest {} must define 19 semantic visible cell colors",
+                manifest_path.display()
+            );
+        }
+        for color in &self.board.visible_colors {
+            let _ = parse_hex_color(color, manifest_path);
+        }
+    }
+
+    fn palette(&self, manifest_path: &std::path::Path) -> ThemePalette {
+        ThemePalette {
+            board_background: parse_hex_color(&self.board.background, manifest_path),
+            empty: parse_hex_color(&self.board.empty, manifest_path),
+            structure: parse_hex_color(&self.board.structure, manifest_path),
+            happy: parse_hex_color(&self.board.happy, manifest_path),
+            frown: parse_hex_color(&self.board.frown, manifest_path),
+            gimp: parse_hex_color(&self.board.gimp, manifest_path),
+            die: parse_hex_color(&self.board.die, manifest_path),
+            invisible: parse_hex_color(&self.board.invisible, manifest_path),
+            hidden: parse_hex_color(&self.board.hidden, manifest_path),
+            text_secondary: parse_hex_color(&self.text.secondary, manifest_path),
+            text_accent: parse_hex_color(&self.text.accent, manifest_path),
+            visible_colors: self
+                .board
+                .visible_colors
+                .iter()
+                .map(|color| parse_hex_color(color, manifest_path))
+                .collect(),
+        }
+    }
+
+    fn button(&self, manifest_path: &std::path::Path) -> ThemeButtonStyle {
+        ThemeButtonStyle {
+            normal: parse_hex_color(&self.button.normal, manifest_path),
+            hover: parse_hex_color(&self.button.hover, manifest_path),
+            pressed: parse_hex_color(&self.button.pressed, manifest_path),
+            text: parse_hex_color(&self.button.text, manifest_path),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawThemeSemanticText {
+    primary: String,
+    secondary: String,
+    accent: String,
+    warning: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawThemeSemanticBoard {
+    background: String,
     empty: String,
     structure: String,
     happy: String,
@@ -943,52 +1630,54 @@ struct RawThemePalette {
     die: String,
     invisible: String,
     hidden: String,
-    text_primary: String,
-    text_secondary: String,
-    text_accent: String,
     visible_colors: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct RawThemeButtonStyle {
+struct RawThemeSemanticButton {
     normal: String,
     hover: String,
     pressed: String,
     text: String,
 }
 
-impl RawThemeButtonStyle {
-    fn into_style(self, manifest_path: &std::path::Path) -> ThemeButtonStyle {
-        ThemeButtonStyle {
-            normal: parse_hex_color(&self.normal, manifest_path),
-            hover: parse_hex_color(&self.hover, manifest_path),
-            pressed: parse_hex_color(&self.pressed, manifest_path),
-            text: parse_hex_color(&self.text, manifest_path),
+#[derive(Debug, Deserialize)]
+struct RawThemeSemanticBazaar {
+    affordable: String,
+    unaffordable: String,
+    selected: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawThemeSemanticWeapon {
+    active: String,
+    expired: String,
+}
+
+impl RawThemeScreenStyle {
+    fn into_style(self, manifest_path: &std::path::Path) -> ThemeScreenStyle {
+        ThemeScreenStyle {
+            background: parse_hex_color(&self.background, manifest_path),
+            title_text: parse_hex_color(&self.title_text, manifest_path),
+            body_text: parse_hex_color(&self.body_text, manifest_path),
+            title_font_size: self.title_font_size,
+            body_font_size: self.body_font_size,
+            button_font_size: self.button_font_size,
         }
     }
 }
 
-impl RawThemePalette {
-    fn into_palette(self, manifest_path: &std::path::Path) -> ThemePalette {
-        ThemePalette {
+impl RawThemeAboutStyle {
+    fn into_style(self, manifest_path: &std::path::Path) -> ThemeAboutStyle {
+        ThemeAboutStyle {
             background: parse_hex_color(&self.background, manifest_path),
-            board_background: parse_hex_color(&self.board_background, manifest_path),
-            empty: parse_hex_color(&self.empty, manifest_path),
-            structure: parse_hex_color(&self.structure, manifest_path),
-            happy: parse_hex_color(&self.happy, manifest_path),
-            frown: parse_hex_color(&self.frown, manifest_path),
-            gimp: parse_hex_color(&self.gimp, manifest_path),
-            die: parse_hex_color(&self.die, manifest_path),
-            invisible: parse_hex_color(&self.invisible, manifest_path),
-            hidden: parse_hex_color(&self.hidden, manifest_path),
-            text_primary: parse_hex_color(&self.text_primary, manifest_path),
-            text_secondary: parse_hex_color(&self.text_secondary, manifest_path),
-            text_accent: parse_hex_color(&self.text_accent, manifest_path),
-            visible_colors: self
-                .visible_colors
-                .iter()
-                .map(|color| parse_hex_color(color, manifest_path))
-                .collect(),
+            title_text: parse_hex_color(&self.title_text, manifest_path),
+            name_text: parse_hex_color(&self.name_text, manifest_path),
+            credit_text: parse_hex_color(&self.credit_text, manifest_path),
+            button_face: parse_hex_color(&self.button_face, manifest_path),
+            button_highlight: parse_hex_color(&self.button_highlight, manifest_path),
+            button_shadow: parse_hex_color(&self.button_shadow, manifest_path),
+            button_text: parse_hex_color(&self.button_text, manifest_path),
         }
     }
 }
@@ -1025,6 +1714,7 @@ enum ControlScheme {
 #[derive(Resource, Debug, Clone)]
 struct ClientSettings {
     screen: ClientScreen,
+    content_mode: ContentMode,
     theme: ThemeChoice,
     sound_pack: SoundPackChoice,
     controls: ControlScheme,
@@ -1042,7 +1732,8 @@ impl Default for ClientSettings {
     fn default() -> Self {
         Self {
             screen: ClientScreen::Startup,
-            theme: ThemeChoice::OriginalInspired,
+            content_mode: ContentMode::Normal,
+            theme: ThemeChoice::Original,
             sound_pack: SoundPackChoice::GeneratedDefault,
             controls: ControlScheme::ModernSplit,
             pixel_scale: 1.0,
@@ -1154,7 +1845,7 @@ struct PersistedClientSettings {
 impl Default for PersistedClientSettings {
     fn default() -> Self {
         Self {
-            theme: ThemeChoice::OriginalInspired,
+            theme: ThemeChoice::Original,
             sound_pack: SoundPackChoice::GeneratedDefault,
             controls: ControlScheme::ModernSplit,
             pixel_scale: 1.0,
@@ -1165,6 +1856,15 @@ impl Default for PersistedClientSettings {
             lobby_addr: "127.0.0.1:4404".to_string(),
         }
     }
+}
+
+fn log_content_mode(settings: Res<ClientSettings>, themes: Res<ThemePacks>) {
+    let theme = themes.get(settings.theme);
+    info!(
+        "BattleTris content mode: {}; Gimp sprite: {}",
+        settings.content_mode.id(),
+        theme.sprites.gimp_for(settings.content_mode)
+    );
 }
 
 #[derive(Resource)]
@@ -1183,6 +1883,7 @@ struct RosterRecords {
 
 #[derive(Debug, Clone)]
 struct RosterRow {
+    player_key: String,
     rank: u64,
     display_name: String,
     wins: u64,
@@ -1191,6 +1892,9 @@ struct RosterRow {
     high_lines: u64,
     high_funds: u64,
     streak: String,
+    fastest_kill_secs: Option<u64>,
+    quickest_death_secs: Option<u64>,
+    longest_game_secs: Option<u64>,
 }
 
 impl RosterRecords {
@@ -1222,6 +1926,7 @@ impl RosterRecords {
                 rows: rows
                     .into_iter()
                     .map(|profile| RosterRow {
+                        player_key: profile.player_id.as_str().to_string(),
                         rank: profile.rank,
                         display_name: profile.display_name,
                         wins: profile.wins,
@@ -1230,6 +1935,9 @@ impl RosterRecords {
                         high_lines: profile.high_lines,
                         high_funds: profile.high_funds,
                         streak: streak_label(profile.streak_kind, profile.streak_count),
+                        fastest_kill_secs: profile.fastest_kill_secs,
+                        quickest_death_secs: profile.quickest_death_secs,
+                        longest_game_secs: profile.longest_game_secs,
                     })
                     .collect(),
                 error: None,
@@ -1263,6 +1971,9 @@ fn apply_visual_fixture_state(
     if fixture == VisualFixture::Settings {
         settings.controls = ControlScheme::LegacyInspired;
     }
+    if fixture == VisualFixture::Challenge {
+        settings.ernie_level = 0;
+    }
 
     *local = visual_local_game(fixture, settings.ernie_level);
     *recon = visual_recon_panel(fixture, local);
@@ -1291,6 +2002,7 @@ fn visual_local_game(fixture: VisualFixture, ernie_level: usize) -> LocalGame {
             "Visual fixture: board cell catalog",
         ),
         VisualFixture::GameBazaar => visual_bazaar_game(),
+        VisualFixture::GameOver => visual_game_over_game(),
         _ => LocalGame::new_human_vs_human(),
     }
 }
@@ -1323,7 +2035,7 @@ fn visual_computer_game(
 }
 
 fn visual_bazaar_game() -> LocalGame {
-    let mut game = TwoPlayerGame::bazaar_fixture(
+    let game = TwoPlayerGame::bazaar_fixture(
         GameSeed::from_u64(111),
         visual_playing_board(),
         650,
@@ -1331,14 +2043,31 @@ fn visual_bazaar_game() -> LocalGame {
         visual_opponent_board(),
         425,
     );
-    let _ = game.bazaar_buy(PlayerId::One, WeaponToken::Gimp);
-    let _ = game.bazaar_buy(PlayerId::One, WeaponToken::FlipOut);
-    let _ = game.bazaar_buy(PlayerId::Two, WeaponToken::RiseUp);
     LocalGame {
         game,
         computer: None,
         local_player: PlayerId::One,
         status_message: Some("Visual fixture: bazaar shopping".to_string()),
+    }
+}
+
+fn visual_game_over_game() -> LocalGame {
+    let mut local_board = Board::empty();
+    for y in 0..BOARD_HEIGHT {
+        for x in 0..BOARD_WIDTH {
+            local_board.set(Coord { x, y }, Some(Cell::visible()));
+        }
+    }
+    LocalGame {
+        game: TwoPlayerGame::with_boards(
+            GameSeed::from_u64(121),
+            local_board,
+            GameSeed::from_u64(222),
+            visual_opponent_board(),
+        ),
+        computer: None,
+        local_player: PlayerId::One,
+        status_message: None,
     }
 }
 
@@ -1358,8 +2087,20 @@ fn visual_recon_panel(fixture: VisualFixture, local: &LocalGame) -> ReconPanel {
 fn visual_bazaar_ui(fixture: VisualFixture) -> BazaarUiState {
     if fixture == VisualFixture::GameBazaar {
         BazaarUiState {
-            selected: WeaponToken::Gimp,
-            last_message: "Visual fixture has staged Gimp and Flip out for Player 1.".to_string(),
+            selected: WeaponToken::FlipOut,
+            last_message: "Legacy visual fixture: bazaar shopping.".to_string(),
+            visual_arsenal: Some([
+                Some(WeaponToken::Gimp),
+                Some(WeaponToken::FlipOut),
+                Some(WeaponToken::RiseUp),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ]),
         }
     } else {
         BazaarUiState::default()
@@ -1370,6 +2111,7 @@ fn visual_roster_records() -> RosterRecords {
     RosterRecords {
         rows: vec![
             RosterRow {
+                player_key: "ada".to_string(),
                 rank: 1,
                 display_name: "Ada".to_string(),
                 wins: 12,
@@ -1377,9 +2119,13 @@ fn visual_roster_records() -> RosterRecords {
                 high_score: 48_250,
                 high_lines: 82,
                 high_funds: 1_450,
-                streak: "W5".to_string(),
+                streak: "5 wins".to_string(),
+                fastest_kill_secs: None,
+                quickest_death_secs: None,
+                longest_game_secs: None,
             },
             RosterRow {
+                player_key: "grace".to_string(),
                 rank: 2,
                 display_name: "Grace".to_string(),
                 wins: 9,
@@ -1387,9 +2133,13 @@ fn visual_roster_records() -> RosterRecords {
                 high_score: 37_600,
                 high_lines: 69,
                 high_funds: 1_100,
-                streak: "W2".to_string(),
+                streak: "2 wins".to_string(),
+                fastest_kill_secs: None,
+                quickest_death_secs: None,
+                longest_game_secs: None,
             },
             RosterRow {
+                player_key: "katherine".to_string(),
                 rank: 3,
                 display_name: "Katherine".to_string(),
                 wins: 7,
@@ -1397,7 +2147,80 @@ fn visual_roster_records() -> RosterRecords {
                 high_score: 31_900,
                 high_lines: 58,
                 high_funds: 980,
-                streak: "L1".to_string(),
+                streak: "1 loss".to_string(),
+                fastest_kill_secs: None,
+                quickest_death_secs: None,
+                longest_game_secs: None,
+            },
+            RosterRow {
+                player_key: "margaret".to_string(),
+                rank: 4,
+                display_name: "Margaret".to_string(),
+                wins: 6,
+                losses: 6,
+                high_score: 28_400,
+                high_lines: 51,
+                high_funds: 820,
+                streak: "1 win".to_string(),
+                fastest_kill_secs: None,
+                quickest_death_secs: None,
+                longest_game_secs: None,
+            },
+            RosterRow {
+                player_key: "radia".to_string(),
+                rank: 5,
+                display_name: "Radia".to_string(),
+                wins: 5,
+                losses: 7,
+                high_score: 22_750,
+                high_lines: 44,
+                high_funds: 700,
+                streak: "2 losses".to_string(),
+                fastest_kill_secs: None,
+                quickest_death_secs: None,
+                longest_game_secs: None,
+            },
+            RosterRow {
+                player_key: "evelyn".to_string(),
+                rank: 6,
+                display_name: "Evelyn".to_string(),
+                wins: 4,
+                losses: 8,
+                high_score: 19_600,
+                high_lines: 39,
+                high_funds: 640,
+                streak: "1 win".to_string(),
+                fastest_kill_secs: None,
+                quickest_death_secs: None,
+                longest_game_secs: None,
+            },
+            RosterRow {
+                player_key: "hedy".to_string(),
+                rank: 7,
+                display_name: "Hedy".to_string(),
+                wins: 3,
+                losses: 9,
+                high_score: 16_300,
+                high_lines: 33,
+                high_funds: 500,
+                streak: "3 losses".to_string(),
+                fastest_kill_secs: None,
+                quickest_death_secs: None,
+                longest_game_secs: None,
+            },
+            RosterRow {
+                player_key: "joan".to_string(),
+                rank: 8,
+                display_name: "Joan".to_string(),
+                wins: 2,
+                losses: 10,
+                high_score: 11_950,
+                high_lines: 26,
+                high_funds: 410,
+                streak: "1 loss".to_string(),
+                fastest_kill_secs: None,
+                quickest_death_secs: None,
+                longest_game_secs: None,
             },
         ],
         error: None,
@@ -1467,6 +2290,17 @@ fn visual_opponent_board() -> Board {
 
 fn visual_board_cells_board() -> Board {
     let mut board = Board::empty();
+    const CATALOG_START_Y: usize = 5;
+
+    for y in CATALOG_START_Y..BOARD_HEIGHT {
+        for x in 0..BOARD_WIDTH {
+            board.set(
+                Coord::new(x, y).expect("fixture coordinate in bounds"),
+                Some(visible_cell(((x + y) % 19 + 1) as u8)),
+            );
+        }
+    }
+
     let samples = [
         visible_cell(1),
         visible_cell(2),
@@ -1494,20 +2328,10 @@ fn visual_board_cells_board() -> Board {
     ];
     for (index, cell) in samples.into_iter().enumerate() {
         board.set(
-            Coord::new(index % BOARD_WIDTH, 5 + index / BOARD_WIDTH)
+            Coord::new(index % BOARD_WIDTH, CATALOG_START_Y + index / BOARD_WIDTH)
                 .expect("fixture coordinate in bounds"),
             Some(cell),
         );
-    }
-    for y in BOARD_HEIGHT - 5..BOARD_HEIGHT {
-        for x in 0..BOARD_WIDTH {
-            if !(x == 4 && y == BOARD_HEIGHT - 1) {
-                board.set(
-                    Coord::new(x, y).expect("fixture coordinate in bounds"),
-                    Some(visible_cell(((x + y) % 9 + 1) as u8)),
-                );
-            }
-        }
     }
     board
 }
@@ -1617,6 +2441,7 @@ struct ReconPanel {
 struct BazaarUiState {
     selected: WeaponToken,
     last_message: String,
+    visual_arsenal: Option<[Option<WeaponToken>; 10]>,
 }
 
 impl Default for BazaarUiState {
@@ -1625,6 +2450,7 @@ impl Default for BazaarUiState {
             selected: WeaponToken::Gimp,
             last_message: "Select a weapon, then Add. Click staged arsenal slots to remove."
                 .to_string(),
+            visual_arsenal: None,
         }
     }
 }
@@ -1672,18 +2498,36 @@ enum SoundEvent {
     BazaarEntered,
     Purchase,
     WeaponLaunch,
+    WeaponLaunchGimp,
+    ChallengeIncoming,
+    ChallengeRejected,
+    BazaarWait,
+    OpponentWait,
+    GameLost,
+    GameWon,
+    GameDead,
+    AboutEasterEgg,
     Warning,
     GameOver,
 }
 
 impl SoundEvent {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 17] = [
         Self::MenuAction,
         Self::PieceLocked,
         Self::LineClear,
         Self::BazaarEntered,
         Self::Purchase,
         Self::WeaponLaunch,
+        Self::WeaponLaunchGimp,
+        Self::ChallengeIncoming,
+        Self::ChallengeRejected,
+        Self::BazaarWait,
+        Self::OpponentWait,
+        Self::GameLost,
+        Self::GameWon,
+        Self::GameDead,
+        Self::AboutEasterEgg,
         Self::Warning,
         Self::GameOver,
     ];
@@ -1696,6 +2540,15 @@ impl SoundEvent {
             Self::BazaarEntered => "bazaar_entered",
             Self::Purchase => "purchase",
             Self::WeaponLaunch => "weapon_launch",
+            Self::WeaponLaunchGimp => "weapon_launch_gimp",
+            Self::ChallengeIncoming => "challenge_incoming",
+            Self::ChallengeRejected => "challenge_rejected",
+            Self::BazaarWait => "bazaar_wait",
+            Self::OpponentWait => "opponent_wait",
+            Self::GameLost => "game_lost",
+            Self::GameWon => "game_won",
+            Self::GameDead => "game_dead",
+            Self::AboutEasterEgg => "about_easter_egg",
             Self::Warning => "warning",
             Self::GameOver => "game_over",
         }
@@ -1713,6 +2566,50 @@ struct BoardCell {
     y: usize,
 }
 
+#[derive(Resource, Debug, Clone)]
+struct ThemeAtlasHandles {
+    original: ThemeAtlasHandle,
+    high_contrast: ThemeAtlasHandle,
+}
+
+impl ThemeAtlasHandles {
+    fn get(
+        &self,
+        choice: ThemeChoice,
+        content_mode: ContentMode,
+        themes: &ThemePacks,
+    ) -> &ThemeAtlasImageHandle {
+        let theme = themes.get(choice);
+        let handles = match choice {
+            ThemeChoice::Original => &self.original,
+            ThemeChoice::HighContrast => &self.high_contrast,
+        };
+        if content_mode == ContentMode::Rated {
+            if let Some(rated) = &handles.rated {
+                return rated;
+            }
+            warn!(
+                "BattleTris rated content mode requested, but theme {:?} has no rated assets; using normal sprites",
+                choice
+            );
+            debug_assert!(!theme.sprites.supports_rated());
+        }
+        &handles.normal
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ThemeAtlasHandle {
+    normal: ThemeAtlasImageHandle,
+    rated: Option<ThemeAtlasImageHandle>,
+}
+
+#[derive(Debug, Clone)]
+struct ThemeAtlasImageHandle {
+    image: Handle<Image>,
+    layout: Handle<TextureAtlasLayout>,
+}
+
 #[derive(Component)]
 struct HudText {
     player: PlayerId,
@@ -1720,6 +2617,21 @@ struct HudText {
 
 #[derive(Component)]
 struct PhaseText;
+
+#[derive(Component)]
+struct PlayingGameEntity;
+
+#[derive(Component)]
+struct LegacyGameText {
+    role: LegacyGameTextRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyGameTextRole {
+    Score,
+    ArsenalSlot(usize),
+    Message,
+}
 
 #[derive(Component)]
 struct MenuText;
@@ -1731,7 +2643,30 @@ struct GameEntity;
 struct BazaarEntity;
 
 #[derive(Component)]
-struct BazaarText;
+struct BazaarText {
+    role: BazaarTextRole,
+}
+
+#[derive(Component)]
+struct BazaarSelectionMarker {
+    role: BazaarSelectionMarkerRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BazaarSelectionMarkerRole {
+    Background,
+    Text,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BazaarTextRole {
+    Catalog,
+    SelectedCatalogRow,
+    Funds,
+    ArsenalSlot(usize),
+    Message,
+    Description,
+}
 
 #[derive(Component)]
 struct PlayerViewEntity {
@@ -1745,7 +2680,207 @@ struct ScreenShell;
 struct ScreenText;
 
 #[derive(Component)]
+struct GenericScreenShell;
+
+#[derive(Component)]
+struct StartupOnlyShell;
+
+#[derive(Component)]
+struct AboutShell;
+
+#[derive(Component)]
+struct ChallengeShell;
+
+#[derive(Component)]
+struct RosterShell;
+
+#[derive(Component)]
+struct ChallengeLogo;
+
+#[derive(Component)]
+struct ChallengeSliderKnob {
+    x_offset: f32,
+}
+
+#[derive(Default)]
+struct ChallengeLogoTextureCache {
+    original: Option<Handle<Image>>,
+    high_contrast: Option<Handle<Image>>,
+}
+
+impl ChallengeLogoTextureCache {
+    fn get(&self, theme: ThemeChoice) -> Option<Handle<Image>> {
+        match theme {
+            ThemeChoice::Original => self.original.clone(),
+            ThemeChoice::HighContrast => self.high_contrast.clone(),
+        }
+    }
+
+    fn set(&mut self, theme: ThemeChoice, handle: Handle<Image>) {
+        match theme {
+            ThemeChoice::Original => self.original = Some(handle),
+            ThemeChoice::HighContrast => self.high_contrast = Some(handle),
+        }
+    }
+}
+
+#[derive(Component)]
+struct ChallengeText {
+    role: ChallengeTextRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChallengeTextRole {
+    UserList,
+    UserInfo,
+    ComputerStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BazaarWaitingText {
+    LocalWaiting,
+    LocalRepeated,
+    PlayerWaiting(PlayerId),
+    PlayerRepeated(PlayerId),
+}
+
+struct UiTextTone;
+
+impl UiTextTone {
+    fn challenge_copy(content_mode: ContentMode) -> &'static str {
+        match content_mode {
+            ContentMode::Normal => "",
+            ContentMode::Rated => "wants a piece of yo' ass.",
+        }
+    }
+
+    fn bazaar_waiting_copy(content_mode: ContentMode, text: BazaarWaitingText) -> String {
+        match (content_mode, text) {
+            (ContentMode::Rated, BazaarWaitingText::LocalWaiting)
+            | (ContentMode::Rated, BazaarWaitingText::PlayerWaiting(_)) => {
+                "Waiting for fat slut...".to_string()
+            }
+            (ContentMode::Rated, BazaarWaitingText::LocalRepeated)
+            | (ContentMode::Rated, BazaarWaitingText::PlayerRepeated(_)) => {
+                "Fuckface is getting angsty.".to_string()
+            }
+            (ContentMode::Normal, BazaarWaitingText::LocalWaiting) => {
+                "Done. Waiting for opponent.".to_string()
+            }
+            (ContentMode::Normal, BazaarWaitingText::LocalRepeated) => {
+                "Already waiting for opponent.".to_string()
+            }
+            (ContentMode::Normal, BazaarWaitingText::PlayerWaiting(player)) => {
+                format!("{} done. Waiting for opponent.", player_label(player))
+            }
+            (ContentMode::Normal, BazaarWaitingText::PlayerRepeated(player)) => {
+                format!("{} is already waiting.", player_label(player))
+            }
+        }
+    }
+
+    fn bazaar_done_overlay_copy(content_mode: ContentMode) -> &'static str {
+        match content_mode {
+            ContentMode::Normal => {
+                "Done selected. Waiting for opponent; shopping controls are dimmed."
+            }
+            ContentMode::Rated => "Waiting for fat slut...",
+        }
+    }
+
+    fn bazaar_instructions_copy(content_mode: ContentMode) -> &'static str {
+        match content_mode {
+            ContentMode::Normal => "Click a row to inspect. Click Add/Remove/DONE. Number slots launch in game, remove staged here.",
+            ContentMode::Rated => "Click a row to inspect. Click Add/Remove/DONE. Number slots launch in game, remove staged here.",
+        }
+    }
+
+    fn game_result_copy(content_mode: ContentMode, local_won: Option<bool>) -> &'static str {
+        match (content_mode, local_won) {
+            (ContentMode::Rated, Some(false)) => "Nice loss, shithead.",
+            (ContentMode::Rated, Some(true)) => "Yer the shit!",
+            (ContentMode::Normal, _) | (ContentMode::Rated, None) => "Game over",
+        }
+    }
+}
+
+#[derive(Component)]
+struct RosterText {
+    role: RosterTextRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RosterTextRole {
+    UserList,
+    UserInfo1,
+    UserInfo2,
+    Player1Name,
+    Player2Name,
+    Player1Score,
+    Player2Score,
+}
+
+#[derive(Component)]
 struct ButtonFace;
+
+#[derive(Component)]
+struct ThemedSprite {
+    role: ThemedSpriteRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThemedSpriteRole {
+    Startup,
+    Bazaar,
+    Biff,
+    AboutIcon,
+}
+
+#[derive(Component)]
+struct ThemedTextColor {
+    role: ThemedTextColorRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThemedTextColorRole {
+    Secondary,
+    ScreenTitle,
+    ScreenBody,
+    Button,
+    AboutTitle,
+    AboutName,
+    AboutCredit,
+    AboutButton,
+}
+
+#[derive(Component)]
+struct ThemedTextFont {
+    role: ThemedTextFontRole,
+}
+
+#[derive(Component)]
+struct ThemedTextMetrics;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThemedTextFontRole {
+    Title,
+    Body,
+    Button,
+    Mono,
+}
+
+#[derive(Component)]
+struct ThemedColorSprite {
+    role: ThemedColorSpriteRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThemedColorSpriteRole {
+    ScreenBackground,
+    AboutBackground,
+    ButtonHighlight,
+    ButtonShadow,
+}
 
 #[derive(Component)]
 struct MenuButton {
@@ -1756,27 +2891,79 @@ struct MenuButton {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MenuAction {
-    StartHumanVsHuman,
     StartHumanVsComputer,
-    AdjustErnieDifficulty(isize),
     GoTo(ClientScreen),
     Quit,
+}
+
+fn load_theme_atlases(
+    mut commands: Commands,
+    themes: Res<ThemePacks>,
+    asset_server: Res<AssetServer>,
+    mut atlas_layouts: ResMut<Assets<TextureAtlasLayout>>,
+) {
+    commands.insert_resource(ThemeAtlasHandles {
+        original: theme_atlas_handle(
+            themes.get(ThemeChoice::Original),
+            &asset_server,
+            &mut atlas_layouts,
+        ),
+        high_contrast: theme_atlas_handle(
+            themes.get(ThemeChoice::HighContrast),
+            &asset_server,
+            &mut atlas_layouts,
+        ),
+    });
+}
+
+fn theme_atlas_handle(
+    theme: &LoadedTheme,
+    asset_server: &AssetServer,
+    atlas_layouts: &mut Assets<TextureAtlasLayout>,
+) -> ThemeAtlasHandle {
+    let layout = TextureAtlasLayout::from_grid(
+        theme.cell_atlas.tile_size(),
+        theme.cell_atlas.columns,
+        theme.cell_atlas.rows,
+        theme.cell_atlas.padding(),
+        theme.cell_atlas.offset(),
+    );
+    let layout = atlas_layouts.add(layout);
+    ThemeAtlasHandle {
+        normal: ThemeAtlasImageHandle {
+            image: asset_server.load(theme.sprites.atlas_for(ContentMode::Normal).to_string()),
+            layout: layout.clone(),
+        },
+        rated: theme
+            .sprites
+            .rated
+            .as_ref()
+            .map(|rated| ThemeAtlasImageHandle {
+                image: asset_server.load(rated.atlas.clone()),
+                layout,
+            }),
+    }
 }
 
 fn setup(
     mut commands: Commands,
     settings: Res<ClientSettings>,
     themes: Res<ThemePacks>,
+    atlases: Res<ThemeAtlasHandles>,
     asset_server: Res<AssetServer>,
 ) {
-    commands.spawn(Camera2d);
+    commands.spawn((Camera2d, Msaa::Off));
     let theme = themes.get(settings.theme);
 
     spawn_screen_shell(&mut commands, theme, &asset_server);
+    spawn_challenge_shell(&mut commands, theme, &asset_server);
+    spawn_about_shell(&mut commands, theme, &asset_server);
+    spawn_roster_shell(&mut commands, theme, &asset_server);
 
     spawn_player_view(
         &mut commands,
         theme,
+        atlases.get(settings.theme, settings.content_mode, &themes),
         PlayerId::One,
         theme.layout.board.player_one_left,
         "Player 1",
@@ -1784,79 +2971,1897 @@ fn setup(
     spawn_player_view(
         &mut commands,
         theme,
+        atlases.get(settings.theme, settings.content_mode, &themes),
         PlayerId::Two,
         theme.layout.board.player_two_left,
         "Player 2 / Computer",
     );
     spawn_bazaar_overlay(&mut commands, theme, &asset_server);
+    spawn_legacy_game_hud(&mut commands, theme, &asset_server);
 
     commands.spawn((
         Text2d::new("BattleTris"),
-        TextFont::from_font_size(22.0),
-        TextColor(theme.palette.text_primary),
+        themed_text_font_at_size(theme, ThemedTextFontRole::Body, 22.0, &asset_server),
+        TextColor(theme.palette.text_secondary),
+        ThemedTextColor {
+            role: ThemedTextColorRole::Secondary,
+        },
+        ThemedTextMetrics,
         Transform::from_xyz(0.0, -300.0, 5.0),
         PhaseText,
+        PlayingGameEntity,
         GameEntity,
     ));
 
     commands.spawn((
         Text2d::new(""),
-        TextFont::from_font_size(18.0),
-        TextColor(theme.palette.text_accent),
+        themed_text_font(theme, ThemedTextFontRole::Title, &asset_server),
+        TextColor(theme.screen.title_text),
+        ThemedTextColor {
+            role: ThemedTextColorRole::ScreenTitle,
+        },
+        ThemedTextFont {
+            role: ThemedTextFontRole::Title,
+        },
+        ThemedTextMetrics,
         Transform::from_xyz(0.0, 245.0, 10.0),
         MenuText,
+        GenericScreenShell,
         ScreenShell,
     ));
 }
 
 fn spawn_bazaar_overlay(commands: &mut Commands, theme: &LoadedTheme, asset_server: &AssetServer) {
+    let text_assets = ThemeTextAssets {
+        theme,
+        asset_server,
+    };
+    let mut backdrop = Sprite::from_image(asset_server.load(theme.sprites.bazaar.clone()));
+    backdrop.custom_size = Some(Vec2::new(490.0, 164.0));
+    let art_center = bazaar_world(20.0 + 245.0, 18.0 + 82.0);
     commands.spawn((
-        Sprite::from_image(asset_server.load(theme.sprites.bazaar.clone())),
-        Transform::from_xyz(0.0, 0.0, 20.0),
+        backdrop,
+        Transform::from_xyz(art_center.x, art_center.y, 20.0),
         Visibility::Hidden,
+        ThemedSprite {
+            role: ThemedSpriteRole::Bazaar,
+        },
         BazaarEntity,
         GameEntity,
     ));
+
+    spawn_bazaar_panel(
+        commands,
+        bazaar_rect(20.0, 200.0, 300.0, 780.0),
+        MotifBevel::Inset,
+    );
+    spawn_bazaar_scrollbar(commands, 20.0, 200.0, 300.0, 780.0, true, true);
+    commands.spawn((
+        Sprite::from_color(motif_red3_color(), Vec2::new(254.0, 16.0)),
+        Transform::from_xyz(-249.0, bazaar_world(0.0, 210.0).y, 23.0),
+        Visibility::Hidden,
+        BazaarSelectionMarker {
+            role: BazaarSelectionMarkerRole::Background,
+        },
+        BazaarEntity,
+        GameEntity,
+    ));
+    spawn_bazaar_panel(
+        commands,
+        bazaar_rect(340.0, 600.0, 780.0, 780.0),
+        MotifBevel::Inset,
+    );
+    spawn_bazaar_scrollbar(commands, 340.0, 600.0, 780.0, 780.0, true, false);
+    spawn_bazaar_panel(
+        commands,
+        bazaar_rect(325.0, 215.0, 475.0, 245.0),
+        MotifBevel::Raised,
+    );
+    spawn_bazaar_panel(
+        commands,
+        bazaar_rect(325.0, 245.0, 475.0, 315.0),
+        MotifBevel::Inset,
+    );
+    spawn_bazaar_static_text(
+        commands,
+        text_assets,
+        "Funds",
+        bazaar_world(372.0, 235.0),
+        12.0,
+        motif_blue_color(),
+        Anchor::CENTER,
+    );
+    spawn_bazaar_dynamic_text(
+        commands,
+        text_assets,
+        BazaarTextRole::Funds,
+        bazaar_world(400.0, 282.0),
+        12.0,
+        motif_red3_color(),
+        Anchor::CENTER,
+    );
+
+    for slot in 0..10 {
+        let y1 = 204.0 + slot as f32 * 30.0;
+        let y2 = y1 + 24.0;
+        spawn_bazaar_panel(
+            commands,
+            bazaar_rect(503.0, y1, 778.0, y2),
+            MotifBevel::Raised,
+        );
+        spawn_bazaar_dynamic_text(
+            commands,
+            text_assets,
+            BazaarTextRole::ArsenalSlot(slot),
+            bazaar_world(512.0, y1 + 12.0),
+            12.0,
+            motif_dim_text_color(),
+            Anchor::TOP_LEFT,
+        );
+    }
+
+    for (label, rect) in [
+        ("Add >>", bazaar_rect(340.0, 365.0, 460.0, 415.0)),
+        ("<< Remove", bazaar_rect(340.0, 435.0, 460.0, 485.0)),
+        ("DONE", bazaar_rect(340.0, 505.0, 460.0, 575.0)),
+    ] {
+        spawn_bazaar_panel(commands, rect, MotifBevel::Raised);
+        let (center, _) = rect;
+        spawn_bazaar_static_text(
+            commands,
+            text_assets,
+            label,
+            center,
+            12.0,
+            motif_blue_color(),
+            Anchor::CENTER,
+        );
+    }
+
+    spawn_bazaar_dynamic_text(
+        commands,
+        text_assets,
+        BazaarTextRole::Catalog,
+        bazaar_world(24.0, 205.0),
+        13.3,
+        motif_red3_color(),
+        Anchor::TOP_LEFT,
+    );
+    let selected_text_position = bazaar_world(24.0, 205.0);
     commands.spawn((
         Text2d::new(""),
-        TextFont::from_font_size(12.0),
-        TextColor(theme.palette.text_primary),
-        Transform::from_xyz(-370.0, 350.0, 21.0),
+        text_assets.font(ThemedTextFontRole::Body, 13.3),
+        TextColor(Color::WHITE),
+        ThemedTextMetrics,
+        Anchor::TOP_LEFT,
+        Transform::from_xyz(selected_text_position.x, selected_text_position.y, 24.5),
         Visibility::Hidden,
         BazaarEntity,
-        BazaarText,
+        BazaarText {
+            role: BazaarTextRole::SelectedCatalogRow,
+        },
+        BazaarSelectionMarker {
+            role: BazaarSelectionMarkerRole::Text,
+        },
+        GameEntity,
+    ));
+    spawn_bazaar_dynamic_text(
+        commands,
+        text_assets,
+        BazaarTextRole::Message,
+        bazaar_world(640.0, 552.0),
+        12.0,
+        motif_message_green_color(),
+        Anchor::CENTER,
+    );
+    spawn_bazaar_dynamic_text(
+        commands,
+        text_assets,
+        BazaarTextRole::Description,
+        bazaar_world(348.0, 606.0),
+        12.0,
+        motif_red3_color(),
+        Anchor::TOP_LEFT,
+    );
+}
+
+fn spawn_bazaar_panel(commands: &mut Commands, (center, size): (Vec2, Vec2), bevel: MotifBevel) {
+    spawn_bazaar_rect(commands, center, size, motif_text_panel_color(), 21.0);
+    spawn_bazaar_bevel(commands, center, size, 22.0, bevel);
+}
+
+fn spawn_bazaar_rect(commands: &mut Commands, center: Vec2, size: Vec2, color: Color, z: f32) {
+    commands.spawn((
+        Sprite::from_color(color, size),
+        Transform::from_xyz(center.x, center.y, z),
+        Visibility::Hidden,
+        BazaarEntity,
         GameEntity,
     ));
 }
 
+fn spawn_bazaar_bevel(
+    commands: &mut Commands,
+    center: Vec2,
+    size: Vec2,
+    z: f32,
+    bevel: MotifBevel,
+) {
+    let (top_left, bottom_right) = match bevel {
+        MotifBevel::Raised => (motif_highlight_color(), motif_shadow_color()),
+        MotifBevel::Inset => (motif_shadow_color(), motif_highlight_color()),
+    };
+    for (offset, bevel_size, bevel_color) in [
+        (
+            Vec2::new(0.0, size.y / 2.0),
+            Vec2::new(size.x, 2.0),
+            top_left,
+        ),
+        (
+            Vec2::new(-size.x / 2.0, 0.0),
+            Vec2::new(2.0, size.y),
+            top_left,
+        ),
+        (
+            Vec2::new(0.0, -size.y / 2.0),
+            Vec2::new(size.x, 2.0),
+            bottom_right,
+        ),
+        (
+            Vec2::new(size.x / 2.0, 0.0),
+            Vec2::new(2.0, size.y),
+            bottom_right,
+        ),
+    ] {
+        spawn_bazaar_rect(
+            commands,
+            Vec2::new(center.x + offset.x, center.y + offset.y),
+            bevel_size,
+            bevel_color,
+            z,
+        );
+    }
+}
+
+fn spawn_bazaar_scrollbar(
+    commands: &mut Commands,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    vertical: bool,
+    horizontal: bool,
+) {
+    let vertical_y2 = if horizontal { y2 - 18.0 } else { y2 };
+    let horizontal_x2 = if vertical { x2 - 18.0 } else { x2 };
+    if vertical {
+        let bar_x1 = x2 - 18.0;
+        spawn_bazaar_legacy_scrollbar(commands, bazaar_rect(bar_x1, y1, x2, vertical_y2), true);
+    }
+    if horizontal {
+        let bar_y1 = y2 - 18.0;
+        spawn_bazaar_legacy_scrollbar(commands, bazaar_rect(x1, bar_y1, horizontal_x2, y2), false);
+    }
+}
+
+fn spawn_bazaar_legacy_scrollbar(
+    commands: &mut Commands,
+    (center, size): (Vec2, Vec2),
+    vertical: bool,
+) {
+    let parts = legacy_scrollbar_parts(center, size, vertical);
+    spawn_bazaar_scrollbar_panel(
+        commands,
+        center,
+        size,
+        motif_text_panel_color(),
+        21.0,
+        MotifBevel::Inset,
+    );
+    spawn_bazaar_scrollbar_panel(
+        commands,
+        parts.thumb_center,
+        parts.thumb_size,
+        motif_button_face_color(),
+        22.2,
+        MotifBevel::Inset,
+    );
+    spawn_bazaar_arrow_button(
+        commands,
+        parts.leading_arrow_center,
+        parts.arrow_size,
+        if vertical {
+            MotifArrowDirection::Up
+        } else {
+            MotifArrowDirection::Left
+        },
+    );
+    spawn_bazaar_arrow_button(
+        commands,
+        parts.trailing_arrow_center,
+        parts.arrow_size,
+        if vertical {
+            MotifArrowDirection::Down
+        } else {
+            MotifArrowDirection::Right
+        },
+    );
+}
+
+fn spawn_bazaar_scrollbar_panel(
+    commands: &mut Commands,
+    center: Vec2,
+    size: Vec2,
+    color: Color,
+    z: f32,
+    bevel: MotifBevel,
+) {
+    spawn_bazaar_rect(commands, center, size, color, z);
+    spawn_bazaar_bevel(commands, center, size, z + 0.5, bevel);
+}
+
+fn spawn_bazaar_arrow_button(
+    commands: &mut Commands,
+    center: Vec2,
+    size: Vec2,
+    direction: MotifArrowDirection,
+) {
+    spawn_bazaar_scrollbar_panel(
+        commands,
+        center,
+        size,
+        motif_button_face_color(),
+        23.0,
+        MotifBevel::Inset,
+    );
+    spawn_bazaar_arrow_glyph(commands, center, direction);
+}
+
+fn spawn_bazaar_arrow_glyph(commands: &mut Commands, center: Vec2, direction: MotifArrowDirection) {
+    for index in 0..3 {
+        let spread = 1.0 + index as f32 * 2.0;
+        let step = index as f32 * 1.6;
+        let (offset, size) = match direction {
+            MotifArrowDirection::Up => (Vec2::new(0.0, 2.4 - step), Vec2::new(spread, 1.0)),
+            MotifArrowDirection::Down => (Vec2::new(0.0, -2.4 + step), Vec2::new(spread, 1.0)),
+            MotifArrowDirection::Left => (Vec2::new(-2.4 + step, 0.0), Vec2::new(1.0, spread)),
+            MotifArrowDirection::Right => (Vec2::new(2.4 - step, 0.0), Vec2::new(1.0, spread)),
+        };
+        spawn_bazaar_rect(
+            commands,
+            Vec2::new(center.x + offset.x, center.y + offset.y),
+            size,
+            Color::BLACK,
+            24.0,
+        );
+    }
+}
+
+fn spawn_bazaar_static_text(
+    commands: &mut Commands,
+    text_assets: ThemeTextAssets,
+    label: &'static str,
+    position: Vec2,
+    font_size: f32,
+    color: Color,
+    anchor: Anchor,
+) {
+    commands.spawn((
+        Text2d::new(label),
+        text_assets.font(ThemedTextFontRole::Body, font_size),
+        TextColor(color),
+        ThemedTextMetrics,
+        anchor,
+        Transform::from_xyz(position.x, position.y, 24.0),
+        Visibility::Hidden,
+        BazaarEntity,
+        GameEntity,
+    ));
+}
+
+fn spawn_bazaar_dynamic_text(
+    commands: &mut Commands,
+    text_assets: ThemeTextAssets,
+    role: BazaarTextRole,
+    position: Vec2,
+    font_size: f32,
+    color: Color,
+    anchor: Anchor,
+) {
+    let font_role = bazaar_text_font_role(role);
+    commands.spawn((
+        Text2d::new(""),
+        text_assets.font(font_role, font_size),
+        TextColor(color),
+        ThemedTextMetrics,
+        anchor,
+        Transform::from_xyz(position.x, position.y, 24.0),
+        Visibility::Hidden,
+        BazaarEntity,
+        BazaarText { role },
+        GameEntity,
+    ));
+}
+
+fn bazaar_text_font_role(role: BazaarTextRole) -> ThemedTextFontRole {
+    match role {
+        BazaarTextRole::Funds => ThemedTextFontRole::Mono,
+        BazaarTextRole::Catalog
+        | BazaarTextRole::SelectedCatalogRow
+        | BazaarTextRole::ArsenalSlot(_)
+        | BazaarTextRole::Message
+        | BazaarTextRole::Description => ThemedTextFontRole::Body,
+    }
+}
+
+fn bazaar_rect(x1: f32, y1: f32, x2: f32, y2: f32) -> (Vec2, Vec2) {
+    let center = Vec2::new(
+        (x1 + x2) / 2.0 - LEGACY_BAZAAR_WIDTH / 2.0,
+        LEGACY_BAZAAR_HEIGHT / 2.0 - (y1 + y2) / 2.0,
+    );
+    let size = Vec2::new(x2 - x1, y2 - y1);
+    (center, size)
+}
+
+fn bazaar_world(x: f32, y: f32) -> Vec2 {
+    Vec2::new(
+        x - LEGACY_BAZAAR_WIDTH / 2.0,
+        LEGACY_BAZAAR_HEIGHT / 2.0 - y,
+    )
+}
+
+fn spawn_legacy_game_hud(commands: &mut Commands, theme: &LoadedTheme, asset_server: &AssetServer) {
+    spawn_game_panel(
+        commands,
+        game_screen_rect(
+            LEGACY_GAME_SCORE_X,
+            LEGACY_GAME_SCORE_Y,
+            LEGACY_GAME_SCORE_WIDTH,
+            LEGACY_GAME_SCORE_HEIGHT,
+        ),
+        motif_text_panel_color(),
+        1.0,
+        MotifBevel::Inset,
+    );
+    spawn_legacy_game_text(
+        commands,
+        theme,
+        asset_server,
+        LegacyGameTextRole::Score,
+        309.0,
+        43.0,
+        10.0,
+    );
+
+    for slot in 0..10 {
+        let y = LEGACY_GAME_ARSENAL_Y + slot as f32 * LEGACY_GAME_ARSENAL_ROW_HEIGHT + 3.0;
+        spawn_game_panel(
+            commands,
+            game_screen_rect(LEGACY_GAME_ARSENAL_X, y, LEGACY_GAME_ARSENAL_WIDTH, 30.0),
+            motif_button_face_color(),
+            1.0,
+            MotifBevel::Raised,
+        );
+        spawn_legacy_game_text(
+            commands,
+            theme,
+            asset_server,
+            LegacyGameTextRole::ArsenalSlot(slot),
+            311.0,
+            y + 8.0,
+            11.0,
+        );
+    }
+
+    spawn_legacy_game_text(
+        commands,
+        theme,
+        asset_server,
+        LegacyGameTextRole::Message,
+        305.0,
+        630.0,
+        11.0,
+    );
+}
+
+fn spawn_game_panel(
+    commands: &mut Commands,
+    (center, size): (Vec2, Vec2),
+    color: Color,
+    z: f32,
+    bevel: MotifBevel,
+) {
+    spawn_game_rect(commands, center, size, color, z);
+    spawn_game_bevel(commands, center, size, z + 0.1, bevel);
+}
+
+fn spawn_game_bevel(commands: &mut Commands, center: Vec2, size: Vec2, z: f32, bevel: MotifBevel) {
+    let (top_left, bottom_right) = match bevel {
+        MotifBevel::Raised => (motif_highlight_color(), motif_shadow_color()),
+        MotifBevel::Inset => (motif_shadow_color(), motif_highlight_color()),
+    };
+    for (offset, bevel_size, bevel_color) in [
+        (
+            Vec2::new(0.0, size.y / 2.0),
+            Vec2::new(size.x, 2.0),
+            top_left,
+        ),
+        (
+            Vec2::new(-size.x / 2.0, 0.0),
+            Vec2::new(2.0, size.y),
+            top_left,
+        ),
+        (
+            Vec2::new(0.0, -size.y / 2.0),
+            Vec2::new(size.x, 2.0),
+            bottom_right,
+        ),
+        (
+            Vec2::new(size.x / 2.0, 0.0),
+            Vec2::new(2.0, size.y),
+            bottom_right,
+        ),
+    ] {
+        spawn_game_rect(
+            commands,
+            Vec2::new(center.x + offset.x, center.y + offset.y),
+            bevel_size,
+            bevel_color,
+            z,
+        );
+    }
+}
+
+fn spawn_game_rect(commands: &mut Commands, center: Vec2, size: Vec2, color: Color, z: f32) {
+    commands.spawn((
+        Sprite::from_color(color, size),
+        Transform::from_xyz(center.x, center.y, z),
+        Visibility::Hidden,
+        PlayingGameEntity,
+        GameEntity,
+    ));
+}
+
+fn spawn_legacy_game_text(
+    commands: &mut Commands,
+    theme: &LoadedTheme,
+    asset_server: &AssetServer,
+    role: LegacyGameTextRole,
+    x: f32,
+    y: f32,
+    font_size: f32,
+) {
+    let position = game_screen_world(x, y);
+    let color = match role {
+        LegacyGameTextRole::Message => Color::BLACK,
+        LegacyGameTextRole::Score | LegacyGameTextRole::ArsenalSlot(_) => motif_blue_color(),
+    };
+    commands.spawn((
+        Text2d::new(""),
+        themed_text_font_at_size(
+            theme,
+            legacy_game_text_font_role(role),
+            font_size,
+            asset_server,
+        ),
+        TextColor(color),
+        ThemedTextMetrics,
+        Anchor::TOP_LEFT,
+        Transform::from_xyz(position.x, position.y, 5.0),
+        LegacyGameText { role },
+        PlayingGameEntity,
+        GameEntity,
+    ));
+}
+
+fn legacy_game_text_font_role(role: LegacyGameTextRole) -> ThemedTextFontRole {
+    match role {
+        LegacyGameTextRole::Score | LegacyGameTextRole::ArsenalSlot(_) => ThemedTextFontRole::Mono,
+        LegacyGameTextRole::Message => ThemedTextFontRole::Body,
+    }
+}
+
+fn game_screen_rect(x: f32, y: f32, width: f32, height: f32) -> (Vec2, Vec2) {
+    let center = game_screen_world(x + width / 2.0, y + height / 2.0);
+    (center, Vec2::new(width, height))
+}
+
+fn game_screen_world(x: f32, y: f32) -> Vec2 {
+    Vec2::new(x - LEGACY_GAME_WIDTH / 2.0, LEGACY_GAME_HEIGHT / 2.0 - y)
+}
+
 fn spawn_screen_shell(commands: &mut Commands, theme: &LoadedTheme, asset_server: &AssetServer) {
     commands.spawn((
-        Sprite::from_image(asset_server.load(theme.sprites.startup.clone())),
-        Transform::from_xyz(0.0, 34.0, -2.0),
+        Sprite::from_color(theme.screen.background, Vec2::new(640.0, 600.0)),
+        Transform::from_xyz(0.0, 0.0, -3.0),
+        ThemedColorSprite {
+            role: ThemedColorSpriteRole::ScreenBackground,
+        },
+        GenericScreenShell,
+        ScreenShell,
+    ));
+
+    let mut startup_sprite = Sprite::from_image(asset_server.load(theme.sprites.startup.clone()));
+    startup_sprite.custom_size = Some(Vec2::new(640.0, 440.0));
+    commands.spawn((
+        startup_sprite,
+        Transform::from_xyz(0.0, 80.0, -2.0),
+        ThemedSprite {
+            role: ThemedSpriteRole::Startup,
+        },
+        StartupOnlyShell,
+        GenericScreenShell,
         ScreenShell,
     ));
 
     commands.spawn((
         Sprite::from_image(asset_server.load(theme.sprites.biff.clone())),
         Transform::from_xyz(-220.0, -155.0, 1.0),
+        ThemedSprite {
+            role: ThemedSpriteRole::Biff,
+        },
+        GenericScreenShell,
         ScreenShell,
     ));
 
     commands.spawn((
         Text2d::new(""),
-        TextFont::from_font_size(18.0),
-        TextColor(theme.palette.text_primary),
+        themed_text_font(theme, ThemedTextFontRole::Body, asset_server),
+        TextColor(theme.screen.body_text),
+        ThemedTextColor {
+            role: ThemedTextColorRole::ScreenBody,
+        },
+        ThemedTextFont {
+            role: ThemedTextFontRole::Body,
+        },
+        ThemedTextMetrics,
         Transform::from_xyz(55.0, 70.0, 4.0),
         ScreenText,
+        GenericScreenShell,
         ScreenShell,
     ));
 
-    for spec in startup_buttons() {
-        spawn_menu_button(commands, theme, spec);
+    for spec in startup_buttons(theme) {
+        spawn_menu_button(commands, theme, asset_server, spec);
     }
-    for spec in secondary_screen_buttons() {
-        spawn_menu_button(commands, theme, spec);
+    for spec in secondary_screen_buttons(theme) {
+        spawn_menu_button(commands, theme, asset_server, spec);
     }
+}
+
+fn spawn_challenge_shell(commands: &mut Commands, theme: &LoadedTheme, asset_server: &AssetServer) {
+    let text_assets = ThemeTextAssets {
+        theme,
+        asset_server,
+    };
+    spawn_challenge_rect(
+        commands,
+        challenge_rect(0.0, 0.0, 800.0, 700.0),
+        motif_page_color(),
+        -3.0,
+    );
+    spawn_challenge_panel(
+        commands,
+        challenge_rect(20.0, 20.0, 400.0, 500.0),
+        motif_text_panel_color(),
+        0.0,
+        MotifBevel::Inset,
+    );
+    spawn_challenge_panel(
+        commands,
+        challenge_rect(440.0, 320.0, 780.0, 680.0),
+        motif_text_panel_color(),
+        0.0,
+        MotifBevel::Inset,
+    );
+    spawn_challenge_computer_frame(commands, text_assets);
+
+    let logo_top_left = challenge_point(540.0, 30.0);
+    let logo_size = Vec2::new(105.0, 105.0);
+    let logo_center = Vec2::new(
+        logo_top_left.x + logo_size.x / 2.0 - 320.0,
+        300.0 - (logo_top_left.y + logo_size.y / 2.0),
+    );
+    commands.spawn((
+        Sprite::from_image(asset_server.load(theme.sprites.biff.clone())),
+        Transform::from_xyz(logo_center.x, logo_center.y, 1.0),
+        Visibility::Hidden,
+        ChallengeLogo,
+        ChallengeShell,
+        ScreenShell,
+    ));
+
+    spawn_challenge_scrollbar(commands, 380.0, 20.0, 400.0, 480.0, true);
+    spawn_challenge_scrollbar(commands, 20.0, 480.0, 380.0, 500.0, false);
+    spawn_challenge_scrollbar(commands, 760.0, 320.0, 780.0, 680.0, true);
+
+    spawn_challenge_text(
+        commands,
+        text_assets,
+        ChallengeTextRole::UserList,
+        challenge_rect_center(38.0, 44.0, 382.0, 470.0),
+        12.0,
+        motif_red3_color(),
+    );
+    spawn_challenge_text(
+        commands,
+        text_assets,
+        ChallengeTextRole::UserInfo,
+        challenge_rect_center(458.0, 340.0, 762.0, 660.0),
+        12.0,
+        motif_red3_color(),
+    );
+    spawn_challenge_text(
+        commands,
+        text_assets,
+        ChallengeTextRole::ComputerStatus,
+        challenge_world(210.0, 625.0),
+        11.0,
+        Color::BLACK,
+    );
+    spawn_static_challenge_text(
+        commands,
+        text_assets,
+        "Available for challenges",
+        challenge_world(155.0, 653.0),
+        11.0,
+        Color::BLACK,
+    );
+    spawn_challenge_checkbox(commands, challenge_rect(40.0, 648.0, 52.0, 660.0), 2.0);
+    spawn_challenge_slider(commands);
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MotifBevel {
+    Raised,
+    Inset,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MotifArrowDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+const LEGACY_SCROLLBAR_INSET: f32 = 2.0;
+
+#[derive(Debug, Clone, Copy)]
+struct LegacyScrollbarParts {
+    thumb_center: Vec2,
+    thumb_size: Vec2,
+    leading_arrow_center: Vec2,
+    trailing_arrow_center: Vec2,
+    arrow_size: Vec2,
+}
+
+fn legacy_scrollbar_parts(center: Vec2, size: Vec2, vertical: bool) -> LegacyScrollbarParts {
+    let thickness = if vertical { size.x } else { size.y };
+    let inset = LEGACY_SCROLLBAR_INSET.min(thickness / 3.0).max(0.0);
+    let cap_extent = (thickness - inset * 2.0).max(1.0);
+    let track_length = if vertical { size.y } else { size.x };
+    let thumb_extent = (track_length - inset * 4.0 - cap_extent * 2.0).max(1.0);
+
+    if vertical {
+        let arrow_offset = size.y / 2.0 - inset - cap_extent / 2.0;
+        LegacyScrollbarParts {
+            thumb_center: center,
+            thumb_size: Vec2::new(cap_extent, thumb_extent),
+            leading_arrow_center: Vec2::new(center.x, center.y + arrow_offset),
+            trailing_arrow_center: Vec2::new(center.x, center.y - arrow_offset),
+            arrow_size: Vec2::new(cap_extent, cap_extent),
+        }
+    } else {
+        let arrow_offset = size.x / 2.0 - inset - cap_extent / 2.0;
+        LegacyScrollbarParts {
+            thumb_center: center,
+            thumb_size: Vec2::new(thumb_extent, cap_extent),
+            leading_arrow_center: Vec2::new(center.x - arrow_offset, center.y),
+            trailing_arrow_center: Vec2::new(center.x + arrow_offset, center.y),
+            arrow_size: Vec2::new(cap_extent, cap_extent),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChallengeScreenRect {
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+}
+
+impl ChallengeScreenRect {
+    const fn new(x1: f32, y1: f32, x2: f32, y2: f32) -> Self {
+        Self { x1, y1, x2, y2 }
+    }
+}
+
+fn motif_page_color() -> Color {
+    Color::srgba_u8(0xbf, 0xbf, 0xbf, 0xff)
+}
+
+fn motif_text_panel_color() -> Color {
+    Color::srgba_u8(0xa8, 0xa8, 0xa8, 0xff)
+}
+
+fn motif_button_face_color() -> Color {
+    Color::srgba_u8(0xbe, 0xbe, 0xbe, 0xff)
+}
+
+fn motif_button_hover_color() -> Color {
+    Color::srgba_u8(0xd6, 0xd6, 0xd6, 0xff)
+}
+
+fn motif_button_pressed_color() -> Color {
+    Color::srgba_u8(0xa8, 0xa8, 0xa8, 0xff)
+}
+
+fn motif_highlight_color() -> Color {
+    Color::srgba_u8(0xe4, 0xe4, 0xe4, 0xff)
+}
+
+fn motif_shadow_color() -> Color {
+    Color::srgba_u8(0x67, 0x67, 0x67, 0xff)
+}
+
+fn motif_red3_color() -> Color {
+    Color::srgba_u8(0xcd, 0x00, 0x00, 0xff)
+}
+
+fn motif_blue_color() -> Color {
+    Color::srgba_u8(0x00, 0x00, 0xcc, 0xff)
+}
+
+fn motif_dim_text_color() -> Color {
+    Color::srgba_u8(0xc0, 0xc0, 0xc0, 0xff)
+}
+
+fn motif_message_green_color() -> Color {
+    Color::srgba_u8(0x33, 0x66, 0x00, 0xff)
+}
+
+fn spawn_roster_shell(commands: &mut Commands, theme: &LoadedTheme, asset_server: &AssetServer) {
+    let text_assets = ThemeTextAssets {
+        theme,
+        asset_server,
+    };
+    spawn_roster_rect(
+        commands,
+        roster_rect(0.0, 0.0, LEGACY_ROSTER_WIDTH, LEGACY_ROSTER_HEIGHT),
+        motif_page_color(),
+        -3.0,
+    );
+
+    let logo_center = roster_world(
+        75.0 + LEGACY_ROSTER_BIFF_WIDTH / 2.0,
+        3.0 + LEGACY_ROSTER_BIFF_HEIGHT / 2.0,
+    );
+    commands.spawn((
+        Sprite::from_image(asset_server.load(theme.sprites.biff.clone())),
+        Transform::from_xyz(logo_center.x, logo_center.y, 1.0),
+        Visibility::Hidden,
+        ThemedSprite {
+            role: ThemedSpriteRole::Biff,
+        },
+        RosterShell,
+        ScreenShell,
+    ));
+
+    spawn_roster_panel(
+        commands,
+        roster_rect(15.0, 123.0, 225.0, 547.0),
+        motif_text_panel_color(),
+        0.0,
+        MotifBevel::Inset,
+    );
+    spawn_roster_panel(
+        commands,
+        roster_rect(255.0, 123.0, 585.0, 330.0),
+        motif_text_panel_color(),
+        0.0,
+        MotifBevel::Inset,
+    );
+    spawn_roster_panel(
+        commands,
+        roster_rect(255.0, 341.0, 585.0, 547.0),
+        motif_text_panel_color(),
+        0.0,
+        MotifBevel::Inset,
+    );
+    spawn_roster_scrollbar(commands, 15.0, 123.0, 225.0, 547.0);
+    spawn_roster_scrollbar(commands, 255.0, 123.0, 585.0, 330.0);
+    spawn_roster_scrollbar(commands, 255.0, 341.0, 585.0, 547.0);
+
+    spawn_roster_static_label(
+        commands,
+        text_assets,
+        "Head\nto\nHead",
+        roster_rect(255.0, 15.0, 322.0, 120.0),
+        14.0,
+    );
+    spawn_roster_dynamic_label(
+        commands,
+        text_assets,
+        RosterTextRole::Player1Name,
+        roster_rect(322.0, 15.0, 453.0, 67.0),
+        12.0,
+    );
+    spawn_roster_dynamic_label(
+        commands,
+        text_assets,
+        RosterTextRole::Player2Name,
+        roster_rect(453.0, 15.0, 585.0, 67.0),
+        12.0,
+    );
+    spawn_roster_dynamic_label(
+        commands,
+        text_assets,
+        RosterTextRole::Player1Score,
+        roster_rect(322.0, 67.0, 453.0, 120.0),
+        14.0,
+    );
+    spawn_roster_dynamic_label(
+        commands,
+        text_assets,
+        RosterTextRole::Player2Score,
+        roster_rect(453.0, 67.0, 585.0, 120.0),
+        14.0,
+    );
+
+    spawn_roster_dynamic_text(
+        commands,
+        text_assets,
+        RosterTextRole::UserList,
+        roster_world(26.0, 139.0),
+        15.0,
+        motif_red3_color(),
+    );
+    spawn_roster_dynamic_text(
+        commands,
+        text_assets,
+        RosterTextRole::UserInfo1,
+        roster_world(270.0, 139.0),
+        11.0,
+        Color::BLACK,
+    );
+    spawn_roster_dynamic_text(
+        commands,
+        text_assets,
+        RosterTextRole::UserInfo2,
+        roster_world(270.0, 357.0),
+        11.0,
+        Color::BLACK,
+    );
+
+    spawn_roster_static_button(
+        commands,
+        text_assets,
+        "By Name",
+        roster_rect(22.0, 555.0, 112.0, 585.0),
+    );
+    spawn_roster_static_button(
+        commands,
+        text_assets,
+        "By Rank",
+        roster_rect(127.0, 555.0, 217.0, 585.0),
+    );
+}
+
+fn spawn_roster_static_button(
+    commands: &mut Commands,
+    text_assets: ThemeTextAssets,
+    label: &'static str,
+    rect: (Vec2, Vec2),
+) {
+    spawn_roster_panel(
+        commands,
+        rect,
+        motif_button_face_color(),
+        1.0,
+        MotifBevel::Raised,
+    );
+    let (center, _) = rect;
+    commands.spawn((
+        Text2d::new(label),
+        text_assets.font(ThemedTextFontRole::Button, 12.0),
+        TextColor(motif_blue_color()),
+        ThemedTextMetrics,
+        Transform::from_xyz(center.x, center.y, 4.0),
+        Visibility::Hidden,
+        RosterShell,
+        ScreenShell,
+    ));
+}
+
+fn spawn_roster_static_label(
+    commands: &mut Commands,
+    text_assets: ThemeTextAssets,
+    label: &'static str,
+    rect: (Vec2, Vec2),
+    font_size: f32,
+) {
+    spawn_roster_panel(
+        commands,
+        rect,
+        motif_text_panel_color(),
+        1.0,
+        MotifBevel::Raised,
+    );
+    let (center, _) = rect;
+    commands.spawn((
+        Text2d::new(label),
+        text_assets.font(ThemedTextFontRole::Body, font_size),
+        TextColor(motif_blue_color()),
+        ThemedTextMetrics,
+        Transform::from_xyz(center.x, center.y - 4.0, 4.0),
+        Visibility::Hidden,
+        RosterShell,
+        ScreenShell,
+    ));
+}
+
+fn spawn_roster_dynamic_label(
+    commands: &mut Commands,
+    text_assets: ThemeTextAssets,
+    role: RosterTextRole,
+    rect: (Vec2, Vec2),
+    font_size: f32,
+) {
+    spawn_roster_panel(
+        commands,
+        rect,
+        motif_text_panel_color(),
+        1.0,
+        MotifBevel::Raised,
+    );
+    let (center, _) = rect;
+    commands.spawn((
+        Text2d::new(""),
+        text_assets.font(ThemedTextFontRole::Body, font_size),
+        TextColor(motif_blue_color()),
+        ThemedTextMetrics,
+        Transform::from_xyz(center.x, center.y - 4.0, 4.0),
+        Visibility::Hidden,
+        RosterText { role },
+        RosterShell,
+        ScreenShell,
+    ));
+}
+
+fn spawn_roster_dynamic_text(
+    commands: &mut Commands,
+    text_assets: ThemeTextAssets,
+    role: RosterTextRole,
+    position: Vec2,
+    font_size: f32,
+    color: Color,
+) {
+    commands.spawn((
+        Text2d::new(""),
+        text_assets.font(ThemedTextFontRole::Body, font_size),
+        TextColor(color),
+        ThemedTextMetrics,
+        Anchor::TOP_LEFT,
+        Transform::from_xyz(position.x, position.y, 4.0),
+        Visibility::Hidden,
+        RosterText { role },
+        RosterShell,
+        ScreenShell,
+    ));
+}
+
+fn spawn_roster_panel(
+    commands: &mut Commands,
+    (center, size): (Vec2, Vec2),
+    color: Color,
+    z: f32,
+    bevel: MotifBevel,
+) {
+    spawn_roster_rect(commands, (center, size), color, z);
+    spawn_roster_bevel(commands, center, size, z + 0.1, bevel);
+}
+
+fn spawn_roster_scrollbar(commands: &mut Commands, _x1: f32, y1: f32, x2: f32, y2: f32) {
+    let bar_x1 = x2 - 20.0;
+    let (center, size) = roster_rect(bar_x1, y1, x2, y2);
+    spawn_roster_panel(
+        commands,
+        (center, size),
+        motif_page_color(),
+        2.0,
+        MotifBevel::Inset,
+    );
+    let parts = legacy_scrollbar_parts(center, size, true);
+    spawn_roster_panel(
+        commands,
+        (parts.thumb_center, parts.thumb_size),
+        motif_button_face_color(),
+        2.2,
+        MotifBevel::Inset,
+    );
+    spawn_roster_arrow_button(
+        commands,
+        parts.leading_arrow_center,
+        parts.arrow_size,
+        MotifArrowDirection::Up,
+    );
+    spawn_roster_arrow_button(
+        commands,
+        parts.trailing_arrow_center,
+        parts.arrow_size,
+        MotifArrowDirection::Down,
+    );
+}
+
+fn spawn_roster_arrow_button(
+    commands: &mut Commands,
+    center: Vec2,
+    size: Vec2,
+    direction: MotifArrowDirection,
+) {
+    spawn_roster_panel(
+        commands,
+        (center, size),
+        motif_button_face_color(),
+        2.4,
+        MotifBevel::Inset,
+    );
+    spawn_roster_arrow_glyph(commands, center, direction, 3.0);
+}
+
+fn spawn_roster_arrow_glyph(
+    commands: &mut Commands,
+    center: Vec2,
+    direction: MotifArrowDirection,
+    z: f32,
+) {
+    for index in 0..3 {
+        let spread = 1.0 + index as f32 * 2.0;
+        let step = index as f32 * 1.6;
+        let offset = match direction {
+            MotifArrowDirection::Up => Vec2::new(0.0, 2.4 - step),
+            MotifArrowDirection::Down => Vec2::new(0.0, -2.4 + step),
+            MotifArrowDirection::Left | MotifArrowDirection::Right => Vec2::ZERO,
+        };
+        spawn_roster_rect(
+            commands,
+            (
+                Vec2::new(center.x + offset.x, center.y + offset.y),
+                Vec2::new(spread, 1.0),
+            ),
+            Color::BLACK,
+            z,
+        );
+    }
+}
+
+fn spawn_roster_bevel(
+    commands: &mut Commands,
+    center: Vec2,
+    size: Vec2,
+    z: f32,
+    bevel: MotifBevel,
+) {
+    let (top_left, bottom_right) = match bevel {
+        MotifBevel::Raised => (motif_highlight_color(), motif_shadow_color()),
+        MotifBevel::Inset => (motif_shadow_color(), motif_highlight_color()),
+    };
+    for (offset, bevel_size, bevel_color) in [
+        (
+            Vec2::new(0.0, size.y / 2.0),
+            Vec2::new(size.x, 2.0),
+            top_left,
+        ),
+        (
+            Vec2::new(-size.x / 2.0, 0.0),
+            Vec2::new(2.0, size.y),
+            top_left,
+        ),
+        (
+            Vec2::new(0.0, -size.y / 2.0),
+            Vec2::new(size.x, 2.0),
+            bottom_right,
+        ),
+        (
+            Vec2::new(size.x / 2.0, 0.0),
+            Vec2::new(2.0, size.y),
+            bottom_right,
+        ),
+    ] {
+        spawn_roster_rect(
+            commands,
+            (
+                Vec2::new(center.x + offset.x, center.y + offset.y),
+                bevel_size,
+            ),
+            bevel_color,
+            z,
+        );
+    }
+}
+
+fn spawn_roster_rect(commands: &mut Commands, (center, size): (Vec2, Vec2), color: Color, z: f32) {
+    commands.spawn((
+        Sprite::from_color(color, size),
+        Transform::from_xyz(center.x, center.y, z),
+        Visibility::Hidden,
+        RosterShell,
+        ScreenShell,
+    ));
+}
+
+fn roster_rect(x1: f32, y1: f32, x2: f32, y2: f32) -> (Vec2, Vec2) {
+    let center = Vec2::new(
+        (x1 + x2) / 2.0 - LEGACY_ROSTER_WIDTH / 2.0,
+        LEGACY_ROSTER_HEIGHT / 2.0 - (y1 + y2) / 2.0,
+    );
+    let size = Vec2::new(x2 - x1, y2 - y1);
+    (center, size)
+}
+
+fn roster_world(x: f32, y: f32) -> Vec2 {
+    Vec2::new(
+        x - LEGACY_ROSTER_WIDTH / 2.0,
+        LEGACY_ROSTER_HEIGHT / 2.0 - y,
+    )
+}
+
+fn spawn_challenge_rect(
+    commands: &mut Commands,
+    (center, size): (Vec2, Vec2),
+    color: Color,
+    z: f32,
+) {
+    commands.spawn((
+        Sprite::from_color(color, size),
+        Transform::from_xyz(center.x, center.y, z),
+        Visibility::Hidden,
+        ChallengeShell,
+        ScreenShell,
+    ));
+}
+
+fn spawn_challenge_panel(
+    commands: &mut Commands,
+    (center, size): (Vec2, Vec2),
+    color: Color,
+    z: f32,
+    bevel: MotifBevel,
+) {
+    spawn_challenge_rect(commands, (center, size), color, z);
+    spawn_challenge_bevel(commands, center, size, z + 0.1, bevel);
+}
+
+fn spawn_challenge_bevel(
+    commands: &mut Commands,
+    center: Vec2,
+    size: Vec2,
+    z: f32,
+    bevel: MotifBevel,
+) {
+    let (top_left, bottom_right) = match bevel {
+        MotifBevel::Raised => (motif_highlight_color(), motif_shadow_color()),
+        MotifBevel::Inset => (motif_shadow_color(), motif_highlight_color()),
+    };
+    for (offset, bevel_size, bevel_color) in [
+        (
+            Vec2::new(0.0, size.y / 2.0),
+            Vec2::new(size.x, 2.0),
+            top_left,
+        ),
+        (
+            Vec2::new(-size.x / 2.0, 0.0),
+            Vec2::new(2.0, size.y),
+            top_left,
+        ),
+        (
+            Vec2::new(0.0, -size.y / 2.0),
+            Vec2::new(size.x, 2.0),
+            bottom_right,
+        ),
+        (
+            Vec2::new(size.x / 2.0, 0.0),
+            Vec2::new(2.0, size.y),
+            bottom_right,
+        ),
+    ] {
+        spawn_challenge_rect(
+            commands,
+            (
+                Vec2::new(center.x + offset.x, center.y + offset.y),
+                bevel_size,
+            ),
+            bevel_color,
+            z,
+        );
+    }
+}
+
+fn spawn_challenge_computer_frame(commands: &mut Commands, text_assets: ThemeTextAssets) {
+    spawn_challenge_rect(
+        commands,
+        challenge_rect(20.0, 520.0, 400.0, 680.0),
+        motif_page_color(),
+        0.0,
+    );
+    spawn_challenge_etched_frame_screen(
+        commands,
+        ChallengeScreenRect::new(16.0, 454.0, 320.0, 583.0),
+        (23.0, 137.0),
+        0.2,
+    );
+    spawn_static_challenge_text(
+        commands,
+        text_assets,
+        "Play Computer",
+        challenge_screen_world(76.0, 450.0),
+        12.0,
+        Color::BLACK,
+    );
+}
+
+fn spawn_challenge_etched_frame_screen(
+    commands: &mut Commands,
+    rect: ChallengeScreenRect,
+    title_gap: (f32, f32),
+    z: f32,
+) {
+    let gap = Some(title_gap);
+    spawn_challenge_horizontal_segments(
+        commands,
+        ChallengeScreenRect::new(rect.x1, rect.y1, rect.x2, rect.y1 + 1.0),
+        motif_shadow_color(),
+        z,
+        gap,
+    );
+    spawn_challenge_screen_rect(
+        commands,
+        rect.x1,
+        rect.y1,
+        rect.x1 + 1.0,
+        rect.y2,
+        motif_shadow_color(),
+        z,
+    );
+    spawn_challenge_screen_rect(
+        commands,
+        rect.x1,
+        rect.y2 - 1.0,
+        rect.x2,
+        rect.y2,
+        motif_highlight_color(),
+        z,
+    );
+    spawn_challenge_screen_rect(
+        commands,
+        rect.x2 - 1.0,
+        rect.y1,
+        rect.x2,
+        rect.y2,
+        motif_highlight_color(),
+        z,
+    );
+
+    spawn_challenge_horizontal_segments(
+        commands,
+        ChallengeScreenRect::new(rect.x1 + 1.0, rect.y1 + 1.0, rect.x2 - 1.0, rect.y1 + 2.0),
+        motif_highlight_color(),
+        z + 0.1,
+        gap,
+    );
+    spawn_challenge_screen_rect(
+        commands,
+        rect.x1 + 1.0,
+        rect.y1 + 1.0,
+        rect.x1 + 2.0,
+        rect.y2 - 1.0,
+        motif_highlight_color(),
+        z + 0.1,
+    );
+    spawn_challenge_screen_rect(
+        commands,
+        rect.x1 + 1.0,
+        rect.y2 - 2.0,
+        rect.x2 - 1.0,
+        rect.y2 - 1.0,
+        motif_shadow_color(),
+        z + 0.1,
+    );
+    spawn_challenge_screen_rect(
+        commands,
+        rect.x2 - 2.0,
+        rect.y1 + 1.0,
+        rect.x2 - 1.0,
+        rect.y2 - 1.0,
+        motif_shadow_color(),
+        z + 0.1,
+    );
+}
+
+fn spawn_challenge_horizontal_segments(
+    commands: &mut Commands,
+    rect: ChallengeScreenRect,
+    color: Color,
+    z: f32,
+    gap: Option<(f32, f32)>,
+) {
+    if let Some((gap_x1, gap_x2)) = gap {
+        if gap_x1 > rect.x1 {
+            spawn_challenge_screen_rect(commands, rect.x1, rect.y1, gap_x1, rect.y2, color, z);
+        }
+        if gap_x2 < rect.x2 {
+            spawn_challenge_screen_rect(commands, gap_x2, rect.y1, rect.x2, rect.y2, color, z);
+        }
+    } else {
+        spawn_challenge_screen_rect(commands, rect.x1, rect.y1, rect.x2, rect.y2, color, z);
+    }
+}
+
+fn spawn_challenge_scrollbar(
+    commands: &mut Commands,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    vertical: bool,
+) {
+    let (center, size) = challenge_rect(x1, y1, x2, y2);
+    spawn_challenge_panel(
+        commands,
+        (center, size),
+        motif_page_color(),
+        2.0,
+        MotifBevel::Inset,
+    );
+
+    let parts = legacy_scrollbar_parts(center, size, vertical);
+    spawn_challenge_panel(
+        commands,
+        (parts.thumb_center, parts.thumb_size),
+        motif_button_face_color(),
+        2.2,
+        MotifBevel::Inset,
+    );
+
+    if vertical {
+        spawn_challenge_arrow_button(
+            commands,
+            parts.leading_arrow_center,
+            parts.arrow_size,
+            MotifArrowDirection::Up,
+            2.4,
+        );
+        spawn_challenge_arrow_button(
+            commands,
+            parts.trailing_arrow_center,
+            parts.arrow_size,
+            MotifArrowDirection::Down,
+            2.4,
+        );
+    } else {
+        spawn_challenge_arrow_button(
+            commands,
+            parts.leading_arrow_center,
+            parts.arrow_size,
+            MotifArrowDirection::Left,
+            2.4,
+        );
+        spawn_challenge_arrow_button(
+            commands,
+            parts.trailing_arrow_center,
+            parts.arrow_size,
+            MotifArrowDirection::Right,
+            2.4,
+        );
+    }
+}
+
+fn spawn_challenge_arrow_button(
+    commands: &mut Commands,
+    center: Vec2,
+    size: Vec2,
+    direction: MotifArrowDirection,
+    z: f32,
+) {
+    spawn_challenge_panel(
+        commands,
+        (center, size),
+        motif_button_face_color(),
+        z,
+        MotifBevel::Inset,
+    );
+    spawn_challenge_arrow_glyph(commands, center, direction, z + 0.5);
+}
+
+fn spawn_challenge_arrow_glyph(
+    commands: &mut Commands,
+    center: Vec2,
+    direction: MotifArrowDirection,
+    z: f32,
+) {
+    for index in 0..3 {
+        let spread = 1.0 + index as f32 * 2.0;
+        let step = index as f32 * 1.6;
+        let (offset, size) = match direction {
+            MotifArrowDirection::Up => (Vec2::new(0.0, 2.4 - step), Vec2::new(spread, 1.0)),
+            MotifArrowDirection::Down => (Vec2::new(0.0, -2.4 + step), Vec2::new(spread, 1.0)),
+            MotifArrowDirection::Left => (Vec2::new(-2.4 + step, 0.0), Vec2::new(1.0, spread)),
+            MotifArrowDirection::Right => (Vec2::new(2.4 - step, 0.0), Vec2::new(1.0, spread)),
+        };
+        spawn_challenge_rect(
+            commands,
+            (Vec2::new(center.x + offset.x, center.y + offset.y), size),
+            Color::BLACK,
+            z,
+        );
+    }
+}
+
+fn spawn_challenge_checkbox(commands: &mut Commands, rect: (Vec2, Vec2), z: f32) {
+    let (center, size) = rect;
+    spawn_challenge_rect(commands, (center, size), motif_page_color(), z);
+    spawn_challenge_bevel(commands, center, size, z + 0.1, MotifBevel::Inset);
+}
+
+fn spawn_challenge_slider(commands: &mut Commands) {
+    spawn_challenge_panel(
+        commands,
+        challenge_screen_rect(30.0, 502.0, 306.0, 516.0),
+        motif_page_color(),
+        1.0,
+        MotifBevel::Inset,
+    );
+    spawn_challenge_slider_knob(
+        commands,
+        challenge_screen_world(46.0, 509.0),
+        Vec2::new(28.0, 10.0),
+    );
+}
+
+fn spawn_challenge_slider_knob(commands: &mut Commands, center: Vec2, size: Vec2) {
+    spawn_challenge_slider_knob_rect(
+        commands,
+        center,
+        size,
+        motif_button_face_color(),
+        2.0,
+        center.x,
+    );
+    let (top_left, bottom_right) = (motif_highlight_color(), motif_shadow_color());
+    for (offset, bevel_size, bevel_color) in [
+        (
+            Vec2::new(0.0, size.y / 2.0),
+            Vec2::new(size.x, 1.0),
+            top_left,
+        ),
+        (
+            Vec2::new(-size.x / 2.0, 0.0),
+            Vec2::new(1.0, size.y),
+            top_left,
+        ),
+        (
+            Vec2::new(0.0, -size.y / 2.0),
+            Vec2::new(size.x, 1.0),
+            bottom_right,
+        ),
+        (
+            Vec2::new(size.x / 2.0, 0.0),
+            Vec2::new(1.0, size.y),
+            bottom_right,
+        ),
+    ] {
+        spawn_challenge_slider_knob_rect(
+            commands,
+            Vec2::new(center.x + offset.x, center.y + offset.y),
+            bevel_size,
+            bevel_color,
+            2.1,
+            center.x,
+        );
+    }
+}
+
+fn spawn_challenge_slider_knob_rect(
+    commands: &mut Commands,
+    center: Vec2,
+    size: Vec2,
+    color: Color,
+    z: f32,
+    base_x: f32,
+) {
+    commands.spawn((
+        Sprite::from_color(color, size),
+        Transform::from_xyz(center.x, center.y, z),
+        Visibility::Hidden,
+        ChallengeSliderKnob {
+            x_offset: center.x - base_x,
+        },
+        ChallengeShell,
+        ScreenShell,
+    ));
+}
+
+fn spawn_challenge_text(
+    commands: &mut Commands,
+    text_assets: ThemeTextAssets,
+    role: ChallengeTextRole,
+    center: Vec2,
+    font_size: f32,
+    color: Color,
+) {
+    commands.spawn((
+        Text2d::new(""),
+        text_assets.font(ThemedTextFontRole::Body, font_size),
+        TextColor(color),
+        ThemedTextMetrics,
+        Transform::from_xyz(center.x, center.y, 4.0),
+        Visibility::Hidden,
+        ChallengeText { role },
+        ChallengeShell,
+        ScreenShell,
+    ));
+}
+
+fn spawn_static_challenge_text(
+    commands: &mut Commands,
+    text_assets: ThemeTextAssets,
+    text: &'static str,
+    center: Vec2,
+    font_size: f32,
+    color: Color,
+) {
+    commands.spawn((
+        Text2d::new(text),
+        text_assets.font(ThemedTextFontRole::Body, font_size),
+        TextColor(color),
+        ThemedTextMetrics,
+        Transform::from_xyz(center.x, center.y, 4.0),
+        Visibility::Hidden,
+        ChallengeShell,
+        ScreenShell,
+    ));
+}
+
+fn challenge_rect(x1: f32, y1: f32, x2: f32, y2: f32) -> (Vec2, Vec2) {
+    let top_left = challenge_point(x1, y1);
+    let bottom_right = challenge_point(x2, y2);
+    let center = Vec2::new(
+        (top_left.x + bottom_right.x) / 2.0 - 320.0,
+        300.0 - (top_left.y + bottom_right.y) / 2.0,
+    );
+    let size = Vec2::new(bottom_right.x - top_left.x, bottom_right.y - top_left.y);
+    (center, size)
+}
+
+fn challenge_rect_center(x1: f32, y1: f32, x2: f32, y2: f32) -> Vec2 {
+    challenge_rect(x1, y1, x2, y2).0
+}
+
+fn spawn_challenge_screen_rect(
+    commands: &mut Commands,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    color: Color,
+    z: f32,
+) {
+    spawn_challenge_rect(commands, challenge_screen_rect(x1, y1, x2, y2), color, z);
+}
+
+fn challenge_screen_rect(x1: f32, y1: f32, x2: f32, y2: f32) -> (Vec2, Vec2) {
+    let center = Vec2::new((x1 + x2) / 2.0 - 320.0, 300.0 - (y1 + y2) / 2.0);
+    let size = Vec2::new(x2 - x1, y2 - y1);
+    (center, size)
+}
+
+fn challenge_screen_world(x: f32, y: f32) -> Vec2 {
+    Vec2::new(x - 320.0, 300.0 - y)
+}
+
+fn challenge_world(x: f32, y: f32) -> Vec2 {
+    let point = challenge_point(x, y);
+    Vec2::new(point.x - 320.0, 300.0 - point.y)
+}
+
+fn challenge_point(x: f32, y: f32) -> Vec2 {
+    Vec2::new(x * 0.8, y * 6.0 / 7.0)
+}
+
+fn spawn_about_shell(commands: &mut Commands, theme: &LoadedTheme, asset_server: &AssetServer) {
+    let text_assets = ThemeTextAssets {
+        theme,
+        asset_server,
+    };
+    commands.spawn((
+        Sprite::from_color(theme.about.background, Vec2::new(640.0, 600.0)),
+        Transform::from_xyz(0.0, 34.0, 0.0),
+        Visibility::Hidden,
+        ThemedColorSprite {
+            role: ThemedColorSpriteRole::AboutBackground,
+        },
+        AboutShell,
+        ScreenShell,
+    ));
+
+    for x in [113.0, 527.0] {
+        commands.spawn((
+            Sprite::from_image(asset_server.load(theme.sprites.crest.clone())),
+            about_transform(x, 181.0, 1.0),
+            Visibility::Hidden,
+            ThemedSprite {
+                role: ThemedSpriteRole::AboutIcon,
+            },
+            AboutShell,
+            ScreenShell,
+        ));
+    }
+
+    spawn_about_text(
+        commands,
+        text_assets,
+        "BattleTris",
+        Vec2::new(320.0, 60.0),
+        12.0,
+        theme.about.title_text,
+        ThemedTextColorRole::AboutTitle,
+    );
+    spawn_about_text(
+        commands,
+        text_assets,
+        "Version 1.0",
+        Vec2::new(320.0, 124.0),
+        11.0,
+        theme.about.title_text,
+        ThemedTextColorRole::AboutTitle,
+    );
+    spawn_about_text(
+        commands,
+        text_assets,
+        "Bryan Cantrill",
+        Vec2::new(320.0, 156.0),
+        11.0,
+        theme.about.name_text,
+        ThemedTextColorRole::AboutName,
+    );
+    spawn_about_text(
+        commands,
+        text_assets,
+        "Charlie Hoecker",
+        Vec2::new(320.0, 190.0),
+        11.0,
+        theme.about.name_text,
+        ThemedTextColorRole::AboutName,
+    );
+    spawn_about_text(
+        commands,
+        text_assets,
+        "Mike Shapiro",
+        Vec2::new(320.0, 225.0),
+        11.0,
+        theme.about.name_text,
+        ThemedTextColorRole::AboutName,
+    );
+    spawn_about_text(
+        commands,
+        text_assets,
+        "battletris@cs.brown.edu",
+        Vec2::new(320.0, 261.0),
+        11.0,
+        theme.about.name_text,
+        ThemedTextColorRole::AboutName,
+    );
+
+    for (text, y) in [
+        (
+            "BattleTris Copyright (c) 1993-1997 Bryan Cantrill, Charles Hoecker, Michael Shapiro.",
+            306.0,
+        ),
+        ("Special thanks to:", 328.0),
+        (
+            "Libby \"Hoss the Camel\" Cantrill, for many ideas and extensive play-testing",
+            351.0,
+        ),
+        ("Drew Davis, for great advice early on", 374.0),
+        (
+            "Tony, for cleaning up our empty Mountain Dew bottles",
+            397.0,
+        ),
+        (
+            "botrytis, pebbles and barney for many long and passionate nights",
+            420.0,
+        ),
+        (
+            "The original BT beta testers:  Ben, Caffer, Masi, Dave, Scott and Todd",
+            443.0,
+        ),
+        ("and of course", 466.0),
+        ("Kevin \"shouldn't there be a paren there?\" Regan", 489.0),
+    ] {
+        spawn_about_text(
+            commands,
+            text_assets,
+            text,
+            Vec2::new(320.0, y),
+            10.0,
+            theme.about.credit_text,
+            ThemedTextColorRole::AboutCredit,
+        );
+    }
+
+    spawn_about_button_bevel(commands, theme);
+}
+
+fn spawn_about_button_bevel(commands: &mut Commands, theme: &LoadedTheme) {
+    let button = theme.layout.rects.about_ok;
+    let center = button.center();
+    let half = button.size() / 2.0;
+
+    for (offset, size, color) in [
+        (
+            Vec2::new(0.0, half.y),
+            Vec2::new(button.width, 2.0),
+            theme.about.button_highlight,
+        ),
+        (
+            Vec2::new(-half.x, 0.0),
+            Vec2::new(2.0, button.height),
+            theme.about.button_highlight,
+        ),
+        (
+            Vec2::new(0.0, -half.y),
+            Vec2::new(button.width, 2.0),
+            theme.about.button_shadow,
+        ),
+        (
+            Vec2::new(half.x, 0.0),
+            Vec2::new(2.0, button.height),
+            theme.about.button_shadow,
+        ),
+    ] {
+        commands.spawn((
+            Sprite::from_color(color, size),
+            Transform::from_xyz(center.x + offset.x, center.y + offset.y, 3.5),
+            Visibility::Hidden,
+            ThemedColorSprite {
+                role: if offset.x < 0.0 || offset.y > 0.0 {
+                    ThemedColorSpriteRole::ButtonHighlight
+                } else {
+                    ThemedColorSpriteRole::ButtonShadow
+                },
+            },
+            AboutShell,
+            ScreenShell,
+        ));
+    }
+}
+
+fn spawn_about_text(
+    commands: &mut Commands,
+    text_assets: ThemeTextAssets,
+    text: &'static str,
+    position: Vec2,
+    font_size: f32,
+    color: Color,
+    color_role: ThemedTextColorRole,
+) {
+    commands.spawn((
+        Text2d::new(text),
+        text_assets.font(ThemedTextFontRole::Body, font_size),
+        TextColor(color),
+        ThemedTextColor { role: color_role },
+        ThemedTextMetrics,
+        about_transform(position.x, position.y, 5.0),
+        Visibility::Hidden,
+        AboutShell,
+        ScreenShell,
+    ));
+}
+
+fn about_transform(x: f32, y: f32, z: f32) -> Transform {
+    Transform::from_xyz(x - 320.0, 334.0 - y, z)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1868,9 +4873,32 @@ struct MenuButtonSpec {
     action: MenuAction,
 }
 
-fn spawn_menu_button(commands: &mut Commands, theme: &LoadedTheme, spec: MenuButtonSpec) {
+fn spawn_menu_button(
+    commands: &mut Commands,
+    theme: &LoadedTheme,
+    asset_server: &AssetServer,
+    spec: MenuButtonSpec,
+) {
+    let button_color = if spec.screen == ClientScreen::Startup {
+        motif_button_face_color()
+    } else if spec.screen == ClientScreen::About {
+        theme.about.button_face
+    } else if spec.screen == ClientScreen::Challenge || spec.screen == ClientScreen::Roster {
+        motif_button_face_color()
+    } else {
+        theme.button.normal
+    };
+    let text_color = if spec.screen == ClientScreen::Startup {
+        motif_blue_color()
+    } else if spec.screen == ClientScreen::About {
+        theme.about.button_text
+    } else if spec.screen == ClientScreen::Challenge || spec.screen == ClientScreen::Roster {
+        motif_blue_color()
+    } else {
+        theme.button.text
+    };
     commands.spawn((
-        Sprite::from_color(theme.button.normal, spec.size),
+        Sprite::from_color(button_color, spec.size),
         Transform::from_xyz(spec.center.x, spec.center.y, 3.0),
         ButtonFace,
         MenuButton {
@@ -1880,11 +4908,42 @@ fn spawn_menu_button(commands: &mut Commands, theme: &LoadedTheme, spec: MenuBut
         },
         ScreenShell,
     ));
-    commands.spawn((
+    if spec.screen == ClientScreen::Startup {
+        spawn_startup_button_bevel(commands, spec.center, spec.size);
+        if matches!(spec.action, MenuAction::GoTo(ClientScreen::Challenge)) {
+            spawn_startup_focus_outline(commands, spec.center, spec.size);
+        }
+    } else if spec.screen == ClientScreen::Challenge {
+        spawn_challenge_button_bevel(commands, spec.center, spec.size);
+    } else if spec.screen == ClientScreen::Roster {
+        spawn_roster_bevel(commands, spec.center, spec.size, 3.5, MotifBevel::Raised);
+    }
+    let text_font = if spec.screen == ClientScreen::Startup
+        || spec.screen == ClientScreen::Challenge
+        || spec.screen == ClientScreen::Roster
+    {
+        themed_text_font_at_size(theme, ThemedTextFontRole::Button, 12.0, asset_server)
+    } else {
+        themed_text_font(theme, ThemedTextFontRole::Button, asset_server)
+    };
+    let mut text_entity = commands.spawn((
         Text2d::new(spec.label),
-        TextFont::from_font_size(17.0),
-        TextColor(theme.button.text),
-        Transform::from_xyz(spec.center.x, spec.center.y - 5.0, 4.0),
+        text_font,
+        TextColor(text_color),
+        ThemedTextColor {
+            role: if spec.screen == ClientScreen::Startup {
+                ThemedTextColorRole::ScreenBody
+            } else if spec.screen == ClientScreen::About {
+                ThemedTextColorRole::AboutButton
+            } else if spec.screen == ClientScreen::Challenge || spec.screen == ClientScreen::Roster
+            {
+                ThemedTextColorRole::ScreenBody
+            } else {
+                ThemedTextColorRole::Button
+            },
+        },
+        ThemedTextMetrics,
+        Transform::from_xyz(spec.center.x, spec.center.y, 4.0),
         MenuButton {
             screen: spec.screen,
             rect: spec.rect(),
@@ -1892,6 +4951,89 @@ fn spawn_menu_button(commands: &mut Commands, theme: &LoadedTheme, spec: MenuBut
         },
         ScreenShell,
     ));
+    if spec.screen != ClientScreen::Startup
+        && spec.screen != ClientScreen::Challenge
+        && spec.screen != ClientScreen::Roster
+    {
+        text_entity.insert(ThemedTextFont {
+            role: ThemedTextFontRole::Button,
+        });
+    }
+}
+
+fn spawn_startup_button_bevel(commands: &mut Commands, center: Vec2, size: Vec2) {
+    spawn_startup_bevel(commands, center, size, 3.5, MotifBevel::Raised);
+}
+
+fn spawn_startup_focus_outline(commands: &mut Commands, center: Vec2, size: Vec2) {
+    let outline_size = size + Vec2::splat(2.0);
+    for (offset, segment_size) in [
+        (
+            Vec2::new(0.0, outline_size.y / 2.0),
+            Vec2::new(outline_size.x, 2.0),
+        ),
+        (
+            Vec2::new(-outline_size.x / 2.0, 0.0),
+            Vec2::new(2.0, outline_size.y),
+        ),
+        (
+            Vec2::new(0.0, -outline_size.y / 2.0),
+            Vec2::new(outline_size.x, 2.0),
+        ),
+        (
+            Vec2::new(outline_size.x / 2.0, 0.0),
+            Vec2::new(2.0, outline_size.y),
+        ),
+    ] {
+        commands.spawn((
+            Sprite::from_color(motif_blue_color(), segment_size),
+            Transform::from_xyz(center.x + offset.x, center.y + offset.y, 3.6),
+            StartupOnlyShell,
+            ScreenShell,
+        ));
+    }
+}
+
+fn spawn_startup_bevel(
+    commands: &mut Commands,
+    center: Vec2,
+    size: Vec2,
+    z: f32,
+    bevel: MotifBevel,
+) {
+    let (top_left, bottom_right) = match bevel {
+        MotifBevel::Raised => (motif_highlight_color(), motif_shadow_color()),
+        MotifBevel::Inset => (motif_shadow_color(), motif_highlight_color()),
+    };
+    for (offset, bevel_size, bevel_color) in [
+        (
+            Vec2::new(0.0, size.y / 2.0),
+            Vec2::new(size.x, 2.0),
+            top_left,
+        ),
+        (
+            Vec2::new(-size.x / 2.0, 0.0),
+            Vec2::new(2.0, size.y),
+            top_left,
+        ),
+        (
+            Vec2::new(0.0, -size.y / 2.0),
+            Vec2::new(size.x, 2.0),
+            bottom_right,
+        ),
+        (
+            Vec2::new(size.x / 2.0, 0.0),
+            Vec2::new(2.0, size.y),
+            bottom_right,
+        ),
+    ] {
+        commands.spawn((
+            Sprite::from_color(bevel_color, bevel_size),
+            Transform::from_xyz(center.x + offset.x, center.y + offset.y, z),
+            StartupOnlyShell,
+            ScreenShell,
+        ));
+    }
 }
 
 impl MenuButtonSpec {
@@ -1900,118 +5042,108 @@ impl MenuButtonSpec {
     }
 }
 
-fn startup_buttons() -> [MenuButtonSpec; 7] {
-    let size = Vec2::new(150.0, 34.0);
+fn spawn_challenge_button_bevel(commands: &mut Commands, center: Vec2, size: Vec2) {
+    spawn_challenge_bevel(commands, center, size, 3.5, MotifBevel::Raised);
+}
+
+fn startup_buttons(theme: &LoadedTheme) -> [MenuButtonSpec; 5] {
+    let rects = theme.layout.rects;
     [
         MenuButtonSpec {
             screen: ClientScreen::Startup,
             label: "Challenge",
-            center: Vec2::new(210.0, 120.0),
-            size,
+            center: rects.startup_challenge.center(),
+            size: rects.startup_challenge.size(),
             action: MenuAction::GoTo(ClientScreen::Challenge),
         },
         MenuButtonSpec {
             screen: ClientScreen::Startup,
             label: "Sleep",
-            center: Vec2::new(210.0, 75.0),
-            size,
+            center: rects.startup_sleep.center(),
+            size: rects.startup_sleep.size(),
             action: MenuAction::GoTo(ClientScreen::Sleep),
         },
         MenuButtonSpec {
             screen: ClientScreen::Startup,
             label: "About",
-            center: Vec2::new(210.0, 30.0),
-            size,
+            center: rects.startup_about.center(),
+            size: rects.startup_about.size(),
             action: MenuAction::GoTo(ClientScreen::About),
         },
         MenuButtonSpec {
             screen: ClientScreen::Startup,
             label: "Roster",
-            center: Vec2::new(210.0, -15.0),
-            size,
+            center: rects.startup_roster.center(),
+            size: rects.startup_roster.size(),
             action: MenuAction::GoTo(ClientScreen::Roster),
         },
         MenuButtonSpec {
             screen: ClientScreen::Startup,
             label: "Quit",
-            center: Vec2::new(210.0, -60.0),
-            size,
+            center: rects.startup_quit.center(),
+            size: rects.startup_quit.size(),
             action: MenuAction::Quit,
-        },
-        MenuButtonSpec {
-            screen: ClientScreen::Startup,
-            label: "Local Game",
-            center: Vec2::new(210.0, -125.0),
-            size,
-            action: MenuAction::StartHumanVsHuman,
-        },
-        MenuButtonSpec {
-            screen: ClientScreen::Startup,
-            label: "Play Ernie",
-            center: Vec2::new(210.0, -170.0),
-            size,
-            action: MenuAction::StartHumanVsComputer,
         },
     ]
 }
 
-fn secondary_screen_buttons() -> [MenuButtonSpec; 8] {
-    let size = Vec2::new(132.0, 32.0);
+fn secondary_screen_buttons(theme: &LoadedTheme) -> [MenuButtonSpec; 8] {
+    let rects = theme.layout.rects;
     [
         MenuButtonSpec {
             screen: ClientScreen::Challenge,
-            label: "Level -",
-            center: Vec2::new(-85.0, -118.0),
-            size,
-            action: MenuAction::AdjustErnieDifficulty(-1),
+            label: "Challenge",
+            center: rects.challenge_level_down.center(),
+            size: rects.challenge_level_down.size(),
+            action: MenuAction::GoTo(ClientScreen::Challenge),
         },
         MenuButtonSpec {
             screen: ClientScreen::Challenge,
-            label: "Level +",
-            center: Vec2::new(52.0, -118.0),
-            size,
-            action: MenuAction::AdjustErnieDifficulty(1),
+            label: "Update",
+            center: rects.challenge_level_up.center(),
+            size: rects.challenge_level_up.size(),
+            action: MenuAction::GoTo(ClientScreen::Challenge),
         },
         MenuButtonSpec {
             screen: ClientScreen::Challenge,
             label: "Play Ernie",
-            center: Vec2::new(200.0, -168.0),
-            size,
+            center: rects.challenge_play_ernie.center(),
+            size: rects.challenge_play_ernie.size(),
             action: MenuAction::StartHumanVsComputer,
         },
         MenuButtonSpec {
             screen: ClientScreen::Challenge,
-            label: "Back",
-            center: Vec2::new(52.0, -168.0),
-            size,
+            label: "Cancel",
+            center: rects.challenge_back.center(),
+            size: rects.challenge_back.size(),
             action: MenuAction::GoTo(ClientScreen::Startup),
         },
         MenuButtonSpec {
             screen: ClientScreen::Sleep,
             label: "Wake",
-            center: Vec2::new(52.0, -168.0),
-            size,
+            center: rects.sleep_wake.center(),
+            size: rects.sleep_wake.size(),
             action: MenuAction::GoTo(ClientScreen::Startup),
         },
         MenuButtonSpec {
             screen: ClientScreen::About,
             label: "OK",
-            center: Vec2::new(52.0, -168.0),
-            size,
+            center: rects.about_ok.center(),
+            size: rects.about_ok.size(),
             action: MenuAction::GoTo(ClientScreen::Startup),
         },
         MenuButtonSpec {
             screen: ClientScreen::Roster,
-            label: "Back",
-            center: Vec2::new(52.0, -168.0),
-            size,
+            label: "Done",
+            center: rects.roster_back.center(),
+            size: rects.roster_back.size(),
             action: MenuAction::GoTo(ClientScreen::Startup),
         },
         MenuButtonSpec {
             screen: ClientScreen::Settings,
             label: "Back",
-            center: Vec2::new(52.0, -168.0),
-            size,
+            center: rects.settings_back.center(),
+            size: rects.settings_back.size(),
             action: MenuAction::GoTo(ClientScreen::Startup),
         },
     ]
@@ -2020,6 +5152,7 @@ fn secondary_screen_buttons() -> [MenuButtonSpec; 8] {
 fn spawn_player_view(
     commands: &mut Commands,
     theme: &LoadedTheme,
+    atlas: &ThemeAtlasImageHandle,
     player: PlayerId,
     left: f32,
     label: &str,
@@ -2030,13 +5163,7 @@ fn spawn_player_view(
     let center_y = theme.layout.board.top - height / 2.0;
 
     commands.spawn((
-        Sprite::from_color(
-            theme.palette.board_background,
-            Vec2::new(
-                width + theme.cell.shadow * 4.0,
-                height + theme.cell.shadow * 4.0,
-            ),
-        ),
+        Sprite::from_color(theme.palette.board_background, Vec2::new(width, height)),
         Transform::from_xyz(center_x, center_y, -1.0),
         PlayerViewEntity { player },
         GameEntity,
@@ -2044,11 +5171,9 @@ fn spawn_player_view(
 
     for y in 0..BOARD_HEIGHT {
         for x in 0..BOARD_WIDTH {
+            let cell_sprite = empty_cell_sprite(theme);
             commands.spawn((
-                Sprite::from_color(
-                    theme.palette.empty,
-                    Vec2::splat((theme.cell.size - theme.cell.gap).max(1.0)),
-                ),
+                board_cell_sprite(theme, atlas, cell_sprite),
                 Transform::from_xyz(cell_x(theme, left, x), cell_y(theme, y), 0.0),
                 BoardCell { player, x, y },
                 PlayerViewEntity { player },
@@ -2057,24 +5182,7 @@ fn spawn_player_view(
         }
     }
 
-    commands.spawn((
-        Text2d::new(label),
-        TextFont::from_font_size(24.0),
-        TextColor(theme.palette.text_primary),
-        Transform::from_xyz(center_x, theme.layout.board.top + 34.0, 5.0),
-        PlayerViewEntity { player },
-        GameEntity,
-    ));
-
-    commands.spawn((
-        Text2d::new(""),
-        TextFont::from_font_size(15.0),
-        TextColor(theme.palette.text_secondary),
-        Transform::from_xyz(center_x, theme.layout.board.top - height - 44.0, 5.0),
-        HudText { player },
-        PlayerViewEntity { player },
-        GameEntity,
-    ));
+    let _ = (center_x, height, label);
 }
 
 #[derive(SystemParam)]
@@ -2133,6 +5241,7 @@ struct MouseButtonParams<'w, 's> {
     buttons: Query<'w, 's, &'static MenuButton>,
     local: ResMut<'w, LocalGame>,
     settings: ResMut<'w, ClientSettings>,
+    themes: Res<'w, ThemePacks>,
     sound: ResMut<'w, SoundEventState>,
     bazaar_ui: ResMut<'w, BazaarUiState>,
     app_exit: MessageWriter<'w, AppExit>,
@@ -2155,7 +5264,14 @@ fn handle_mouse_buttons(mut input: MouseButtonParams) {
     );
     if input.settings.screen == ClientScreen::Game && input.local.game.phase() == GamePhase::Bazaar
     {
-        handle_bazaar_click(world, &mut input.local.game, &mut input.bazaar_ui);
+        let theme = input.themes.get(input.settings.theme);
+        handle_bazaar_click(
+            world,
+            theme,
+            &mut input.local.game,
+            &mut input.bazaar_ui,
+            input.settings.content_mode,
+        );
         return;
     }
     let Some(button) = input
@@ -2183,18 +5299,10 @@ fn apply_menu_action(
     app_exit: &mut MessageWriter<AppExit>,
 ) {
     match action {
-        MenuAction::StartHumanVsHuman => {
-            *local = LocalGame::new_human_vs_human();
-            settings.screen = ClientScreen::Game;
-            sound.next_log_index = 0;
-        }
         MenuAction::StartHumanVsComputer => {
             *local = LocalGame::new_human_vs_computer(settings.ernie_level);
             settings.screen = ClientScreen::Game;
             sound.next_log_index = 0;
-        }
-        MenuAction::AdjustErnieDifficulty(step) => {
-            adjust_ernie_level(settings, step);
         }
         MenuAction::GoTo(screen) => settings.screen = screen,
         MenuAction::Quit => {
@@ -2256,6 +5364,11 @@ fn handle_startup_input(
         sound.next_log_index = 0;
         queue_sound(sound, SoundEvent::MenuAction);
     }
+    if keys.just_pressed(KeyCode::KeyT) {
+        toggle_theme(settings);
+        settings.save();
+        queue_sound(sound, SoundEvent::MenuAction);
+    }
 }
 
 fn handle_challenge_input(
@@ -2288,10 +5401,7 @@ fn handle_settings_input(
     let previous = settings.persisted();
 
     if keys.just_pressed(KeyCode::KeyT) {
-        settings.theme = match settings.theme {
-            ThemeChoice::OriginalInspired => ThemeChoice::HighContrast,
-            ThemeChoice::HighContrast => ThemeChoice::OriginalInspired,
-        };
+        toggle_theme(settings);
         queue_sound(sound, SoundEvent::MenuAction);
     }
     if keys.just_pressed(KeyCode::KeyO) {
@@ -2357,7 +5467,7 @@ fn handle_game_input(
     }
 
     if local.game.phase() == GamePhase::Bazaar {
-        handle_bazaar_input(keys, &mut local.game, bazaar_ui);
+        handle_bazaar_input(keys, &mut local.game, bazaar_ui, settings.content_mode);
         return;
     }
 
@@ -2491,21 +5601,38 @@ fn handle_bazaar_input(
     keys: &ButtonInput<KeyCode>,
     game: &mut TwoPlayerGame,
     bazaar_ui: &mut BazaarUiState,
+    content_mode: ContentMode,
 ) {
     if keys.just_pressed(KeyCode::Enter) {
         match game.bazaar_done(PlayerId::One) {
             events if events.is_empty() => {
-                bazaar_ui.last_message = "Player 1 is already waiting.".to_string()
+                bazaar_ui.last_message = UiTextTone::bazaar_waiting_copy(
+                    content_mode,
+                    BazaarWaitingText::PlayerRepeated(PlayerId::One),
+                )
             }
-            _ => bazaar_ui.last_message = "Player 1 done. Waiting for opponent.".to_string(),
+            _ => {
+                bazaar_ui.last_message = UiTextTone::bazaar_waiting_copy(
+                    content_mode,
+                    BazaarWaitingText::PlayerWaiting(PlayerId::One),
+                )
+            }
         }
     }
     if keys.just_pressed(KeyCode::Space) {
         match game.bazaar_done(PlayerId::Two) {
             events if events.is_empty() => {
-                bazaar_ui.last_message = "Player 2 is already waiting.".to_string()
+                bazaar_ui.last_message = UiTextTone::bazaar_waiting_copy(
+                    content_mode,
+                    BazaarWaitingText::PlayerRepeated(PlayerId::Two),
+                )
             }
-            _ => bazaar_ui.last_message = "Player 2 done. Waiting for opponent.".to_string(),
+            _ => {
+                bazaar_ui.last_message = UiTextTone::bazaar_waiting_copy(
+                    content_mode,
+                    BazaarWaitingText::PlayerWaiting(PlayerId::Two),
+                )
+            }
         }
     }
 
@@ -2749,7 +5876,9 @@ fn play_sound_events(
     }
 
     for event in std::mem::take(&mut sound.pending_events) {
-        let Some(sound_event) = sound_packs.sound_for(settings.sound_pack, event) else {
+        let Some(sound_event) =
+            sound_packs.sound_for(settings.sound_pack, settings.content_mode, event)
+        else {
             continue;
         };
         commands.spawn((
@@ -2759,14 +5888,36 @@ fn play_sound_events(
     }
 }
 
-type HudTextQuery<'w, 's> =
-    Query<'w, 's, (&'static HudText, &'static mut Text2d), (Without<PhaseText>, Without<MenuText>)>;
+type HudTextQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static HudText, &'static mut Text2d),
+    (Without<PhaseText>, Without<MenuText>, Without<RosterText>),
+>;
 
-type PhaseTextSingle<'w, 's> =
-    Single<'w, 's, &'static mut Text2d, (With<PhaseText>, Without<HudText>, Without<MenuText>)>;
+type PhaseTextSingle<'w, 's> = Single<
+    'w,
+    's,
+    &'static mut Text2d,
+    (
+        With<PhaseText>,
+        Without<HudText>,
+        Without<MenuText>,
+        Without<RosterText>,
+    ),
+>;
 
-type MenuTextSingle<'w, 's> =
-    Single<'w, 's, &'static mut Text2d, (With<MenuText>, Without<HudText>, Without<PhaseText>)>;
+type MenuTextSingle<'w, 's> = Single<
+    'w,
+    's,
+    &'static mut Text2d,
+    (
+        With<MenuText>,
+        Without<HudText>,
+        Without<PhaseText>,
+        Without<RosterText>,
+    ),
+>;
 
 type ScreenTextSingle<'w, 's> = Single<
     'w,
@@ -2777,26 +5928,111 @@ type ScreenTextSingle<'w, 's> = Single<
         Without<MenuText>,
         Without<HudText>,
         Without<PhaseText>,
+        Without<RosterText>,
     ),
 >;
 
-type BazaarTextSingle<'w, 's> = Single<
+type BazaarTextQuery<'w, 's> = Query<
     'w,
     's,
-    &'static mut Text2d,
+    (&'static BazaarText, &'static mut Text2d),
     (
         With<BazaarText>,
         Without<MenuText>,
         Without<HudText>,
         Without<PhaseText>,
         Without<ScreenText>,
+        Without<RosterText>,
     ),
 >;
+
+type LegacyGameTextQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static LegacyGameText, &'static mut Text2d),
+    (
+        Without<MenuText>,
+        Without<HudText>,
+        Without<PhaseText>,
+        Without<ScreenText>,
+        Without<BazaarText>,
+        Without<ChallengeText>,
+        Without<MenuButton>,
+        Without<RosterText>,
+    ),
+>;
+
+type ChallengeTextQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static ChallengeText, &'static mut Text2d),
+    (
+        Without<MenuText>,
+        Without<HudText>,
+        Without<PhaseText>,
+        Without<ScreenText>,
+        Without<BazaarText>,
+        Without<MenuButton>,
+        Without<RosterText>,
+    ),
+>;
+
+type RosterTextQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static RosterText, &'static mut Text2d),
+    (
+        Without<MenuText>,
+        Without<HudText>,
+        Without<PhaseText>,
+        Without<ScreenText>,
+        Without<BazaarText>,
+        Without<LegacyGameText>,
+        Without<ChallengeText>,
+        Without<MenuButton>,
+    ),
+>;
+
+type MenuButtonTextQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static MenuButton, &'static mut Text2d),
+    (
+        Without<MenuText>,
+        Without<HudText>,
+        Without<PhaseText>,
+        Without<ScreenText>,
+        Without<BazaarText>,
+        Without<ChallengeText>,
+        Without<RosterText>,
+    ),
+>;
+
+type ChallengeSliderKnobQuery<'w, 's> =
+    Query<'w, 's, (&'static ChallengeSliderKnob, &'static mut Transform), Without<Text2d>>;
+
+type BazaarSelectionMarkerQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static BazaarSelectionMarker, &'static mut Transform),
+    Without<ChallengeSliderKnob>,
+>;
+
+type TextMetricsQuery<'w, 's> =
+    Query<'w, 's, (&'static mut LineHeight, &'static mut LetterSpacing), With<ThemedTextMetrics>>;
 
 type ShellVisibilityQuery<'w, 's> = Query<
     'w,
     's,
-    (&'static mut Visibility, Option<&'static MenuButton>),
+    (
+        &'static mut Visibility,
+        Option<&'static MenuButton>,
+        Option<&'static GenericScreenShell>,
+        Option<&'static StartupOnlyShell>,
+        Option<&'static AboutShell>,
+        Option<&'static ChallengeShell>,
+        Option<&'static RosterShell>,
+    ),
     (With<ScreenShell>, Without<GameEntity>),
 >;
 
@@ -2807,6 +6043,7 @@ type GameVisibilityQuery<'w, 's> = Query<
         &'static mut Visibility,
         Option<&'static PlayerViewEntity>,
         Option<&'static BazaarEntity>,
+        Option<&'static PlayingGameEntity>,
     ),
     With<GameEntity>,
 >;
@@ -2817,23 +6054,36 @@ struct RenderGameParams<'w, 's> {
     settings: Res<'w, ClientSettings>,
     roster: Res<'w, RosterRecords>,
     themes: Res<'w, ThemePacks>,
+    atlases: Res<'w, ThemeAtlasHandles>,
     sound: Res<'w, SoundEventState>,
     bazaar_ui: Res<'w, BazaarUiState>,
     clear_color: ResMut<'w, ClearColor>,
     recon: Res<'w, ReconPanel>,
     cells: Query<'w, 's, (&'static BoardCell, &'static mut Sprite)>,
+    text_metrics: TextMetricsQuery<'w, 's>,
     hud: HudTextQuery<'w, 's>,
     phase_text: PhaseTextSingle<'w, 's>,
     menu_text: MenuTextSingle<'w, 's>,
     screen_text: ScreenTextSingle<'w, 's>,
-    bazaar_text: BazaarTextSingle<'w, 's>,
+    bazaar_text: BazaarTextQuery<'w, 's>,
+    legacy_game_text: LegacyGameTextQuery<'w, 's>,
+    challenge_text: ChallengeTextQuery<'w, 's>,
+    roster_text: RosterTextQuery<'w, 's>,
+    menu_button_text: MenuButtonTextQuery<'w, 's>,
+    challenge_slider_knob: ChallengeSliderKnobQuery<'w, 's>,
+    bazaar_selection_marker: BazaarSelectionMarkerQuery<'w, 's>,
     reported_startup_render: Local<'s, bool>,
 }
 
 fn render_game(mut render: RenderGameParams) {
     let theme = render.themes.get(render.settings.theme);
+    let atlas = render.atlases.get(
+        render.settings.theme,
+        render.settings.content_mode,
+        &render.themes,
+    );
     for (cell, mut sprite) in &mut render.cells {
-        sprite.color = render_cell_color(
+        let cell_sprite = render_cell_sprite(
             &render.local,
             &render.recon,
             cell.player,
@@ -2841,9 +6091,20 @@ fn render_game(mut render: RenderGameParams) {
             cell.y,
             theme,
         );
+        sprite.image = atlas.image.clone();
+        sprite.texture_atlas = Some(TextureAtlas {
+            layout: atlas.layout.clone(),
+            index: cell_sprite.atlas_index,
+        });
+        sprite.color = cell_sprite.tint;
         sprite.custom_size = Some(Vec2::splat(
             ((theme.cell.size - theme.cell.gap) * render.settings.pixel_scale).max(1.0),
         ));
+    }
+
+    for (mut line_height, mut letter_spacing) in &mut render.text_metrics {
+        *line_height = LineHeight::RelativeToFont(theme.fonts.line_height);
+        *letter_spacing = LetterSpacing::Px(theme.fonts.tracking);
     }
 
     for (hud, mut text) in &mut render.hud {
@@ -2853,20 +6114,285 @@ fn render_game(mut render: RenderGameParams) {
     render.phase_text.0 = phase_label(&render.local, &render.settings, &render.sound);
     render.menu_text.0 = menu_label(&render.local.game, &render.settings);
     render.screen_text.0 = screen_body_label(&render.local.game, &render.settings, &render.roster);
-    render.bazaar_text.0 = bazaar_overlay_label(&render.local, &render.bazaar_ui);
+    for (bazaar_text, mut text) in &mut render.bazaar_text {
+        text.0 = bazaar_text_label(
+            bazaar_text.role,
+            &render.local,
+            &render.bazaar_ui,
+            render.settings.content_mode,
+        );
+    }
+    for (legacy_text, mut text) in &mut render.legacy_game_text {
+        text.0 = legacy_game_text_label(&render.local, &render.settings, legacy_text.role);
+    }
+    for (challenge_text, mut text) in &mut render.challenge_text {
+        text.0 = challenge_label(challenge_text.role, &render.settings);
+    }
+    for (roster_text, mut text) in &mut render.roster_text {
+        text.0 = roster_text_label(&render.roster, roster_text.role);
+    }
+    for (button, mut text) in &mut render.menu_button_text {
+        if button.screen == ClientScreen::Challenge
+            && matches!(button.action, MenuAction::StartHumanVsComputer)
+        {
+            text.0 = format!(
+                "Play {} Ernie",
+                selected_ernie_difficulty(&render.settings).name
+            );
+        }
+    }
+    for (knob, mut transform) in &mut render.challenge_slider_knob {
+        transform.translation.x = challenge_ernie_slider_x(&render.settings) + knob.x_offset;
+    }
+    for (marker, mut transform) in &mut render.bazaar_selection_marker {
+        transform.translation.y = bazaar_selection_marker_y(&render.bazaar_ui, marker.role);
+    }
     let menu_label_chars =
         render.menu_text.0.chars().count() + render.screen_text.0.chars().count();
-    let menu_is_unhealthy = render.settings.screen != ClientScreen::Game && menu_label_chars == 0;
+    let menu_is_unhealthy = render.settings.screen != ClientScreen::Game
+        && render.settings.screen != ClientScreen::Startup
+        && menu_label_chars == 0;
     render.clear_color.0 = if menu_is_unhealthy {
         Color::srgb(0.5, 0.0, 0.28)
+    } else if render.settings.screen == ClientScreen::Startup {
+        Color::BLACK
+    } else if render.settings.screen == ClientScreen::About {
+        theme.about.background
     } else {
-        theme.palette.background
+        theme.screen.background
     };
 
     if !*render.reported_startup_render {
         report_startup_render_health(render.settings.screen, menu_label_chars);
         *render.reported_startup_render = true;
     }
+}
+
+#[derive(SystemParam)]
+struct ThemeEntityQueries<'w, 's> {
+    sprites: Query<'w, 's, (&'static ThemedSprite, &'static mut Sprite)>,
+    color_sprites:
+        Query<'w, 's, (&'static ThemedColorSprite, &'static mut Sprite), Without<ThemedSprite>>,
+    text_colors: Query<'w, 's, (&'static ThemedTextColor, &'static mut TextColor)>,
+    text_fonts: Query<'w, 's, (&'static ThemedTextFont, &'static mut TextFont)>,
+}
+
+fn update_theme_entities(
+    settings: Res<ClientSettings>,
+    themes: Res<ThemePacks>,
+    asset_server: Res<AssetServer>,
+    mut active_theme: Local<Option<(ThemeChoice, ContentMode)>>,
+    mut themed: ThemeEntityQueries,
+) {
+    let active_key = (settings.theme, settings.content_mode);
+    if *active_theme == Some(active_key) {
+        return;
+    }
+    *active_theme = Some(active_key);
+
+    let theme = themes.get(settings.theme);
+    for (sprite_theme, mut sprite) in &mut themed.sprites {
+        sprite.image = asset_server.load(themed_sprite_path(
+            theme,
+            sprite_theme.role,
+            settings.content_mode,
+        ));
+    }
+    for (sprite_theme, mut sprite) in &mut themed.color_sprites {
+        sprite.color = themed_sprite_color(theme, sprite_theme.role);
+    }
+    for (text_theme, mut text_color) in &mut themed.text_colors {
+        text_color.0 = themed_text_color(theme, text_theme.role);
+    }
+    for (font_theme, mut text_font) in &mut themed.text_fonts {
+        *text_font = themed_text_font(theme, font_theme.role, &asset_server);
+    }
+}
+
+fn update_challenge_logo_texture(
+    settings: Res<ClientSettings>,
+    themes: Res<ThemePacks>,
+    asset_server: Res<AssetServer>,
+    mut images: ResMut<Assets<Image>>,
+    mut cache: Local<ChallengeLogoTextureCache>,
+    mut logos: Query<&mut Sprite, With<ChallengeLogo>>,
+) {
+    if logos.is_empty() {
+        return;
+    }
+
+    let logo = if let Some(handle) = cache.get(settings.theme) {
+        handle
+    } else {
+        let raw_handle: Handle<Image> =
+            asset_server.load(themes.get(settings.theme).sprites.biff.clone());
+        let processed = images.get(&raw_handle).map(|source| {
+            let mut image = source.clone();
+            quantize_motif_ppm_image(&mut image);
+            image
+        });
+        if let Some(image) = processed {
+            let handle = images.add(image);
+            cache.set(settings.theme, handle.clone());
+            handle
+        } else {
+            raw_handle
+        }
+    };
+
+    for mut sprite in &mut logos {
+        sprite.image = logo.clone();
+    }
+}
+
+fn quantize_motif_ppm_image(image: &mut Image) {
+    let Some(data) = image.data.as_mut() else {
+        return;
+    };
+    match image.texture_descriptor.format {
+        TextureFormat::Rgba8Unorm
+        | TextureFormat::Rgba8UnormSrgb
+        | TextureFormat::Bgra8Unorm
+        | TextureFormat::Bgra8UnormSrgb => {
+            for pixel in data.chunks_exact_mut(4) {
+                pixel[0] = quantize_motif_ppm_component(pixel[0]);
+                pixel[1] = quantize_motif_ppm_component(pixel[1]);
+                pixel[2] = quantize_motif_ppm_component(pixel[2]);
+            }
+            image.sampler = ImageSampler::nearest();
+        }
+        _ => {}
+    }
+}
+
+fn quantize_motif_ppm_component(value: u8) -> u8 {
+    let max = u8::MAX as u16;
+    let bucket = value as u16 * 4 / max;
+    (bucket * max / 4) as u8
+}
+
+fn themed_sprite_path(
+    theme: &LoadedTheme,
+    role: ThemedSpriteRole,
+    _content_mode: ContentMode,
+) -> String {
+    match role {
+        ThemedSpriteRole::Startup => theme.sprites.startup.clone(),
+        ThemedSpriteRole::Bazaar => theme.sprites.bazaar.clone(),
+        ThemedSpriteRole::Biff => theme.sprites.biff.clone(),
+        ThemedSpriteRole::AboutIcon => theme.sprites.crest.clone(),
+    }
+}
+
+fn themed_sprite_color(theme: &LoadedTheme, role: ThemedColorSpriteRole) -> Color {
+    match role {
+        ThemedColorSpriteRole::ScreenBackground => theme.screen.background,
+        ThemedColorSpriteRole::AboutBackground => theme.about.background,
+        ThemedColorSpriteRole::ButtonHighlight => theme.about.button_highlight,
+        ThemedColorSpriteRole::ButtonShadow => theme.about.button_shadow,
+    }
+}
+
+fn themed_text_color(theme: &LoadedTheme, role: ThemedTextColorRole) -> Color {
+    match role {
+        ThemedTextColorRole::Secondary => theme.palette.text_secondary,
+        ThemedTextColorRole::ScreenTitle => theme.screen.title_text,
+        ThemedTextColorRole::ScreenBody => theme.screen.body_text,
+        ThemedTextColorRole::Button => theme.button.text,
+        ThemedTextColorRole::AboutTitle => theme.about.title_text,
+        ThemedTextColorRole::AboutName => theme.about.name_text,
+        ThemedTextColorRole::AboutCredit => theme.about.credit_text,
+        ThemedTextColorRole::AboutButton => theme.about.button_text,
+    }
+}
+
+fn themed_text_font_size(theme: &LoadedTheme, role: ThemedTextFontRole) -> f32 {
+    match role {
+        ThemedTextFontRole::Title => theme.screen.title_font_size,
+        ThemedTextFontRole::Body => theme.screen.body_font_size,
+        ThemedTextFontRole::Button => theme.screen.button_font_size,
+        ThemedTextFontRole::Mono => theme.screen.body_font_size,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ThemeTextAssets<'a> {
+    theme: &'a LoadedTheme,
+    asset_server: &'a AssetServer,
+}
+
+impl ThemeTextAssets<'_> {
+    fn font(self, role: ThemedTextFontRole, font_size: f32) -> TextFont {
+        themed_text_font_at_size(self.theme, role, font_size, self.asset_server)
+    }
+}
+
+fn themed_text_font(
+    theme: &LoadedTheme,
+    role: ThemedTextFontRole,
+    asset_server: &AssetServer,
+) -> TextFont {
+    themed_text_font_at_size(
+        theme,
+        role,
+        themed_text_font_size(theme, role),
+        asset_server,
+    )
+}
+
+fn themed_text_font_at_size(
+    theme: &LoadedTheme,
+    role: ThemedTextFontRole,
+    font_size: f32,
+    asset_server: &AssetServer,
+) -> TextFont {
+    let font = pixel_text_font(font_size);
+    if let Some(path) = theme.fonts.path_for(role) {
+        font.with_font(asset_server.load(path.to_string()))
+    } else {
+        font
+    }
+}
+
+fn pixel_text_font(font_size: f32) -> TextFont {
+    TextFont::from_font_size(font_size)
+        .with_font_smoothing(FontSmoothing::None)
+        .with_font_weight(FontWeight::BOLD)
+}
+
+fn update_window_layout(
+    settings: Res<ClientSettings>,
+    local: Res<LocalGame>,
+    recon: Res<ReconPanel>,
+    themes: Res<ThemePacks>,
+    mut window: Single<&mut Window, With<PrimaryWindow>>,
+) {
+    let theme = themes.get(settings.theme);
+    let layout = active_window_layout(&settings, &local, &recon, theme);
+    let width = layout.width.round().max(1.0);
+    let height = layout.height.round().max(1.0);
+    if (window.resolution.width() - width).abs() > f32::EPSILON
+        || (window.resolution.height() - height).abs() > f32::EPSILON
+    {
+        window.resolution.set(width, height);
+    }
+}
+
+fn active_window_layout(
+    settings: &ClientSettings,
+    local: &LocalGame,
+    recon: &ReconPanel,
+    theme: &LoadedTheme,
+) -> ThemeWindowLayout {
+    if settings.screen == ClientScreen::Game {
+        if local.game.phase() == GamePhase::Bazaar {
+            return theme.layout.screens.bazaar;
+        }
+        if recon.manual_condor || recon.snapshot.is_some() {
+            return theme.layout.screens.game_recon;
+        }
+    }
+    theme.layout.screen(settings.screen)
 }
 
 fn update_screen_visibility(
@@ -2878,9 +6404,13 @@ fn update_screen_visibility(
 ) {
     let game_visible = settings.screen == ClientScreen::Game;
     let bazaar_visible = game_visible && local.game.phase() == GamePhase::Bazaar;
-    for (mut visibility, player_view, bazaar_entity) in &mut game_entities {
+    for (mut visibility, player_view, bazaar_entity, playing_entity) in &mut game_entities {
         let entity_visible = if bazaar_entity.is_some() {
             bazaar_visible
+        } else if bazaar_visible {
+            false
+        } else if playing_entity.is_some() {
+            true
         } else {
             player_view.is_none_or(|view| player_view_visible(&local, &recon, view.player))
         };
@@ -2891,8 +6421,35 @@ fn update_screen_visibility(
         };
     }
 
-    for (mut visibility, button) in &mut shell_entities {
-        let visible = !game_visible && button.is_none_or(|button| button.screen == settings.screen);
+    for (
+        mut visibility,
+        button,
+        generic_shell,
+        startup_only,
+        about_shell,
+        challenge_shell,
+        roster_shell,
+    ) in &mut shell_entities
+    {
+        let visible = !game_visible
+            && if let Some(button) = button {
+                button.screen == settings.screen
+            } else if challenge_shell.is_some() {
+                settings.screen == ClientScreen::Challenge
+            } else if about_shell.is_some() {
+                settings.screen == ClientScreen::About
+            } else if roster_shell.is_some() {
+                settings.screen == ClientScreen::Roster
+            } else if startup_only.is_some() {
+                settings.screen == ClientScreen::Startup
+            } else if generic_shell.is_some() {
+                settings.screen != ClientScreen::Startup
+                    && settings.screen != ClientScreen::About
+                    && settings.screen != ClientScreen::Challenge
+                    && settings.screen != ClientScreen::Roster
+            } else {
+                true
+            };
         *visibility = if visible {
             Visibility::Visible
         } else {
@@ -2904,6 +6461,7 @@ fn update_screen_visibility(
 fn player_view_visible(local: &LocalGame, recon: &ReconPanel, player: PlayerId) -> bool {
     player == local.local_player
         || local.computer.is_none()
+        || (local.computer.is_some() && player == opponent_player(local.local_player))
         || recon.manual_condor
         || recon.snapshot.is_some()
 }
@@ -2926,7 +6484,26 @@ fn update_menu_button_visuals(
     for (button, mut sprite) in &mut buttons {
         let hovered = button.screen == settings.screen
             && cursor.is_some_and(|cursor| button.rect.contains(cursor));
-        sprite.color = if hovered && mouse.pressed(MouseButton::Left) {
+        sprite.color = if button.screen == ClientScreen::About {
+            if hovered && mouse.pressed(MouseButton::Left) {
+                theme.about.button_shadow
+            } else if hovered {
+                theme.about.button_highlight
+            } else {
+                theme.about.button_face
+            }
+        } else if button.screen == ClientScreen::Startup
+            || button.screen == ClientScreen::Challenge
+            || button.screen == ClientScreen::Roster
+        {
+            if hovered && mouse.pressed(MouseButton::Left) {
+                motif_button_pressed_color()
+            } else if hovered {
+                motif_button_hover_color()
+            } else {
+                motif_button_face_color()
+            }
+        } else if hovered && mouse.pressed(MouseButton::Left) {
             theme.button.pressed
         } else if hovered {
             theme.button.hover
@@ -2938,7 +6515,7 @@ fn update_menu_button_visuals(
 
 fn report_startup_render_health(screen: ClientScreen, menu_label_chars: usize) {
     info!("BattleTris render health: screen={screen:?} menu_label_chars={menu_label_chars}");
-    if screen != ClientScreen::Game && menu_label_chars == 0 {
+    if screen != ClientScreen::Game && screen != ClientScreen::Startup && menu_label_chars == 0 {
         error!("BattleTris render health: non-game screen has empty menu text");
     }
 }
@@ -3173,14 +6750,37 @@ fn send_fast_drop(
     let _ = game.command(player, command);
 }
 
-fn render_cell_color(
+#[derive(Debug, Clone, Copy)]
+struct RenderedCellSprite {
+    atlas_index: usize,
+    tint: Color,
+}
+
+fn board_cell_sprite(
+    theme: &LoadedTheme,
+    atlas: &ThemeAtlasImageHandle,
+    cell_sprite: RenderedCellSprite,
+) -> Sprite {
+    let mut sprite = Sprite::from_atlas_image(
+        atlas.image.clone(),
+        TextureAtlas {
+            layout: atlas.layout.clone(),
+            index: cell_sprite.atlas_index,
+        },
+    );
+    sprite.color = cell_sprite.tint;
+    sprite.custom_size = Some(Vec2::splat((theme.cell.size - theme.cell.gap).max(1.0)));
+    sprite
+}
+
+fn render_cell_sprite(
     local: &LocalGame,
     recon: &ReconPanel,
     player: PlayerId,
     x: usize,
     y: usize,
     theme: &LoadedTheme,
-) -> Color {
+) -> RenderedCellSprite {
     if player != local.local_player && local.computer.is_some() {
         if recon.manual_condor {
             return local
@@ -3189,8 +6789,8 @@ fn render_cell_color(
                 .board()
                 .get(Coord { x, y })
                 .map_or_else(
-                    || empty_cell_color(theme),
-                    |cell| cell_color(cell, false, theme),
+                    || empty_cell_sprite(theme),
+                    |cell| cell_sprite(cell, false, theme),
                 );
         }
         if let Some(snapshot) = &recon.snapshot {
@@ -3201,11 +6801,11 @@ fn render_cell_color(
                 .copied()
                 .flatten()
                 .map_or_else(
-                    || empty_cell_color(theme),
-                    |cell| cell_color(cell, false, theme),
+                    || empty_cell_sprite(theme),
+                    |cell| cell_sprite(cell, false, theme),
                 );
         }
-        return empty_cell_color(theme);
+        return empty_cell_sprite(theme);
     }
 
     let piece_cell = local
@@ -3221,15 +6821,15 @@ fn render_cell_color(
         .map(|(_, cell)| cell);
 
     if let Some(cell) = piece_cell {
-        return cell_color(cell, true, theme);
+        return cell_sprite(cell, true, theme);
     }
 
     let Some(coord) = Coord::new(x, y) else {
-        return empty_cell_color(theme);
+        return empty_cell_sprite(theme);
     };
     local.game.player(player).board().get(coord).map_or_else(
-        || empty_cell_color(theme),
-        |cell| cell_color(cell, false, theme),
+        || empty_cell_sprite(theme),
+        |cell| cell_sprite(cell, false, theme),
     )
 }
 
@@ -3288,65 +6888,100 @@ fn recon_hud(game: &TwoPlayerGame, recon: &ReconPanel, player: PlayerId) -> Stri
     "opponent hidden\nuse Ames/Ace/Condor or press C for Condor in computer mode".to_string()
 }
 
-fn phase_label(local: &LocalGame, settings: &ClientSettings, sound: &SoundEventState) -> String {
+fn phase_label(_local: &LocalGame, settings: &ClientSettings, _sound: &SoundEventState) -> String {
     if settings.screen != ClientScreen::Game {
         return String::new();
     }
+    String::new()
+}
+
+fn legacy_game_text_label(
+    local: &LocalGame,
+    settings: &ClientSettings,
+    role: LegacyGameTextRole,
+) -> String {
+    if settings.screen != ClientScreen::Game || local.game.phase() == GamePhase::Bazaar {
+        return String::new();
+    }
+    match role {
+        LegacyGameTextRole::Score => legacy_score_label(local),
+        LegacyGameTextRole::ArsenalSlot(slot) => legacy_arsenal_slot_label(local, slot),
+        LegacyGameTextRole::Message => legacy_game_message_label(local, settings.content_mode),
+    }
+}
+
+fn legacy_score_label(local: &LocalGame) -> String {
     let game = &local.game;
+    let player = local.local_player;
+    let opponent = opponent_player(player);
+    let own = game.player(player);
+    let other = game.player(opponent);
+    format!(
+        "Your score:          {}\nOpponent's score:    {}\n\nYour lines:          {}\nOpponent's lines:    {}\n\nYour funds:          {}\nOpponent's funds:    {}\n\nLines 'til bazaar:   {}",
+        own.score(),
+        other.score(),
+        own.lines(),
+        other.lines(),
+        own.funds(),
+        other.funds(),
+        game.lines_until_bazaar(),
+    )
+}
 
-    let sound_label = sound
-        .last_event
-        .map(|event| format!("  sound {:?}", event))
-        .unwrap_or_default();
-    let mode = match game.mode() {
-        GameMode::HumanVsHuman => "human vs human",
-        GameMode::HumanVsComputer { .. } => "human vs computer (unranked)",
+fn legacy_arsenal_slot_label(local: &LocalGame, slot: usize) -> String {
+    let label = if slot == 9 { 0 } else { slot + 1 };
+    let Some(slot) = local
+        .game
+        .player(local.local_player)
+        .arsenal()
+        .slots()
+        .get(slot)
+        .copied()
+        .flatten()
+    else {
+        return format!(" {label}.  < Empty >");
     };
-    let status = local
-        .status_message
-        .as_ref()
-        .map(|message| format!("  {message}"))
-        .unwrap_or_default();
-    let weapon_status = latest_weapon_feedback(game)
-        .map(|message| format!("  {message}"))
-        .unwrap_or_default();
-    let common = format!(
-        "F1 menu  F2 challenge  F3 settings  Esc game  {mode}{sound_label}{status}{weapon_status}"
-    );
+    let suffix = if slot.quantity > 1 {
+        format!(" ({})", slot.quantity)
+    } else {
+        String::new()
+    };
+    format!(" {label}.  {}{suffix}", weapon_spec(slot.token).name)
+}
 
+fn legacy_game_message_label(local: &LocalGame, content_mode: ContentMode) -> String {
+    let game = &local.game;
+    if let Some(message) = latest_weapon_feedback(game) {
+        return message;
+    }
+    if let Some(message) = &local.status_message {
+        return message.clone();
+    }
     match game.phase() {
-        GamePhase::Playing => format!(
-            "{}\nP pause  R restart  controls {}  1-0 launch P1, Shift+1-0 launch P2",
-            common,
-            controls_label(settings.controls)
-        ),
-        GamePhase::Paused => format!("{common}\npaused  P resume  R restart"),
-        GamePhase::Bazaar => format!(
-            "{}\nbazaar  click rows/Add/Remove/DONE  Up/Down select  A add  X remove  Enter done",
-            common
-        ),
-        GamePhase::GameOver => game
-            .event_log()
-            .iter()
-            .rev()
-            .find_map(|logged| match logged.event {
-                BattleEvent::GameOver { winner, loser } => Some(format!(
-                    "{common}\n{winner:?} wins, {loser:?} loses  R restart"
-                )),
-                _ => None,
-            })
-            .unwrap_or_else(|| format!("{common}\ngame over  R restart")),
+        GamePhase::Playing => match game.mode() {
+            GameMode::HumanVsComputer { difficulty, .. } => {
+                format!("Playing {} Ernie", difficulty.name)
+            }
+            GameMode::HumanVsHuman => "Playing local game".to_string(),
+        },
+        GamePhase::Paused => "Paused...".to_string(),
+        GamePhase::Bazaar => String::new(),
+        GamePhase::GameOver => UiTextTone::game_result_copy(
+            content_mode,
+            local_game_result_for(local.game.event_log(), local.local_player),
+        )
+        .to_string(),
     }
 }
 
 fn menu_label(_game: &TwoPlayerGame, settings: &ClientSettings) -> String {
     match settings.screen {
-        ClientScreen::Startup => "BattleTris\nChallenge, Sleep, About, Roster, Quit".to_string(),
+        ClientScreen::Startup => String::new(),
         ClientScreen::Game => String::new(),
         ClientScreen::Challenge => "Challenge".to_string(),
         ClientScreen::Sleep => "Sleep".to_string(),
         ClientScreen::About => "About BattleTris".to_string(),
-        ClientScreen::Roster => "Roster".to_string(),
+        ClientScreen::Roster => String::new(),
         ClientScreen::Settings => format!(
             "Settings\nT theme: {:?}  O sound: {:?}  M controls\n-/= scale: {:.2}x",
             settings.theme, settings.sound_pack, settings.pixel_scale,
@@ -3355,14 +6990,12 @@ fn menu_label(_game: &TwoPlayerGame, settings: &ClientSettings) -> String {
 }
 
 fn screen_body_label(
-    game: &TwoPlayerGame,
+    _game: &TwoPlayerGame,
     settings: &ClientSettings,
-    roster: &RosterRecords,
+    _roster: &RosterRecords,
 ) -> String {
     match settings.screen {
-        ClientScreen::Startup => {
-            "Click Challenge for human/computer setup, Sleep to wait as available, About for credits, Roster for records, or Quit. Keyboard: H local game, C Play Ernie, F2/F3/F4/F5/F6 screens.".to_string()
-        }
+        ClientScreen::Startup => String::new(),
         ClientScreen::Challenge => {
             let difficulty = selected_ernie_difficulty(settings);
             let lobby_preview = lobby_registration_preview(settings);
@@ -3395,9 +7028,10 @@ fn screen_body_label(
             )
         }
         ClientScreen::About => {
-            "BattleTris\nRust/Bevy rewrite of the legacy X11/Motif game.\nOriginal authors: Bryan Cantrill, Charlie Hoecker, and Mike Shapiro, Brown CS32 spring 1994.\nRevived and exhumed by the BattleTris community in 2026.\nThis build preserves deterministic rules, the weapon economy, Biff, Ernie, ranked records, and source-backed art/audio packs.\nClick OK to return.".to_string()
+            "BattleTris\nVersion 1.0\nBryan Cantrill\nCharlie Hoecker\nMike Shapiro\nbattletris@cs.brown.edu\nBattleTris Copyright (c) 1993-1997 Bryan Cantrill, Charles Hoecker, Michael Shapiro.\nSpecial thanks to:\nLibby \"Hoss the Camel\" Cantrill, for many ideas and extensive play-testing\nDrew Davis, for great advice early on\nTony, for cleaning up our empty Mountain Dew bottles\nbotrytis, pebbles and barney for many long and passionate nights\nThe original BT beta testers:  Ben, Caffer, Masi, Dave, Scott and Todd\nand of course\nKevin \"shouldn't there be a paren there?\" Regan"
+                .to_string()
         }
-        ClientScreen::Roster => roster_label(game, settings, roster),
+        ClientScreen::Roster => " ".to_string(),
         ClientScreen::Settings => format!(
             "Theme: {:?}\nSound pack: {:?}\nControls: {}\nScale: {:.2}x\nDisplay name: {}\nCommunity: {}\nDirect listen: {}\nLobby: {}\nProtocol: v{}.{}\nAssets: {}\nSettings: {}",
             settings.theme,
@@ -3419,6 +7053,34 @@ fn screen_body_label(
         ),
         ClientScreen::Game => String::new(),
     }
+}
+
+fn challenge_label(role: ChallengeTextRole, settings: &ClientSettings) -> String {
+    match role {
+        ChallengeTextRole::UserList | ChallengeTextRole::ComputerStatus => String::new(),
+        ChallengeTextRole::UserInfo => {
+            UiTextTone::challenge_copy(settings.content_mode).to_string()
+        }
+    }
+}
+
+fn challenge_ernie_slider_x(settings: &ClientSettings) -> f32 {
+    let max_level = (COMPUTER_DIFFICULTIES.len() - 1).max(1) as f32;
+    let fraction = settings.ernie_level as f32 / max_level;
+    challenge_screen_world(46.0 + 244.0 * fraction, 509.0).x
+}
+
+fn bazaar_selection_marker_y(ui: &BazaarUiState, role: BazaarSelectionMarkerRole) -> f32 {
+    let rows = sorted_weapon_catalog();
+    let index = rows
+        .iter()
+        .position(|spec| spec.token == ui.selected)
+        .unwrap_or_default() as f32;
+    let legacy_y = match role {
+        BazaarSelectionMarkerRole::Background => 210.0,
+        BazaarSelectionMarkerRole::Text => 205.0,
+    } + index * 16.2;
+    bazaar_world(0.0, legacy_y).y
 }
 
 fn sanitize_pixel_scale(pixel_scale: f32) -> f32 {
@@ -3446,6 +7108,13 @@ fn adjust_ernie_level(settings: &mut ClientSettings, step: isize) {
     let max = COMPUTER_DIFFICULTIES.len() as isize - 1;
     settings.ernie_level = (settings.ernie_level as isize + step).clamp(0, max) as usize;
     settings.save();
+}
+
+fn toggle_theme(settings: &mut ClientSettings) {
+    settings.theme = match settings.theme {
+        ThemeChoice::Original => ThemeChoice::HighContrast,
+        ThemeChoice::HighContrast => ThemeChoice::Original,
+    };
 }
 
 fn selected_ernie_difficulty(settings: &ClientSettings) -> battletris_core::ai::ComputerDifficulty {
@@ -3519,53 +7188,86 @@ fn assets_dir() -> PathBuf {
         .join("assets")
 }
 
-fn roster_label(game: &TwoPlayerGame, settings: &ClientSettings, roster: &RosterRecords) -> String {
-    let ranked = if game.is_ranked_game() {
-        "ranked"
-    } else {
-        "unranked"
-    };
-    let mut label = format!(
-        "Roster\nPlayer 1: {}\nPlayer 2: {}\nCommunity: {}\nCurrent game is {ranked}. Local records sorted by rank.\n",
-        settings.display_name,
-        match game.mode() {
-            GameMode::HumanVsHuman => "local human",
-            GameMode::HumanVsComputer { .. } => "computer Ernie",
-        },
-        settings.community_label,
-    );
-    if let Some(error) = &roster.error {
-        let _ = writeln!(label, "Records unavailable: {error}");
-    } else if roster.rows.is_empty() {
-        label.push_str("No ranked human-vs-human results have been recorded yet.\n");
-    } else {
-        for row in roster.rows.iter().take(8) {
-            let _ = writeln!(
-                label,
-                "#{:<4} {:<16} {:>3}-{:>3} score {} lines {} funds {} streak {}",
-                row.rank,
-                truncate_label(&row.display_name, 16),
-                row.wins,
-                row.losses,
-                row.high_score,
-                row.high_lines,
-                row.high_funds,
-                row.streak,
-            );
-        }
-        if roster.rows.len() > 8 {
-            let _ = writeln!(label, "... and {} more", roster.rows.len() - 8);
-        }
+fn roster_text_label(roster: &RosterRecords, role: RosterTextRole) -> String {
+    match role {
+        RosterTextRole::UserList => roster_user_list_label(roster),
+        RosterTextRole::UserInfo1 => roster_user_info_label(roster, 0),
+        RosterTextRole::UserInfo2 => " ".to_string(),
+        RosterTextRole::Player1Name => roster_player_name_label(roster, 0),
+        RosterTextRole::Player2Name => " ".to_string(),
+        RosterTextRole::Player1Score | RosterTextRole::Player2Score => " ".to_string(),
     }
-    label.push_str("Esc returns to game.");
-    label
+}
+
+fn roster_user_list_label(roster: &RosterRecords) -> String {
+    if let Some(error) = &roster.error {
+        return format!("Records unavailable\n{}", truncate_label(error, 22));
+    }
+    if roster.rows.is_empty() {
+        return "No records".to_string();
+    }
+
+    roster
+        .rows
+        .iter()
+        .take(20)
+        .map(|row| truncate_label(&row.player_key, 20))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn roster_user_info_label(roster: &RosterRecords, index: usize) -> String {
+    if let Some(error) = &roster.error {
+        return format!("Records unavailable:\n{}", truncate_label(error, 34));
+    }
+    let Some(row) = roster.rows.get(index) else {
+        return if index == 0 {
+            "No ranked human-vs-human\nresults have been recorded.\n\nNickname: none\nPlan: none"
+                .to_string()
+        } else {
+            " ".to_string()
+        };
+    };
+
+    format!(
+        "          Name: {}\n          Rank: {}\n          Wins: {}\n        Losses: {}\n Highest score: {}\n Highest lines: {}\n Highest funds: {}\n        Streak: {}\n  Fastest kill: {}\nQuickest death: {}\n  Longest game: {}\n\nNickname: none\nPlan: none",
+        truncate_label(&row.display_name, 20),
+        row.rank,
+        row.wins,
+        row.losses,
+        row.high_score,
+        row.high_lines,
+        row.high_funds,
+        row.streak,
+        roster_duration_label(row.fastest_kill_secs),
+        roster_duration_label(row.quickest_death_secs),
+        roster_duration_label(row.longest_game_secs),
+    )
+}
+
+fn roster_duration_label(secs: Option<u64>) -> String {
+    let Some(secs) = secs else {
+        return "None".to_string();
+    };
+    let hours = (secs / 3600).min(99);
+    let minutes = (secs / 60) % 60;
+    let seconds = secs % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+fn roster_player_name_label(roster: &RosterRecords, index: usize) -> String {
+    roster
+        .rows
+        .get(index)
+        .map(|row| truncate_label(&row.player_key, 14))
+        .unwrap_or_else(|| " ".to_string())
 }
 
 fn streak_label(kind: StreakKind, count: u64) -> String {
     match kind {
-        StreakKind::None => "none".to_string(),
-        StreakKind::Wins => format!("W{count}"),
-        StreakKind::Losses => format!("L{count}"),
+        StreakKind::None => "0 wins".to_string(),
+        StreakKind::Wins => format!("{count} win{}", if count == 1 { "" } else { "s" }),
+        StreakKind::Losses => format!("{count} loss{}", if count == 1 { "" } else { "es" }),
     }
 }
 
@@ -3722,7 +7424,12 @@ fn bazaar_catalog_label(bazaar: &battletris_core::weapons::Bazaar) -> String {
         .join("  ")
 }
 
-fn bazaar_overlay_label(local: &LocalGame, ui: &BazaarUiState) -> String {
+fn bazaar_text_label(
+    role: BazaarTextRole,
+    local: &LocalGame,
+    ui: &BazaarUiState,
+    content_mode: ContentMode,
+) -> String {
     if local.game.phase() != GamePhase::Bazaar {
         return String::new();
     }
@@ -3730,55 +7437,101 @@ fn bazaar_overlay_label(local: &LocalGame, ui: &BazaarUiState) -> String {
     let Some(bazaar) = local.game.bazaar_session(local.local_player) else {
         return "Bazaar closed".to_string();
     };
-    let selected = weapon_spec(ui.selected);
-    let done = local.game.bazaar_player_done(local.local_player);
-    let mut text = format!(
-        "BATTLETRIS BAZAAR\nFunds: {}{}  Arsenal: {}\n{}\n\n",
-        bazaar.staged_funds(),
-        if bazaar.carter_prices() {
-            "  CARTER PRICES"
-        } else {
-            ""
-        },
-        arsenal_slots_label(bazaar.staged_arsenal()),
-        if done {
-            "Done selected. Waiting for opponent; shopping controls are dimmed."
-        } else {
-            "Click a row to inspect. Click Add/Remove/DONE. Number slots launch in game, remove staged here."
+    match role {
+        BazaarTextRole::Catalog => bazaar_catalog_widget_label(bazaar),
+        BazaarTextRole::SelectedCatalogRow => weapon_spec(ui.selected).name.to_string(),
+        BazaarTextRole::Funds => {
+            if bazaar.carter_prices() {
+                format!("{}\nCarter prices", bazaar.staged_funds())
+            } else {
+                bazaar.staged_funds().to_string()
+            }
         }
-    );
-
-    for (row, spec) in sorted_weapon_catalog().into_iter().enumerate() {
-        let marker = if spec.token == ui.selected { '>' } else { ' ' };
-        let duration = if spec.line_duration == 0 {
-            "one-shot".to_string()
-        } else {
-            format!("{} lines", spec.line_duration)
-        };
-        let _ = writeln!(
-            text,
-            "{marker}{:02}. {:<21} ${:<4} {:<8}",
-            row + 1,
-            spec.name,
-            bazaar.price(spec.token),
-            duration,
-        );
+        BazaarTextRole::ArsenalSlot(slot) => bazaar_arsenal_slot_widget_label(bazaar, ui, slot),
+        BazaarTextRole::Message => bazaar_message_widget_label(local, ui, content_mode),
+        BazaarTextRole::Description => bazaar_description_widget_label(bazaar, ui.selected),
     }
+}
 
-    let _ = write!(
-        text,
-        "\nSelected: {}  ${}  {}\n{}\n\n[Add] [Remove staged] [DONE]\n{}",
-        selected.name,
-        bazaar.price(selected.token),
-        if selected.line_duration == 0 {
-            "one-shot".to_string()
-        } else {
-            format!("{} target lines", selected.line_duration)
-        },
-        selected.description,
-        ui.last_message,
+fn bazaar_catalog_widget_label(bazaar: &battletris_core::weapons::Bazaar) -> String {
+    sorted_weapon_catalog()
+        .into_iter()
+        .map(|spec| {
+            let price_marker = if bazaar.price(spec.token) <= bazaar.staged_funds() {
+                ""
+            } else {
+                " *"
+            };
+            format!("{}{price_marker}", spec.name)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn bazaar_arsenal_slot_widget_label(
+    bazaar: &battletris_core::weapons::Bazaar,
+    ui: &BazaarUiState,
+    slot: usize,
+) -> String {
+    if let Some(visual_arsenal) = &ui.visual_arsenal {
+        return visual_arsenal[slot]
+            .map(|token| weapon_spec(token).name.to_string())
+            .unwrap_or_else(|| "< Empty >".to_string());
+    }
+    let Some(slot) = bazaar.staged_arsenal().slots().get(slot).copied().flatten() else {
+        return "< Empty >".to_string();
+    };
+    if slot.quantity > 1 {
+        format!("{} ({})", weapon_spec(slot.token).name, slot.quantity)
+    } else {
+        weapon_spec(slot.token).name.to_string()
+    }
+}
+
+fn bazaar_message_widget_label(
+    local: &LocalGame,
+    ui: &BazaarUiState,
+    content_mode: ContentMode,
+) -> String {
+    if local.game.bazaar_player_done(local.local_player) {
+        wrap_bazaar_description(UiTextTone::bazaar_done_overlay_copy(content_mode), 34)
+    } else if ui.last_message.trim().is_empty() {
+        wrap_bazaar_description(UiTextTone::bazaar_instructions_copy(content_mode), 34)
+    } else {
+        ui.last_message.clone()
+    }
+}
+
+fn bazaar_description_widget_label(
+    bazaar: &battletris_core::weapons::Bazaar,
+    selected: WeaponToken,
+) -> String {
+    let spec = weapon_spec(selected);
+    let mut text = format!(
+        "Price:    {}\nDuration: {} lines\n\n",
+        bazaar.price(spec.token),
+        spec.line_duration,
     );
+    text.push_str(&wrap_bazaar_description(spec.description, 37));
     text
+}
+
+fn wrap_bazaar_description(description: &str, width: usize) -> String {
+    let mut output = String::new();
+    let mut line_len = 0_usize;
+    for word in description.split_whitespace() {
+        let word_len = word.chars().count();
+        if line_len > 0 && line_len + 1 + word_len > width {
+            output.push('\n');
+            line_len = 0;
+        } else if line_len > 0 {
+            output.push(' ');
+            line_len += 1;
+        }
+        output.push_str(word);
+        line_len += word_len;
+    }
+    output
 }
 
 fn sorted_weapon_catalog() -> Vec<&'static battletris_core::weapons::WeaponSpec> {
@@ -3849,30 +7602,57 @@ fn piece_label(kind: PieceKind) -> &'static str {
     }
 }
 
-fn cell_color(cell: Cell, _active: bool, theme: &LoadedTheme) -> Color {
+fn cell_sprite(cell: Cell, _active: bool, theme: &LoadedTheme) -> RenderedCellSprite {
     match cell {
         Cell::Visible { color } => {
             let index = usize::from(color.get().saturating_sub(1))
                 % theme.palette.visible_colors.len().max(1);
-            theme
-                .palette
-                .visible_colors
-                .get(index)
-                .copied()
-                .unwrap_or(theme.palette.text_accent)
+            RenderedCellSprite {
+                atlas_index: theme.cell_atlas.cells.visible_colors[index],
+                tint: theme
+                    .palette
+                    .visible_colors
+                    .get(index)
+                    .copied()
+                    .unwrap_or(theme.palette.text_accent),
+            }
         }
-        Cell::Structure => theme.palette.structure,
-        Cell::Happy => theme.palette.happy,
-        Cell::Frown => theme.palette.frown,
-        Cell::Gimp { .. } => theme.palette.gimp,
-        Cell::Die { .. } => theme.palette.die,
-        Cell::Invisible => theme.palette.invisible,
-        Cell::Hidden { .. } => theme.palette.hidden,
+        Cell::Structure => RenderedCellSprite {
+            atlas_index: theme.cell_atlas.cells.structure,
+            tint: theme.palette.structure,
+        },
+        Cell::Happy => RenderedCellSprite {
+            atlas_index: theme.cell_atlas.cells.happy,
+            tint: theme.palette.happy,
+        },
+        Cell::Frown => RenderedCellSprite {
+            atlas_index: theme.cell_atlas.cells.frown,
+            tint: theme.palette.frown,
+        },
+        Cell::Gimp { .. } => RenderedCellSprite {
+            atlas_index: theme.cell_atlas.cells.gimp,
+            tint: theme.palette.gimp,
+        },
+        Cell::Die { pip } => RenderedCellSprite {
+            atlas_index: theme.cell_atlas.cells.die[usize::from(pip.get() - 1)],
+            tint: theme.palette.die,
+        },
+        Cell::Invisible => RenderedCellSprite {
+            atlas_index: theme.cell_atlas.cells.invisible,
+            tint: theme.palette.invisible,
+        },
+        Cell::Hidden { .. } => RenderedCellSprite {
+            atlas_index: theme.cell_atlas.cells.hidden,
+            tint: theme.palette.hidden,
+        },
     }
 }
 
-fn empty_cell_color(theme: &LoadedTheme) -> Color {
-    theme.palette.empty
+fn empty_cell_sprite(theme: &LoadedTheme) -> RenderedCellSprite {
+    RenderedCellSprite {
+        atlas_index: theme.cell_atlas.cells.empty,
+        tint: theme.palette.empty,
+    }
 }
 
 fn sound_event_for(event: &BattleEvent) -> Option<SoundEvent> {
@@ -3893,15 +7673,41 @@ fn sound_event_for(event: &BattleEvent) -> Option<SoundEvent> {
         BattleEvent::BazaarPlayerDone { .. } | BattleEvent::BazaarLeft => {
             Some(SoundEvent::Purchase)
         }
+        BattleEvent::WeaponLaunched {
+            token: WeaponToken::Gimp,
+            ..
+        } => Some(SoundEvent::WeaponLaunchGimp),
         BattleEvent::WeaponLaunched { .. }
         | BattleEvent::OneShotWeaponApplied { .. }
         | BattleEvent::TimedWeaponActivated { .. }
         | BattleEvent::WeaponReflected { .. }
         | BattleEvent::WeaponNullified { .. } => Some(SoundEvent::WeaponLaunch),
         BattleEvent::TimedWeaponExpired { .. } => Some(SoundEvent::Purchase),
-        BattleEvent::PlayerDied { .. } | BattleEvent::GameOver { .. } => Some(SoundEvent::GameOver),
+        BattleEvent::PlayerDied { .. } => Some(SoundEvent::GameDead),
+        BattleEvent::GameOver { .. } => Some(SoundEvent::GameOver),
         BattleEvent::Paused | BattleEvent::Resumed => Some(SoundEvent::MenuAction),
         _ => None,
+    }
+}
+
+fn local_game_result_for(
+    log: &[battletris_core::game::LoggedEvent],
+    local_player: PlayerId,
+) -> Option<bool> {
+    log.iter().rev().find_map(|logged| match logged.event {
+        BattleEvent::GameOver { winner, loser }
+            if winner == local_player || loser == local_player =>
+        {
+            Some(winner == local_player)
+        }
+        _ => None,
+    })
+}
+
+const fn player_label(player: PlayerId) -> &'static str {
+    match player {
+        PlayerId::One => "Player 1",
+        PlayerId::Two => "Player 2",
     }
 }
 
@@ -3957,31 +7763,41 @@ fn bazaar_catalog_keys() -> [(WeaponToken, KeyCode); 10] {
     ]
 }
 
-fn handle_bazaar_click(world: Vec2, game: &mut TwoPlayerGame, ui: &mut BazaarUiState) {
+fn handle_bazaar_click(
+    world: Vec2,
+    theme: &LoadedTheme,
+    game: &mut TwoPlayerGame,
+    ui: &mut BazaarUiState,
+    content_mode: ContentMode,
+) {
     let player = PlayerId::One;
-    if let Some(token) = bazaar_catalog_token_at(world) {
+    if let Some(token) = bazaar_catalog_token_at(world, theme) {
         ui.selected = token;
         ui.last_message = format!("Selected {}.", weapon_spec(token).name);
         return;
     }
-    if bazaar_add_rect().contains(world) {
+    if bazaar_add_rect(theme).contains(world) {
         buy_selected_bazaar_weapon(game, ui, player);
         return;
     }
-    if bazaar_remove_rect().contains(world) {
+    if bazaar_remove_rect(theme).contains(world) {
         remove_selected_bazaar_weapon(game, ui, player);
         return;
     }
-    if bazaar_done_rect().contains(world) {
+    if bazaar_done_rect(theme).contains(world) {
         match game.bazaar_done(player) {
             events if events.is_empty() => {
-                ui.last_message = "Already waiting for opponent.".to_string()
+                ui.last_message =
+                    UiTextTone::bazaar_waiting_copy(content_mode, BazaarWaitingText::LocalRepeated)
             }
-            _ => ui.last_message = "Done. Waiting for opponent.".to_string(),
+            _ => {
+                ui.last_message =
+                    UiTextTone::bazaar_waiting_copy(content_mode, BazaarWaitingText::LocalWaiting)
+            }
         }
         return;
     }
-    if let Some(token) = bazaar_arsenal_token_at(world, game, player) {
+    if let Some(token) = bazaar_arsenal_token_at(world, theme, game, player) {
         ui.selected = token;
         remove_selected_bazaar_weapon(game, ui, player);
     }
@@ -4043,35 +7859,29 @@ fn adjacent_catalog_token(current: WeaponToken, step: isize) -> WeaponToken {
     rows[next].token
 }
 
-fn bazaar_catalog_token_at(world: Vec2) -> Option<WeaponToken> {
-    const LEFT: f32 = -390.0;
-    const RIGHT: f32 = 95.0;
-    const TOP: f32 = 284.0;
-    const ROW_HEIGHT: f32 = 13.5;
-    if world.x < LEFT || world.x > RIGHT || world.y > TOP || world.y < TOP - ROW_HEIGHT * 34.0 {
+fn bazaar_catalog_token_at(world: Vec2, theme: &LoadedTheme) -> Option<WeaponToken> {
+    let rows = sorted_weapon_catalog();
+    let rect = theme.layout.rects.bazaar_catalog.rect();
+    if !rect.contains(world) {
         return None;
     }
-    let row = ((TOP - world.y) / ROW_HEIGHT).floor() as usize;
-    sorted_weapon_catalog().get(row).map(|spec| spec.token)
+    let row_height = rect.height() / rows.len() as f32;
+    let row = ((rect.max.y - world.y) / row_height).floor() as usize;
+    rows.get(row).map(|spec| spec.token)
 }
 
 fn bazaar_arsenal_token_at(
     world: Vec2,
+    theme: &LoadedTheme,
     game: &TwoPlayerGame,
     player: PlayerId,
 ) -> Option<WeaponToken> {
-    const LEFT: f32 = -75.0;
-    const TOP: f32 = 338.0;
-    const SLOT_WIDTH: f32 = 44.0;
-    const SLOT_HEIGHT: f32 = 24.0;
-    if world.x < LEFT
-        || world.x > LEFT + SLOT_WIDTH * 10.0
-        || world.y > TOP
-        || world.y < TOP - SLOT_HEIGHT
-    {
+    let rect = theme.layout.rects.bazaar_arsenal.rect();
+    if !rect.contains(world) {
         return None;
     }
-    let index = ((world.x - LEFT) / SLOT_WIDTH).floor() as usize;
+    let slot_width = rect.width() / 10.0;
+    let index = ((world.x - rect.min.x) / slot_width).floor() as usize;
     game.bazaar_session(player)
         .and_then(|bazaar| bazaar.staged_arsenal().slots().get(index))
         .copied()
@@ -4079,16 +7889,16 @@ fn bazaar_arsenal_token_at(
         .map(|slot| slot.token)
 }
 
-fn bazaar_add_rect() -> Rect {
-    Rect::from_center_size(Vec2::new(170.0, -310.0), Vec2::new(82.0, 32.0))
+fn bazaar_add_rect(theme: &LoadedTheme) -> Rect {
+    theme.layout.rects.bazaar_add.rect()
 }
 
-fn bazaar_remove_rect() -> Rect {
-    Rect::from_center_size(Vec2::new(275.0, -310.0), Vec2::new(118.0, 32.0))
+fn bazaar_remove_rect(theme: &LoadedTheme) -> Rect {
+    theme.layout.rects.bazaar_remove.rect()
 }
 
-fn bazaar_done_rect() -> Rect {
-    Rect::from_center_size(Vec2::new(360.0, -310.0), Vec2::new(72.0, 32.0))
+fn bazaar_done_rect(theme: &LoadedTheme) -> Rect {
+    theme.layout.rects.bazaar_done.rect()
 }
 
 fn arsenal_slot_label(index: usize) -> String {
@@ -4130,6 +7940,7 @@ mod tests {
                 "settings",
                 "game-playing",
                 "game-bazaar",
+                "game-over",
                 "game-recon",
                 "board-cells",
             ]
@@ -4139,6 +7950,18 @@ mod tests {
             Some(VisualFixture::GameBazaar)
         );
         assert!(VisualFixture::from_id("bazaar").is_none());
+    }
+
+    #[test]
+    fn game_over_fixture_builds_game_over_state() {
+        let local = visual_local_game(VisualFixture::GameOver, DEFAULT_ERNIE_LEVEL);
+
+        assert_eq!(VisualFixture::GameOver.screen(), ClientScreen::Game);
+        assert_eq!(local.game.phase(), GamePhase::GameOver);
+        assert_eq!(
+            legacy_game_message_label(&local, ContentMode::Rated),
+            "Nice loss, shithead."
+        );
     }
 
     #[test]
@@ -4158,6 +7981,7 @@ mod tests {
         .expect("headless capture CLI parses");
 
         assert!(config.deterministic_capture);
+        assert_eq!(config.content_mode, ContentMode::Normal);
         match config.capture.expect("capture spec") {
             VisualCaptureSpec::One {
                 fixture,
@@ -4176,13 +8000,118 @@ mod tests {
     }
 
     #[test]
+    fn client_cli_defaults_to_normal_content_mode() {
+        let config = ClientRunConfig::parse(Vec::new(), None).expect("empty CLI parses");
+
+        assert_eq!(config.content_mode, ContentMode::Normal);
+        assert!(!config.deterministic_capture);
+        assert!(config.capture.is_none());
+    }
+
+    #[test]
+    fn client_cli_accepts_rated_long_and_legacy_short_flags() {
+        let long = ClientRunConfig::parse(vec![OsString::from("--rated")], None)
+            .expect("rated CLI parses");
+        let short = ClientRunConfig::parse(vec![OsString::from("-r")], None)
+            .expect("legacy rated CLI parses");
+
+        assert_eq!(long.content_mode, ContentMode::Rated);
+        assert_eq!(short.content_mode, ContentMode::Rated);
+        assert!(!long.deterministic_capture);
+        assert!(!short.deterministic_capture);
+    }
+
+    #[test]
+    fn rated_flag_is_session_only_and_not_persisted() {
+        let mut settings = ClientSettings {
+            content_mode: ContentMode::Rated,
+            settings_path: None,
+            ..Default::default()
+        };
+        settings.apply_persisted(PersistedClientSettings::default());
+
+        assert_eq!(settings.content_mode, ContentMode::Rated);
+        let encoded = toml::to_string_pretty(&settings.persisted()).expect("settings encode");
+        assert!(!encoded.contains("content-mode"));
+    }
+
+    #[test]
+    fn rated_flag_can_wrap_headless_capture_without_changing_capture_semantics() {
+        let config = ClientRunConfig::parse(
+            vec![
+                OsString::from("--rated"),
+                OsString::from("headless"),
+                OsString::from("capture"),
+                OsString::from("--fixture=board-cells"),
+                OsString::from("--theme"),
+                OsString::from("original"),
+                OsString::from("--output"),
+                OsString::from("target/visual/current/board-cells-rated.png"),
+            ],
+            None,
+        )
+        .expect("rated headless capture CLI parses");
+
+        assert!(config.deterministic_capture);
+        assert_eq!(config.content_mode, ContentMode::Rated);
+        match config.capture.expect("capture spec") {
+            VisualCaptureSpec::One {
+                fixture,
+                theme,
+                output,
+            } => {
+                assert_eq!(fixture, VisualFixture::BoardCells);
+                assert_eq!(theme, ThemeChoice::Original);
+                assert_eq!(
+                    output,
+                    PathBuf::from("target/visual/current/board-cells-rated.png")
+                );
+            }
+            other => panic!("unexpected capture spec: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn headless_capture_accepts_rated_flag_in_command_options() {
+        let config = ClientRunConfig::parse(
+            vec![
+                OsString::from("headless"),
+                OsString::from("capture"),
+                OsString::from("--fixture"),
+                OsString::from("game-over"),
+                OsString::from("--theme=original"),
+                OsString::from("--rated"),
+                OsString::from("--output"),
+                OsString::from("target/visual/rated/game-over.png"),
+            ],
+            None,
+        )
+        .expect("rated headless capture option parses");
+
+        assert!(config.deterministic_capture);
+        assert_eq!(config.content_mode, ContentMode::Rated);
+        match config.capture.expect("capture spec") {
+            VisualCaptureSpec::One {
+                fixture,
+                theme,
+                output,
+            } => {
+                assert_eq!(fixture, VisualFixture::GameOver);
+                assert_eq!(theme, ThemeChoice::Original);
+                assert_eq!(output, PathBuf::from("target/visual/rated/game-over.png"));
+            }
+            other => panic!("unexpected capture spec: {other:?}"),
+        }
+    }
+
+    #[test]
     fn capture_all_jobs_cover_every_fixture_for_one_theme() {
         let config = ClientRunConfig::parse(
             vec![
                 OsString::from("headless"),
                 OsString::from("capture-all"),
                 OsString::from("--theme"),
-                OsString::from("original-inspired"),
+                OsString::from("original"),
                 OsString::from("--out-dir"),
                 OsString::from("target/visual/current"),
             ],
@@ -4197,13 +8126,13 @@ mod tests {
 
         assert_eq!(capture.jobs.len(), VisualFixture::ALL.len());
         assert_eq!(capture.jobs[0].fixture, VisualFixture::Startup);
-        assert_eq!(capture.jobs[0].theme, ThemeChoice::OriginalInspired);
+        assert_eq!(capture.jobs[0].theme, ThemeChoice::Original);
         assert_eq!(
             capture.jobs[0].path,
             PathBuf::from("target/visual/current/startup.png")
         );
-        assert_eq!(capture.jobs[0].expected_width, 1040);
-        assert_eq!(capture.jobs[0].expected_height, 720);
+        assert_eq!(capture.jobs[0].expected_width, 640);
+        assert_eq!(capture.jobs[0].expected_height, 600);
         assert_eq!(
             capture.jobs.last().unwrap().path,
             PathBuf::from("target/visual/current/board-cells.png")
@@ -4259,11 +8188,145 @@ mod tests {
 
     #[test]
     fn bazaar_mouse_rows_select_any_catalog_weapon() {
-        let first = bazaar_catalog_token_at(Vec2::new(-380.0, 283.0));
-        let last = bazaar_catalog_token_at(Vec2::new(-380.0, 284.0 - 13.5 * 33.0));
+        let themes = ThemePacks::load(&assets_dir());
+        let theme = themes.get(ThemeChoice::Original);
+        let first = bazaar_catalog_token_at(Vec2::new(-370.0, 195.0), theme);
+        let last = bazaar_catalog_token_at(Vec2::new(-370.0, -365.0), theme);
 
         assert_eq!(first, Some(WeaponToken::FlipOut));
         assert_eq!(last, Some(WeaponToken::Swap));
+    }
+
+    #[test]
+    fn bundled_theme_loads_cell_atlas_contract() {
+        let themes = ThemePacks::load(&assets_dir());
+        let theme = themes.get(ThemeChoice::Original);
+
+        assert_eq!(theme.cell_atlas.columns, 32);
+        assert_eq!(theme.cell_atlas.rows, 1);
+        assert_eq!(theme.cell_atlas.cells.empty, 0);
+        assert_eq!(theme.cell_atlas.cells.visible_colors[0], 1);
+        assert_eq!(theme.cell_atlas.cells.visible_colors[18], 19);
+        assert_eq!(theme.cell_atlas.cells.die, [24, 25, 26, 27, 28, 29]);
+        assert_eq!(
+            theme.layout.rects.startup_challenge.center(),
+            Vec2::new(-95.5, -200.0)
+        );
+        assert_eq!(theme.fonts.line_height, 1.0);
+        assert_eq!(
+            theme.fonts.path_for(ThemedTextFontRole::Body),
+            Some("themes/original/fonts/NimbusSans-Bold.otf")
+        );
+        assert_eq!(
+            theme.fonts.path_for(ThemedTextFontRole::Title),
+            Some("themes/original/fonts/NimbusSans-Bold.otf")
+        );
+        assert_eq!(
+            theme.fonts.path_for(ThemedTextFontRole::Button),
+            Some("themes/original/fonts/NimbusSans-Bold.otf")
+        );
+        assert_eq!(
+            theme.fonts.path_for(ThemedTextFontRole::Mono),
+            Some("themes/original/fonts/NimbusMonoPS-Bold.otf")
+        );
+    }
+
+    #[test]
+    fn rated_theme_assets_are_optional_with_normal_fallback() {
+        let themes = ThemePacks::load(&assets_dir());
+        let original = themes.get(ThemeChoice::Original);
+        let high_contrast = themes.get(ThemeChoice::HighContrast);
+
+        assert!(original.sprites.supports_rated());
+        assert!(original
+            .sprites
+            .atlas_for(ContentMode::Rated)
+            .ends_with("images/blocks-rated.png"));
+        assert!(!high_contrast.sprites.supports_rated());
+        assert_eq!(
+            high_contrast.sprites.atlas_for(ContentMode::Rated),
+            high_contrast.sprites.atlas_for(ContentMode::Normal)
+        );
+    }
+
+    #[test]
+    fn content_mode_selects_standalone_gimp_sprite_paths() {
+        let themes = ThemePacks::load(&assets_dir());
+        let original = themes.get(ThemeChoice::Original);
+        let high_contrast = themes.get(ThemeChoice::HighContrast);
+
+        assert!(original
+            .sprites
+            .gimp_for(ContentMode::Normal)
+            .ends_with("images/gimp.png"));
+        assert!(original
+            .sprites
+            .gimp_for(ContentMode::Rated)
+            .ends_with("images/gimp-rated.png"));
+        assert_eq!(
+            high_contrast.sprites.gimp_for(ContentMode::Rated),
+            high_contrast.sprites.gimp_for(ContentMode::Normal)
+        );
+    }
+
+    #[test]
+    fn ui_text_tone_preserves_normal_copy_and_isolates_rated_variants() {
+        assert_eq!(UiTextTone::challenge_copy(ContentMode::Normal), "");
+        assert_eq!(
+            UiTextTone::challenge_copy(ContentMode::Rated),
+            "wants a piece of yo' ass."
+        );
+        assert_eq!(
+            UiTextTone::bazaar_waiting_copy(ContentMode::Normal, BazaarWaitingText::LocalWaiting),
+            "Done. Waiting for opponent."
+        );
+        assert_eq!(
+            UiTextTone::bazaar_waiting_copy(ContentMode::Rated, BazaarWaitingText::LocalWaiting),
+            "Waiting for fat slut..."
+        );
+        assert_eq!(
+            UiTextTone::game_result_copy(ContentMode::Normal, Some(false)),
+            "Game over"
+        );
+        assert_eq!(
+            UiTextTone::game_result_copy(ContentMode::Rated, Some(false)),
+            "Nice loss, shithead."
+        );
+        assert_eq!(
+            UiTextTone::game_result_copy(ContentMode::Rated, Some(true)),
+            "Yer the shit!"
+        );
+    }
+
+    #[test]
+    fn rated_game_over_message_uses_local_result() {
+        let mut board = Board::empty();
+        for y in 0..BOARD_HEIGHT {
+            for x in 0..BOARD_WIDTH {
+                board.set(Coord { x, y }, Some(Cell::visible()));
+            }
+        }
+        let local = LocalGame {
+            game: TwoPlayerGame::with_boards(
+                GameSeed::from_u64(1),
+                board,
+                GameSeed::from_u64(2),
+                Board::empty(),
+            ),
+            computer: None,
+            local_player: PlayerId::One,
+            status_message: None,
+        };
+
+        assert_eq!(local.game.phase(), GamePhase::GameOver);
+        assert_eq!(
+            legacy_game_message_label(&local, ContentMode::Normal),
+            "Game over"
+        );
+        assert_eq!(
+            legacy_game_message_label(&local, ContentMode::Rated),
+            "Nice loss, shithead."
+        );
     }
 
     #[test]
@@ -4295,12 +8358,12 @@ mod tests {
     }
 
     #[test]
-    fn computer_opponent_view_is_hidden_until_recon() {
+    fn computer_opponent_frame_stays_visible_without_recon() {
         let local = LocalGame::new_human_vs_computer(DEFAULT_ERNIE_LEVEL);
         let mut recon = ReconPanel::default();
 
         assert!(player_view_visible(&local, &recon, PlayerId::One));
-        assert!(!player_view_visible(&local, &recon, PlayerId::Two));
+        assert!(player_view_visible(&local, &recon, PlayerId::Two));
 
         recon.manual_condor = true;
         assert!(player_view_visible(&local, &recon, PlayerId::Two));
@@ -4379,12 +8442,36 @@ mod tests {
 
         for event in SoundEvent::ALL {
             let loaded = packs
-                .sound_for(SoundPackChoice::GeneratedDefault, event)
+                .sound_for(
+                    SoundPackChoice::GeneratedDefault,
+                    ContentMode::Normal,
+                    event,
+                )
                 .expect("generated-default maps every semantic event");
             assert!(loaded.file.ends_with(".wav"));
         }
+        let rated_gimp = packs
+            .sound_for(
+                SoundPackChoice::GeneratedDefault,
+                ContentMode::Rated,
+                SoundEvent::WeaponLaunchGimp,
+            )
+            .expect("rated overlay maps rated gimp launch");
+        assert!(rated_gimp.file.contains("generated-rated"));
+        let rated_fallback = packs
+            .sound_for(
+                SoundPackChoice::GeneratedDefault,
+                ContentMode::Rated,
+                SoundEvent::LineClear,
+            )
+            .expect("rated mode falls back to generated-default");
+        assert!(rated_fallback.file.contains("generated-default"));
         assert!(packs
-            .sound_for(SoundPackChoice::Muted, SoundEvent::LineClear)
+            .sound_for(
+                SoundPackChoice::Muted,
+                ContentMode::Rated,
+                SoundEvent::LineClear
+            )
             .is_none());
     }
 

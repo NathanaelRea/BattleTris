@@ -1,0 +1,10 @@
+The Nimbus fonts bundled here come from Artifex Software's URW Base35 font
+set. The font and related files are distributed under the GNU Affero General
+Public License Version 3, with the following exemption:
+
+As a special exception, permission is granted to include these font programs in
+a Postscript or PDF file that consists of a document that contains text to be
+displayed or printed using this font, regardless of the conditions or license
+applying to the document itself.
+
+See AGPL-3.0-only.txt for the full AGPL-3.0-only license text.

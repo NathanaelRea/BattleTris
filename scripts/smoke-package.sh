@@ -27,18 +27,20 @@ required_files=(
     "$package_dir/release-manifest.toml"
     "$package_dir/Cargo.lock"
     "$package_dir/assets/manifest.toml"
-    "$package_dir/assets/themes/original-inspired/theme.toml"
-    "$package_dir/assets/themes/original-inspired/images/blocks.png"
-    "$package_dir/assets/themes/original-inspired/images/startup.png"
-    "$package_dir/assets/themes/original-inspired/images/bazaar.png"
-    "$package_dir/assets/themes/original-inspired/images/biff.png"
-    "$package_dir/assets/themes/original-inspired/images/gimp.png"
+    "$package_dir/assets/themes/original/theme.toml"
+    "$package_dir/assets/themes/original/images/blocks.png"
+    "$package_dir/assets/themes/original/images/startup.png"
+    "$package_dir/assets/themes/original/images/bazaar.png"
+    "$package_dir/assets/themes/original/images/biff.png"
+    "$package_dir/assets/themes/original/images/gimp.png"
+    "$package_dir/assets/themes/original/images/crest.png"
     "$package_dir/assets/themes/high-contrast/theme.toml"
     "$package_dir/assets/themes/high-contrast/images/blocks.png"
     "$package_dir/assets/themes/high-contrast/images/startup.png"
     "$package_dir/assets/themes/high-contrast/images/bazaar.png"
     "$package_dir/assets/themes/high-contrast/images/biff.png"
     "$package_dir/assets/themes/high-contrast/images/gimp.png"
+    "$package_dir/assets/themes/high-contrast/images/crest.png"
     "$package_dir/assets/sounds/generated-default/sound-pack.toml"
     "$package_dir/assets/sounds/generated-default/menu-action.wav"
     "$package_dir/assets/sounds/generated-default/piece-locked.wav"
@@ -67,15 +69,27 @@ for sound in menu-action.wav piece-locked.wav line-clear.wav bazaar-entered.wav 
     fi
 done
 
-for theme in original-inspired high-contrast; do
+for theme in original high-contrast; do
     theme_manifest="$package_dir/assets/themes/$theme/theme.toml"
-    for asset in images/blocks.png images/startup.png images/bazaar.png images/biff.png images/gimp.png; do
+    for asset in images/blocks.png images/startup.png images/bazaar.png images/biff.png images/gimp.png images/crest.png; do
         if ! grep -q "$asset" "$theme_manifest"; then
             printf 'theme manifest %s does not declare required asset %s\n' "$theme_manifest" "$asset" >&2
             exit 1
         fi
     done
 done
+
+tools_binary="$package_dir/bin/battletris-tools"
+if [[ ! -x "$tools_binary" && -x "$package_dir/bin/battletris-tools.exe" ]]; then
+    tools_binary="$package_dir/bin/battletris-tools.exe"
+fi
+if [[ -x "$tools_binary" ]]; then
+    for theme in original high-contrast; do
+        "$tools_binary" validate-theme "$package_dir/assets/themes/$theme"
+    done
+else
+    printf 'packaged tools binary is not executable; skipping decoded theme validation\n' >&2
+fi
 
 binary_count=0
 for binary in "$package_dir"/bin/*; do

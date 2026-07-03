@@ -410,6 +410,7 @@ name = "battletris-tools"
 version = "0.1.0"
 dependencies = [
  "image",
+ "toml",
 ]
 
 [[package]]

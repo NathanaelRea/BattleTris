@@ -1,19 +1,29 @@
-id = "high-contrast"
-name = "High Contrast"
+id = "original"
+name = "Original"
 kind = "theme"
 format_version = 1
-description = "High-contrast data-driven validation theme."
+description = "Original data-driven theme pack using converted legacy PPM art, C++-matched cell atlases, and checked-in legacy font equivalents."
 author = "BattleTris rewrite"
-license = "Generated project assets."
+license = "Converted/generated project assets; Nimbus Sans Bold and Nimbus Mono PS Bold are bundled from URW Base35 under AGPL-3.0-only WITH PS-or-PDF-font-exception-20170817 in fonts/URW-Base35-LICENSE.txt and fonts/AGPL-3.0-only.txt."
 default_scale = 1.0
 pixel_filtering = "nearest"
-supports_high_contrast = true
+supports_high_contrast = false
 
 [provenance]
-notes = "Accessibility-oriented validation pack using the same schema as original."
+notes = "Generated from legacy PPM art and a Rust port of the usr/src/game/BTBox.C cell pixmap drawing logic. Fonts follow the checked-in compiled Motif fallback resources: Nimbus Sans Bold stands in for Helvetica Bold, and Nimbus Mono PS Bold stands in for LucidaTypewriter Bold."
 sources = [
-    "assets/themes/original/theme.toml",
-    "crates/battletris-tools/src/main.rs",
+    "usr/src/art/btstartup2.ppm",
+    "usr/src/art/btbazaar.ppm",
+    "usr/src/art/btbiff4.ppm",
+    "usr/src/art/btgimp2.ppm",
+    "usr/src/art/btgimp.ppm",
+    "usr/src/game/BattleTris.C",
+    "usr/src/game/BTBox.C",
+    "usr/src/game/BTConstants.H",
+    "usr/src/game/PPMReader.C",
+    "usr/src/game/BTFallbacks.C",
+    "usr/src/share/BattleTris.ad",
+    "https://github.com/ArtifexSoftware/urw-base35-fonts",
 ]
 
 [sprites]
@@ -23,6 +33,10 @@ bazaar = "images/bazaar.png"
 biff = "images/biff.png"
 gimp = "images/gimp.png"
 crest = "images/crest.png"
+
+[sprites.rated]
+atlas = "images/blocks-rated.png"
+gimp = "images/gimp-rated.png"
 
 [sprites.cell_atlas]
 tile_width = 23
@@ -46,10 +60,10 @@ invisible = 30
 hidden = 31
 
 [fonts]
-ui = ""
-title = ""
-mono = ""
-line_height = 1.2
+ui = "fonts/NimbusSans-Bold.otf"
+title = "fonts/NimbusSans-Bold.otf"
+mono = "fonts/NimbusMonoPS-Bold.otf"
+line_height = 1.0
 tracking = 0.0
 
 [cell]
@@ -123,52 +137,52 @@ bazaar_remove = { center_x = 0.0, center_y = -60.0, width = 120.0, height = 50.0
 bazaar_done = { center_x = 0.0, center_y = -140.0, width = 120.0, height = 70.0 }
 
 [semantic.text]
-primary = "#ffffff"
-secondary = "#d6f7ff"
-accent = "#fff200"
-warning = "#ffc400"
+primary = "#dce0d1"
+secondary = "#bdc7b8"
+accent = "#e6e0bd"
+warning = "#f7c938"
 
 [semantic.board]
-background = "#111111"
+background = "#000000"
 empty = "#ffffff00"
-structure = "#ccd1db"
-happy = "#ffea00"
-frown = "#d17829"
-gimp = "#ff1ae8"
-die = "#c7d6ff"
-invisible = "#33384260"
-hidden = "#000000"
-visible_colors = ["#ff3939", "#30b7ff", "#fff233", "#47ff6d", "#ff55ff", "#ffffff", "#ffc400", "#ff7a7a", "#6fe0ff", "#d8ff4f", "#ff8cff", "#ffa347", "#7affd9", "#b7ff30", "#ffd000", "#ff4fa3", "#b8c7ff", "#ffe0a3", "#cfcfcf"]
+structure = "#ffffff"
+happy = "#ffffff"
+frown = "#ffffff"
+gimp = "#ffffff"
+die = "#ffffff"
+invisible = "#ffffff00"
+hidden = "#ffffff"
+visible_colors = ["#ffffff", "#ffffff", "#ffffff", "#ffffff", "#ffffff", "#ffffff", "#ffffff", "#ffffff", "#ffffff", "#ffffff", "#ffffff", "#ffffff", "#ffffff", "#ffffff", "#ffffff", "#ffffff", "#ffffff", "#ffffff", "#ffffff"]
 
 [semantic.button]
-normal = "#ffffff"
-hover = "#fff200"
-pressed = "#30b7ff"
-text = "#000000"
+normal = "#b7b2aa"
+hover = "#d3cec4"
+pressed = "#8d8982"
+text = "#0000cc"
 
 [semantic.bazaar]
-affordable = "#ffffff"
-unaffordable = "#ff7a7a"
-selected = "#fff200"
+affordable = "#dce0d1"
+unaffordable = "#806b57"
+selected = "#e6e0bd"
 
 [semantic.weapon]
-active = "#47ff6d"
-expired = "#ccd1db"
+active = "#e6e0bd"
+expired = "#75787d"
 
 [screen]
-background = "#000000"
-title_text = "#fff200"
-body_text = "#ffffff"
+background = "#bfbfbf"
+title_text = "#ffff00"
+body_text = "#0000cc"
 title_font_size = 12.0
 body_font_size = 11.0
 button_font_size = 17.0
 
 [about]
-background = "#000000"
-title_text = "#fff200"
-name_text = "#30b7ff"
-credit_text = "#ff55ff"
-button_face = "#ffffff"
-button_highlight = "#fff200"
-button_shadow = "#30b7ff"
-button_text = "#000000"
+background = "#bfbfbf"
+title_text = "#ffff00"
+name_text = "#0000cc"
+credit_text = "#ff0000"
+button_face = "#bfbfbf"
+button_highlight = "#e4e4e4"
+button_shadow = "#676767"
+button_text = "#ff0000"

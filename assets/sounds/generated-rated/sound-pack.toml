@@ -1,0 +1,39 @@
+name = "Generated Rated Overlay"
+kind = "sound-pack"
+format_version = 1
+description = "Generated rated-mode overlay cues for explicit legacy compatibility mode."
+
+[[event]]
+id = "weapon_launch_gimp"
+files = ["weapon-launch-gimp-rated.wav"]
+volume = 0.80
+
+[[event]]
+id = "challenge_rejected"
+files = ["challenge-rejected-rated.wav"]
+volume = 0.80
+
+[[event]]
+id = "bazaar_wait"
+files = ["bazaar-wait-rated.wav"]
+volume = 0.65
+
+[[event]]
+id = "game_lost"
+files = ["game-lost-rated.wav"]
+volume = 0.85
+
+[[event]]
+id = "game_dead"
+files = ["game-dead-rated.wav"]
+volume = 0.85
+
+[[event]]
+id = "warning"
+files = ["warning-rated.wav"]
+volume = 0.80
+
+[[event]]
+id = "game_over"
+files = ["game-over-rated.wav"]
+volume = 0.85

@@ -34,6 +34,51 @@ files = ["weapon-launch.wav"]
 volume = 0.75
 
 [[event]]
+id = "weapon_launch_gimp"
+files = ["weapon-launch-gimp.wav"]
+volume = 0.75
+
+[[event]]
+id = "challenge_incoming"
+files = ["challenge-incoming.wav"]
+volume = 0.60
+
+[[event]]
+id = "challenge_rejected"
+files = ["challenge-rejected.wav"]
+volume = 0.70
+
+[[event]]
+id = "bazaar_wait"
+files = ["bazaar-wait.wav"]
+volume = 0.55
+
+[[event]]
+id = "opponent_wait"
+files = ["opponent-wait.wav"]
+volume = 0.55
+
+[[event]]
+id = "game_lost"
+files = ["game-lost.wav"]
+volume = 0.75
+
+[[event]]
+id = "game_won"
+files = ["game-won.wav"]
+volume = 0.75
+
+[[event]]
+id = "game_dead"
+files = ["game-dead.wav"]
+volume = 0.75
+
+[[event]]
+id = "about_easter_egg"
+files = ["about-easter-egg.wav"]
+volume = 0.55
+
+[[event]]
 id = "warning"
 files = ["warning.wav"]
 volume = 0.75

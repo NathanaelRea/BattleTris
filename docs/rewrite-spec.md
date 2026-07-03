@@ -160,7 +160,7 @@ sound-event mapping while gameplay decisions remain in `battletris-core`.
 | Startup/menu flow | `battletris-client` exposes startup, challenge placeholder, settings, about placeholder, roster placeholder, sleep placeholder, and game screens through keyboard shortcuts. Challenge remains a placeholder until protocol/networking phases. |
 | Local modes | Startup can launch local human-vs-human or unranked human-vs-computer. Computer play uses the deterministic core `ComputerOpponent` for placement commands and the core `HumanVsComputer` mode for unranked status. |
 | Settings | Runtime settings cover theme, sound-pack selection, control layout, and pixel scale. Phase 18 persists these settings as TOML at `ProjectDirs::config_dir()/settings.toml` using the ADR 0005 app id, while gameplay state remains core-owned. |
-| Themes/assets | The default theme is original-inspired scalable sprites; a high-contrast theme validates the swappable theme boundary without blocking on final art packs. Phase 18 packages source-controlled asset manifests under `assets/` next to the release binaries. |
+| Themes/assets | The default theme is original scalable sprites; a high-contrast theme validates the swappable theme boundary without blocking on final art packs. Phase 18 packages source-controlled asset manifests under `assets/` next to the release binaries. |
 | Audio | The client maps core `BattleEvent`/`CoreEvent` values to semantic `SoundEvent` categories such as menu action, line clear, bazaar, weapon launch, warning, and game over. The generated-default versus muted pack setting validates a swappable sound-pack boundary before recovered audio exists, and Phase 18 bundles a generated-default sound-pack manifest. |
 
 ## Distribution And Release
