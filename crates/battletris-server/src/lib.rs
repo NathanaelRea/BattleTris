@@ -286,6 +286,28 @@ impl HostedLobbyServer {
         false
     }
 
+    /// Cancels an available session at the hosting player's request.
+    pub fn cancel_session(
+        &mut self,
+        session_id: &HostedSessionId,
+        requester_player_id: &str,
+    ) -> Result<()> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| self.missing_session_error(session_id))?;
+        if requester_player_id != session.host.player_id {
+            return Err(ServerError::WrongParticipant(
+                requester_player_id.to_string(),
+            ));
+        }
+        if session.state != SessionState::Available {
+            return Err(ServerError::SessionUnavailable(session_id.clone()));
+        }
+        self.expire_session(session_id);
+        Ok(())
+    }
+
     /// Submits one participant's ranked result claim.
     pub fn submit_ranked_result(
         &mut self,
@@ -721,6 +743,23 @@ mod tests {
         assert!(server.expire_session(&entry.session_id));
         assert!(matches!(
             server.submit_ranked_result(claim(&entry.session_id, "ada"), &mut store),
+            Err(ServerError::SessionUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn host_can_cancel_available_session() {
+        let community = CommunityLabel::new("garage").unwrap();
+        let mut server = HostedLobbyServer::new(community, 100);
+        let entry = server
+            .register_host(register(player("ada", "Ada"), true), PROTOCOL_MAJOR, 0)
+            .unwrap();
+
+        server.cancel_session(&entry.session_id, "ada").unwrap();
+
+        assert!(server.lobby_entries(false).is_empty());
+        assert!(matches!(
+            server.session_status(&entry.session_id, "ada"),
             Err(ServerError::SessionUnavailable(_))
         ));
     }

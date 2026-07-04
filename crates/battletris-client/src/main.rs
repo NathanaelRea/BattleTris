@@ -4,11 +4,18 @@
 //! event mapping, and local keyboard input. It consumes deterministic core
 //! state and events instead of owning gameplay rules.
 
+use battletris_client::net::{
+    build_ranked_result_claim, FinalResultStatus, LanAvailability, LanDiscoveryEntry,
+    NetworkCommand, NetworkEvent, NetworkLifecycleState, NetworkLockstep, NetworkRuntime,
+    NetworkSession,
+};
 use battletris_core::{
     ai::{computer_difficulty, ComputerOpponent, BAZAAR_LEAVE_DELAY_MS, COMPUTER_DIFFICULTIES},
     board::{Board, Coord, BOARD_HEIGHT, BOARD_WIDTH},
     cell::{Cell, Pip, VisibleColor},
-    game::{BattleEvent, Command, CoreEvent, GameMode, GamePhase, PlayerId, TwoPlayerGame},
+    game::{
+        BattleEvent, Command, CoreEvent, GameMode, GamePhase, LoggedEvent, PlayerId, TwoPlayerGame,
+    },
     piece::PieceKind,
     recon::{ReconLevel, ReconSnapshot},
     rng::GameSeed,
@@ -16,11 +23,15 @@ use battletris_core::{
 };
 use battletris_db::{CommunityLabel, PersistencePaths, PlayerStore, StreakKind};
 use battletris_protocol::{
-    HostedPlayer, LobbyRegister, CAPABILITY_DIRECT_TCP, CAPABILITY_SELF_HOSTED_LOBBY,
-    PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    derive_player_seeds, BazaarBuy, BazaarDone, BazaarRemove, Challenge, GameChecksum, GameOver,
+    Heartbeat, HostedGameStart, HostedPlayer, HostedSessionStatus, HostedSessionStatusKind,
+    InputCommand, LobbyEntry, LobbyList, LobbyRegister, PlayerIdentity, PlayerInput, PlayerSlot,
+    RankedRecords, RankedResultPending, RankedResultRejected, TickWatermark, CAPABILITY_DIRECT_TCP,
+    CAPABILITY_SELF_HOSTED_LOBBY, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 use bevy::ecs::system::SystemParam;
 use bevy::image::ImageSampler;
+use bevy::log::{error, info, warn};
 use bevy::prelude::*;
 use bevy::render::render_resource::TextureFormat;
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured};
@@ -36,12 +47,18 @@ use std::{
     fs,
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::mpsc;
 
 const SMOKE_SCREENSHOT_CAPTURE_DELAY_FRAMES: u16 = 30;
 const SMOKE_SCREENSHOT_TIMEOUT_FRAMES: u16 = 300;
 const SETTINGS_FILE_NAME: &str = "settings.toml";
 const CLIENT_FIXED_TICK_MS: u64 = 10;
+const NETWORK_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
+const NETWORK_CHECKSUM_INTERVAL_MS: u64 = 5_000;
+const HOSTED_STATUS_POLL_INTERVAL_MS: u64 = 1_000;
+const LOBBY_BROWSE_REFRESH_INTERVAL_MS: u64 = 3_000;
 const INPUT_REPEAT_INITIAL_MS: u64 = 150;
 const INPUT_REPEAT_MS: u64 = 50;
 const DEFAULT_ERNIE_LEVEL: usize = 7;
@@ -131,6 +148,8 @@ fn run_client(run_config: ClientRunConfig) {
         .insert_resource(SettingsEditState::default())
         .insert_resource(SoundEventState::default())
         .insert_resource(roster_records)
+        .insert_resource(ClientNetworkRuntime::default())
+        .insert_resource(ClientNetworkState::default())
         .add_plugins(
             DefaultPlugins
                 .set(AssetPlugin {
@@ -156,6 +175,10 @@ fn run_client(run_config: ClientRunConfig) {
             Update,
             (
                 update_window_layout.after(apply_visual_capture_fixture),
+                pump_network_events,
+                maintain_sleep_availability,
+                refresh_hosted_lobby,
+                refresh_server_roster,
                 handle_keyboard_input,
                 handle_mouse_buttons,
                 drive_computer_opponent,
@@ -221,6 +244,7 @@ enum ChallengeMode {
     JoinDirect,
     HostViaLobby,
     BrowseLobby,
+    BrowseLan,
 }
 
 impl ChallengeMode {
@@ -231,6 +255,7 @@ impl ChallengeMode {
             Self::JoinDirect => "Join Direct",
             Self::HostViaLobby => "Host Via Lobby",
             Self::BrowseLobby => "Browse Lobby",
+            Self::BrowseLan => "Browse LAN",
         }
     }
 }
@@ -277,6 +302,773 @@ impl Default for SettingsEditState {
         Self {
             field: SettingsField::DisplayName,
         }
+    }
+}
+
+#[derive(Resource, Debug)]
+struct ClientNetworkRuntime {
+    runtime: NetworkRuntime,
+}
+
+impl Default for ClientNetworkRuntime {
+    fn default() -> Self {
+        Self {
+            runtime: NetworkRuntime::start(),
+        }
+    }
+}
+
+#[derive(Resource, Debug, Clone, PartialEq, Eq)]
+struct ClientNetworkState {
+    lifecycle: NetworkLifecycleState,
+    last_error: Option<String>,
+    listening_bind_addr: Option<SocketAddr>,
+    listening_share_addr: Option<SocketAddr>,
+    pending_challenge: Option<Challenge>,
+    lobby_list: Option<LobbyList>,
+    lobby_selected_index: usize,
+    lobby_registration: Option<LobbyEntry>,
+    lobby_server_addr: Option<SocketAddr>,
+    hosted_status: Option<HostedSessionStatus>,
+    hosted_start: Option<HostedGameStart>,
+    connected_session: Option<NetworkSession>,
+    result_status: FinalResultStatus,
+    ranked_records: Option<RankedRecords>,
+    lan_entries: Vec<LanDiscoveryEntry>,
+    lan_selected_index: usize,
+    lan_advertising: bool,
+    last_input: Option<PlayerInput>,
+    last_tick_watermark: Option<TickWatermark>,
+    last_heartbeat: Option<Heartbeat>,
+    last_checksum: Option<GameChecksum>,
+    last_game_over: Option<GameOver>,
+    last_bazaar_buy: Option<BazaarBuy>,
+    last_bazaar_remove: Option<BazaarRemove>,
+    last_bazaar_done_player: Option<battletris_protocol::PlayerSlot>,
+    transient_messages: Vec<String>,
+    hosted_poll_elapsed_ms: u64,
+    lobby_browse_elapsed_ms: u64,
+    sleep_availability_attempted: bool,
+}
+
+impl Default for ClientNetworkState {
+    fn default() -> Self {
+        Self {
+            lifecycle: NetworkLifecycleState::Idle,
+            last_error: None,
+            listening_bind_addr: None,
+            listening_share_addr: None,
+            pending_challenge: None,
+            lobby_list: None,
+            lobby_selected_index: 0,
+            lobby_registration: None,
+            lobby_server_addr: None,
+            hosted_status: None,
+            hosted_start: None,
+            connected_session: None,
+            result_status: FinalResultStatus::None,
+            ranked_records: None,
+            lan_entries: Vec::new(),
+            lan_selected_index: 0,
+            lan_advertising: false,
+            last_input: None,
+            last_tick_watermark: None,
+            last_heartbeat: None,
+            last_checksum: None,
+            last_game_over: None,
+            last_bazaar_buy: None,
+            last_bazaar_remove: None,
+            last_bazaar_done_player: None,
+            transient_messages: Vec::new(),
+            hosted_poll_elapsed_ms: 0,
+            lobby_browse_elapsed_ms: 0,
+            sleep_availability_attempted: false,
+        }
+    }
+}
+
+impl ClientNetworkState {
+    fn push_message(&mut self, message: impl Into<String>) {
+        const MAX_TRANSIENT_MESSAGES: usize = 8;
+        self.transient_messages.push(message.into());
+        if self.transient_messages.len() > MAX_TRANSIENT_MESSAGES {
+            let overflow = self.transient_messages.len() - MAX_TRANSIENT_MESSAGES;
+            self.transient_messages.drain(0..overflow);
+        }
+    }
+}
+
+#[derive(SystemParam)]
+struct NetworkPumpParams<'w> {
+    runtime: ResMut<'w, ClientNetworkRuntime>,
+    network_state: ResMut<'w, ClientNetworkState>,
+    local: ResMut<'w, LocalGame>,
+    settings: ResMut<'w, ClientSettings>,
+    clock: ResMut<'w, ClientTickClock>,
+    repeat: ResMut<'w, InputRepeatState>,
+    recon: ResMut<'w, ReconPanel>,
+    bazaar_ui: ResMut<'w, BazaarUiState>,
+    sound: ResMut<'w, SoundEventState>,
+}
+
+fn pump_network_events(mut input: NetworkPumpParams) {
+    loop {
+        match input.runtime.runtime.channels_mut().try_recv_event() {
+            Ok(event) => {
+                let hosted_start = match &event {
+                    NetworkEvent::HostedGameStarted(start) => Some(start.clone()),
+                    _ => None,
+                };
+                let listening = matches!(&event, NetworkEvent::Listening { .. });
+                apply_network_game_event(
+                    &mut input.local,
+                    &mut input.runtime,
+                    &mut input.network_state,
+                    &event,
+                );
+                let network_game_ended = matches!(
+                    &event,
+                    NetworkEvent::StateChanged(NetworkLifecycleState::Idle)
+                        | NetworkEvent::Error { .. }
+                ) && input.local.is_networked();
+                if let Some(session) = reduce_client_network_event(&mut input.network_state, event)
+                {
+                    *input.local = LocalGame::new_networked(session);
+                    input.settings.screen = ClientScreen::Game;
+                    *input.clock = ClientTickClock::default();
+                    *input.repeat = InputRepeatState::default();
+                    *input.recon = ReconPanel::default();
+                    *input.bazaar_ui = BazaarUiState::default();
+                    input.sound.next_log_index = 0;
+                    input.sound.last_event = None;
+                    input.sound.pending_events.clear();
+                } else if network_game_ended {
+                    input.local.network_session = None;
+                    input.local.network_lockstep = None;
+                    input.local.network_failed_closed = true;
+                    input.settings.screen = ClientScreen::Challenge;
+                }
+                if let Some(start) = hosted_start {
+                    join_hosted_direct_after_start(
+                        &input.settings,
+                        &mut input.runtime,
+                        &mut input.network_state,
+                        start,
+                    );
+                }
+                if listening
+                    && (input.settings.challenge_mode == ChallengeMode::HostViaLobby
+                        || input.settings.challenge_mode == ChallengeMode::HostDirect
+                        || input.settings.screen == ClientScreen::Sleep)
+                {
+                    start_lan_advertising(
+                        &input.settings,
+                        &mut input.runtime,
+                        &mut input.network_state,
+                    );
+                }
+                if listening
+                    && (input.settings.challenge_mode == ChallengeMode::HostViaLobby
+                        || input.settings.screen == ClientScreen::Sleep)
+                {
+                    register_hosted_lobby(
+                        &input.settings,
+                        &mut input.runtime,
+                        &mut input.network_state,
+                    );
+                }
+            }
+            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                let message = "network runtime event channel closed".to_string();
+                input.network_state.lifecycle = NetworkLifecycleState::Error {
+                    message: message.clone(),
+                };
+                input.network_state.last_error = Some(message.clone());
+                input.network_state.push_message(message.clone());
+                error!("{message}");
+                break;
+            }
+        }
+    }
+}
+
+fn apply_network_game_event(
+    local: &mut LocalGame,
+    runtime: &mut ClientNetworkRuntime,
+    state: &mut ClientNetworkState,
+    event: &NetworkEvent,
+) {
+    match event {
+        NetworkEvent::PendingResult(pending) => {
+            set_local_result_status(local, FinalResultStatus::Pending(pending.clone()));
+        }
+        NetworkEvent::RecordedResult(_) => {
+            set_local_result_status(local, FinalResultStatus::Recorded);
+        }
+        NetworkEvent::RejectedResult(rejected) => {
+            set_local_result_status(local, FinalResultStatus::Rejected(rejected.reason.clone()));
+        }
+        _ => {}
+    }
+
+    let Some(lockstep) = local.network_lockstep.as_mut() else {
+        return;
+    };
+    let result = match event {
+        NetworkEvent::InputReceived(input) => lockstep.receive_remote_input(input.clone()),
+        NetworkEvent::TickWatermark(watermark) => {
+            lockstep.receive_peer_watermark(watermark.clone())
+        }
+        NetworkEvent::Heartbeat(heartbeat) => lockstep.receive_peer_watermark(TickWatermark {
+            player: heartbeat.player,
+            through_tick: heartbeat.watermark_tick,
+        }),
+        NetworkEvent::BazaarBuy(buy) => lockstep.apply_bazaar_buy(&mut local.game, buy.clone()),
+        NetworkEvent::BazaarRemove(remove) => {
+            lockstep.apply_bazaar_remove(&mut local.game, remove.clone())
+        }
+        NetworkEvent::BazaarDone { player } => {
+            lockstep.apply_bazaar_done(&mut local.game, BazaarDone { player: *player });
+            Ok(())
+        }
+        NetworkEvent::Checksum(checksum) => {
+            if let Some(report) = lockstep.desync_report(&local.game, checksum) {
+                fail_closed_on_desync(local, runtime, state, report);
+            }
+            return;
+        }
+        NetworkEvent::GameOver(game_over) => {
+            verify_peer_game_over(local, runtime, state, game_over);
+            return;
+        }
+        _ => return,
+    };
+
+    if let Err(error) = result {
+        let message = format!("Network protocol error: {error:?}");
+        local.status_message = Some(message.clone());
+        state.last_error = Some(message.clone());
+        state.push_message(message.clone());
+        warn!("{message}");
+        try_send_network_command(
+            runtime,
+            state,
+            NetworkCommand::Disconnect { reason: message },
+        );
+    }
+}
+
+fn set_local_result_status(local: &mut LocalGame, status: FinalResultStatus) {
+    if let Some(session) = local.network_session.as_mut() {
+        session.final_result_status = status.clone();
+        local.status_message = Some(network_session_status_label(
+            session,
+            local.network_lockstep.as_ref(),
+        ));
+    }
+}
+
+fn fail_closed_on_desync(
+    local: &mut LocalGame,
+    runtime: &mut ClientNetworkRuntime,
+    state: &mut ClientNetworkState,
+    report: battletris_client::net::DesyncReport,
+) {
+    let message = format!(
+        "Desync detected. The online game stopped to avoid showing different results. Tick {}, local checksum {}, peer checksum {}",
+        report.tick, report.local_checksum, report.remote_checksum
+    );
+    local.network_failed_closed = true;
+    local.status_message = Some(message.clone());
+    if let Some(session) = local.network_session.as_mut() {
+        session.ranked = false;
+        session.final_result_status = FinalResultStatus::Rejected("desynced".to_string());
+    }
+    state.last_error = Some(message.clone());
+    state.result_status = FinalResultStatus::Rejected("desynced".to_string());
+    state.push_message(message.clone());
+    error!(
+        "network desync tick={} local_checksum={} remote_checksum={} local_events={} remote_events={}",
+        report.tick,
+        report.local_checksum,
+        report.remote_checksum,
+        report.local_event_count,
+        report.remote_event_count
+    );
+    try_send_network_command(
+        runtime,
+        state,
+        NetworkCommand::Disconnect { reason: message },
+    );
+}
+
+fn verify_peer_game_over(
+    local: &mut LocalGame,
+    runtime: &mut ClientNetworkRuntime,
+    state: &mut ClientNetworkState,
+    peer: &GameOver,
+) {
+    let Some(local_game_over) = game_over_message(local) else {
+        let message = format!(
+            "Desync detected: peer game over at tick {} before local game over",
+            peer.sequence
+        );
+        local.status_message = Some(message.clone());
+        state.last_error = Some(message.clone());
+        state.push_message(message.clone());
+        try_send_network_command(
+            runtime,
+            state,
+            NetworkCommand::Disconnect { reason: message },
+        );
+        local.network_failed_closed = true;
+        return;
+    };
+
+    if local_game_over != *peer {
+        let message = format!(
+            "Desync detected: peer game over {:?} conflicts with local {:?}",
+            peer, local_game_over
+        );
+        local.status_message = Some(message.clone());
+        state.last_error = Some(message.clone());
+        state.push_message(message.clone());
+        try_send_network_command(
+            runtime,
+            state,
+            NetworkCommand::Disconnect { reason: message },
+        );
+        local.network_failed_closed = true;
+    }
+}
+
+fn reduce_client_network_event(
+    state: &mut ClientNetworkState,
+    event: NetworkEvent,
+) -> Option<NetworkSession> {
+    let mut connected = None;
+    match event {
+        NetworkEvent::Listening {
+            bind_addr,
+            share_addr,
+        } => {
+            state.lifecycle = NetworkLifecycleState::Hosting { bind_addr };
+            state.listening_bind_addr = Some(bind_addr);
+            state.listening_share_addr = Some(share_addr);
+            state.pending_challenge = None;
+            state.push_message(format!("Listening on {bind_addr}; share {share_addr}"));
+            info!("network listening bind={bind_addr} share={share_addr}");
+        }
+        NetworkEvent::LanAdvertisingStarted { advertisement } => {
+            state.lan_advertising = true;
+            state.push_message(format!(
+                "LAN advertising started on port {}",
+                advertisement.port
+            ));
+            info!(
+                "network LAN advertising started service={} port={} txt={:?}",
+                advertisement.service, advertisement.port, advertisement.txt
+            );
+        }
+        NetworkEvent::LanAdvertisingStopped => {
+            state.lan_advertising = false;
+            state.push_message("LAN advertising stopped");
+            info!("network LAN advertising stopped");
+        }
+        NetworkEvent::LanDiscoveryEntries { entries } => {
+            let count = entries.len();
+            state.lan_entries = entries;
+            state.lan_selected_index = state.lan_selected_index.min(count.saturating_sub(1));
+            state.push_message(format!("LAN browse returned {count} entries"));
+            info!("network LAN browse entries={count}");
+        }
+        NetworkEvent::LanDiscoveryUnavailable { reason } => {
+            state.lan_advertising = false;
+            state.last_error = Some(reason.clone());
+            state.push_message(format!("LAN discovery unavailable: {reason}"));
+            warn!("network LAN discovery unavailable reason={reason}");
+        }
+        NetworkEvent::IncomingChallenge { challenge } => {
+            state.lifecycle = NetworkLifecycleState::Challenged {
+                challenge: challenge.clone(),
+            };
+            state.pending_challenge = Some(challenge.clone());
+            state.push_message(format!(
+                "Incoming challenge from {}",
+                challenge.challenger.display_name
+            ));
+            info!(
+                "network incoming challenge display_name={} hosted_session={:?}",
+                challenge.challenger.display_name, challenge.hosted_session_id
+            );
+        }
+        NetworkEvent::Connected { session } => {
+            let session = *session;
+            log_network_session(&session);
+            state.lifecycle = NetworkLifecycleState::Connected {
+                session: Box::new(session.clone()),
+            };
+            state.connected_session = Some(session.clone());
+            state.result_status = session.final_result_status.clone();
+            state.pending_challenge = None;
+            state.push_message(format!(
+                "Connected to {} as {:?}",
+                session.peer_identity.display_name, session.local_slot
+            ));
+            connected = Some(session);
+        }
+        NetworkEvent::LobbyRegistered(entry) => {
+            state.lobby_registration = Some(entry.clone());
+            state.hosted_poll_elapsed_ms = 0;
+            state.push_message(format!("Lobby registered as {}", entry.host.display_name));
+            info!(
+                "network lobby registered session={:?} display_name={} share={} ranked={}",
+                entry.session_id, entry.host.display_name, entry.direct_addr, entry.ranked
+            );
+        }
+        NetworkEvent::LobbyList(list) => {
+            let count = list.entries.len();
+            state.lobby_selected_index = state.lobby_selected_index.min(count.saturating_sub(1));
+            state.lobby_list = Some(list);
+            state.lobby_browse_elapsed_ms = 0;
+            state.push_message(format!("Lobby returned {count} players"));
+            info!("network lobby list entries={count}");
+        }
+        NetworkEvent::HostedGameStarted(start) => {
+            state.hosted_start = Some(start.clone());
+            state.push_message(format!("Hosted game started: {:?}", start.session_id));
+            info!(
+                "network hosted start session={:?} community={} seed={} ranked={}",
+                start.session_id, start.community_label, start.seed, start.ranked
+            );
+        }
+        NetworkEvent::HostedSessionStatus(status) => {
+            if let HostedSessionStatusKind::Started(start) = &status.status {
+                state.hosted_start = Some(start.clone());
+            }
+            state.hosted_status = Some(status.clone());
+            if matches!(status.status, HostedSessionStatusKind::Unavailable { .. }) {
+                state.lobby_registration = None;
+            }
+            state.push_message(format!("Hosted session status: {:?}", status.status));
+            info!(
+                "network hosted status session={:?} state={:?}",
+                status.session_id, status.status
+            );
+        }
+        NetworkEvent::InputReceived(input) => {
+            state.last_input = Some(input.clone());
+            info!(
+                "network input received player={:?} tick={} commands={}",
+                input.player, input.tick, 1
+            );
+        }
+        NetworkEvent::TickWatermark(watermark) => {
+            state.last_tick_watermark = Some(watermark.clone());
+            if let Some(session) = state.connected_session.as_mut() {
+                session.peer_watermark = Some(watermark.through_tick);
+            }
+            info!(
+                "network tick watermark player={:?} tick={}",
+                watermark.player, watermark.through_tick
+            );
+        }
+        NetworkEvent::Heartbeat(heartbeat) => {
+            state.last_heartbeat = Some(heartbeat.clone());
+            if let Some(session) = state.connected_session.as_mut() {
+                session.peer_watermark = Some(heartbeat.watermark_tick);
+            }
+            info!(
+                "network heartbeat player={:?} current_tick={} watermark_tick={}",
+                heartbeat.player, heartbeat.current_tick, heartbeat.watermark_tick
+            );
+        }
+        NetworkEvent::BazaarBuy(buy) => {
+            state.last_bazaar_buy = Some(buy.clone());
+            info!(
+                "network bazaar buy player={:?} weapon={:?}",
+                buy.player, buy.weapon
+            );
+        }
+        NetworkEvent::BazaarRemove(remove) => {
+            state.last_bazaar_remove = Some(remove.clone());
+            info!(
+                "network bazaar remove player={:?} slot={}",
+                remove.player, remove.slot_index
+            );
+        }
+        NetworkEvent::BazaarDone { player } => {
+            state.last_bazaar_done_player = Some(player);
+            info!("network bazaar done player={player:?}");
+        }
+        NetworkEvent::Checksum(checksum) => {
+            state.last_checksum = Some(checksum.clone());
+            info!(
+                "network checksum player={:?} tick={} checksum={} events={}",
+                checksum.reporter, checksum.tick, checksum.checksum, checksum.event_count
+            );
+        }
+        NetworkEvent::DesyncDetected(report) => {
+            let message = format!(
+                "Desync detected. The online game stopped to avoid showing different results. Tick {}, local checksum {}, peer checksum {}",
+                report.tick, report.local_checksum, report.remote_checksum
+            );
+            state.last_error = Some(message.clone());
+            state.push_message(message.clone());
+            error!(
+                "network desync tick={} local_checksum={} remote_checksum={} local_events={} remote_events={}",
+                report.tick,
+                report.local_checksum,
+                report.remote_checksum,
+                report.local_event_count,
+                report.remote_event_count
+            );
+        }
+        NetworkEvent::GameOver(game_over) => {
+            state.last_game_over = Some(game_over.clone());
+            state.push_message(format!(
+                "Peer game over: winner {:?}, loser {:?}",
+                game_over.winner, game_over.loser
+            ));
+            info!(
+                "network game over winner={:?} loser={:?} tick={} events={}",
+                game_over.winner, game_over.loser, game_over.sequence, 0
+            );
+        }
+        NetworkEvent::PendingResult(pending) => {
+            state.result_status = FinalResultStatus::Pending(pending.clone());
+            state.push_message("Ranked result pending: waiting for the peer claim.");
+            log_pending_result(&pending);
+        }
+        NetworkEvent::RecordedResult(accepted) => {
+            state.result_status = FinalResultStatus::Recorded;
+            state.push_message("Ranked result recorded");
+            info!("network result recorded session={:?}", accepted.session_id);
+        }
+        NetworkEvent::RejectedResult(rejected) => {
+            state.result_status = FinalResultStatus::Rejected(rejected.reason.clone());
+            state.last_error = Some(rejected.reason.clone());
+            state.push_message(format!("Ranked result rejected: {}", rejected.reason));
+            log_rejected_result(&rejected);
+        }
+        NetworkEvent::RankedRecords(records) => {
+            let count = records.records.len();
+            state.ranked_records = Some(records);
+            state.push_message(format!("Fetched {count} ranked records"));
+            info!("network ranked records count={count}");
+        }
+        NetworkEvent::StateChanged(lifecycle) => {
+            if matches!(lifecycle, NetworkLifecycleState::Idle) {
+                state.listening_bind_addr = None;
+                state.listening_share_addr = None;
+                state.pending_challenge = None;
+                state.connected_session = None;
+                state.lobby_registration = None;
+                state.lobby_server_addr = None;
+                state.hosted_status = None;
+                state.hosted_start = None;
+                state.lan_advertising = false;
+            }
+            state.lifecycle = lifecycle.clone();
+            state.push_message(format!("Network state: {lifecycle:?}"));
+            info!("network lifecycle state={lifecycle:?}");
+        }
+        NetworkEvent::Error { message } => {
+            let message = player_facing_network_error(&message);
+            state.lifecycle = NetworkLifecycleState::Error {
+                message: message.clone(),
+            };
+            state.last_error = Some(message.clone());
+            state.push_message(message.clone());
+            error!("network error: {message}");
+        }
+    }
+    connected
+}
+
+fn player_facing_network_error(message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("address already in use") || lower.contains("addrinuse") {
+        "Host bind failed: address already in use. Try another port or cancel the old host."
+            .to_string()
+    } else if lower.contains("timed out connecting to direct peer")
+        || lower.contains("timed out connecting to hosted direct peer")
+        || lower.contains("join timed out")
+    {
+        format!("Join timed out. Check the host share address and firewall. {message}")
+    } else if lower.contains("lobby server") || lower.contains("hosted status") {
+        format!("Lobby server unavailable. Direct IP can still be used. {message}")
+    } else if lower.contains("challenge denied") || lower.contains("denied") {
+        let reason = message
+            .split_once(':')
+            .map(|(_, reason)| reason.trim().trim_end_matches('.'))
+            .unwrap_or(message.trim().trim_end_matches('.'));
+        format!("Challenge denied: {reason}.")
+    } else if lower.contains("peer disconnected") || lower.contains("peer idle timeout") {
+        format!("Peer disconnected. The online game has ended. {message}")
+    } else if lower.contains("desync") {
+        format!(
+            "Desync detected. The online game stopped to avoid showing different results. {message}"
+        )
+    } else if lower.contains("ranked result") && lower.contains("reject") {
+        format!("Ranked result rejected: {message}")
+    } else if lower.contains("channel") || lower.contains("runtime") {
+        format!("Network channel failure. Return to the menu and try again. {message}")
+    } else {
+        message.to_string()
+    }
+}
+
+#[allow(dead_code)]
+fn try_send_network_command(
+    runtime: &mut ClientNetworkRuntime,
+    state: &mut ClientNetworkState,
+    command: NetworkCommand,
+) -> bool {
+    let command_label = format!("{command:?}");
+    match runtime
+        .runtime
+        .channels_mut()
+        .command_sender()
+        .try_send(command)
+    {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            let message = format!("Network command queue is full: {command_label}");
+            state.last_error = Some(message.clone());
+            state.push_message(message.clone());
+            warn!("{message}");
+            false
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            let message = format!("Network runtime is closed: {command_label}");
+            state.lifecycle = NetworkLifecycleState::Error {
+                message: message.clone(),
+            };
+            state.last_error = Some(message.clone());
+            state.push_message(message.clone());
+            error!("{message}");
+            false
+        }
+    }
+}
+
+fn log_network_session(session: &NetworkSession) {
+    info!(
+        "network connected mode={:?} local_slot={:?} peer={} seed={} ranked={} community={:?} tick={} peer_watermark={:?} result={:?} hosted_session={:?}",
+        session.mode,
+        session.local_slot,
+        session.peer_identity.display_name,
+        session.base_seed,
+        session.ranked,
+        session.community_label,
+        session.current_tick,
+        session.peer_watermark,
+        session.final_result_status,
+        session.hosted.as_ref().map(|hosted| &hosted.session_id)
+    );
+}
+
+fn log_pending_result(pending: &RankedResultPending) {
+    info!(
+        "network result pending session={:?} reason={}",
+        pending.session_id, pending.reason
+    );
+}
+
+fn log_rejected_result(rejected: &RankedResultRejected) {
+    warn!(
+        "network result rejected session={:?} reason={}",
+        rejected.session_id, rejected.reason
+    );
+}
+
+fn refresh_hosted_lobby(
+    time: Res<Time>,
+    settings: Res<ClientSettings>,
+    mut runtime: ResMut<ClientNetworkRuntime>,
+    mut state: ResMut<ClientNetworkState>,
+) {
+    if settings.screen != ClientScreen::Challenge && settings.screen != ClientScreen::Sleep {
+        return;
+    }
+    let can_refresh = matches!(
+        state.lifecycle,
+        NetworkLifecycleState::Idle | NetworkLifecycleState::Hosting { .. }
+    );
+    if !can_refresh {
+        return;
+    }
+    let elapsed_ms = time.delta().as_millis().min(u128::from(u64::MAX)) as u64;
+    if settings.screen == ClientScreen::Sleep
+        || settings.challenge_mode == ChallengeMode::HostViaLobby
+    {
+        state.hosted_poll_elapsed_ms = state.hosted_poll_elapsed_ms.saturating_add(elapsed_ms);
+        if state.hosted_poll_elapsed_ms >= HOSTED_STATUS_POLL_INTERVAL_MS {
+            state.hosted_poll_elapsed_ms = 0;
+            poll_registered_hosted_status(&settings, &mut runtime, &mut state);
+        }
+    }
+    if settings.screen == ClientScreen::Challenge
+        && settings.challenge_mode == ChallengeMode::BrowseLobby
+        && state.lobby_list.is_some()
+    {
+        state.lobby_browse_elapsed_ms = state.lobby_browse_elapsed_ms.saturating_add(elapsed_ms);
+        if state.lobby_browse_elapsed_ms >= LOBBY_BROWSE_REFRESH_INTERVAL_MS {
+            state.lobby_browse_elapsed_ms = 0;
+            browse_hosted_lobby(&settings, &mut runtime, &mut state);
+        }
+    }
+}
+
+fn refresh_server_roster(
+    settings: Res<ClientSettings>,
+    mut runtime: ResMut<ClientNetworkRuntime>,
+    mut state: ResMut<ClientNetworkState>,
+    mut last_screen: Local<Option<ClientScreen>>,
+) {
+    let entered_roster =
+        settings.screen == ClientScreen::Roster && *last_screen != Some(ClientScreen::Roster);
+    *last_screen = Some(settings.screen);
+    if !entered_roster {
+        return;
+    }
+    let Ok(server_addr) = parse_network_addr(&settings.lobby_addr, "lobby address", &mut state)
+    else {
+        return;
+    };
+    try_send_network_command(
+        &mut runtime,
+        &mut state,
+        NetworkCommand::FetchRankedRecords {
+            server_addr,
+            limit: 20,
+        },
+    );
+}
+
+fn maintain_sleep_availability(
+    settings: Res<ClientSettings>,
+    mut runtime: ResMut<ClientNetworkRuntime>,
+    mut state: ResMut<ClientNetworkState>,
+    capture: Option<Res<VisualCapture>>,
+) {
+    if capture.is_some() {
+        return;
+    }
+    if settings.screen == ClientScreen::Sleep {
+        if !state.sleep_availability_attempted {
+            start_sleep_availability(&settings, &mut runtime, &mut state);
+        }
+        return;
+    }
+
+    if state.sleep_availability_attempted {
+        if !matches!(state.lifecycle, NetworkLifecycleState::Connected { .. }) {
+            cancel_network_challenge(&mut runtime, &mut state);
+        }
+        state.sleep_availability_attempted = false;
     }
 }
 
@@ -1961,7 +2753,21 @@ struct LocalGame {
     game: TwoPlayerGame,
     computer: Option<ComputerController>,
     local_player: PlayerId,
+    mode: LocalGameMode,
+    network_session: Option<NetworkSession>,
+    network_lockstep: Option<NetworkLockstep>,
+    network_failed_closed: bool,
+    network_game_over_sent: bool,
+    network_result_claim_submitted: bool,
     status_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalGameMode {
+    LocalHumanVsHuman,
+    ComputerOpponent,
+    DirectConnect,
+    HostedPlay,
 }
 
 #[derive(Resource, Debug, Clone)]
@@ -2119,6 +2925,12 @@ fn visual_computer_game(
             difficulty.level,
         )),
         local_player: PlayerId::One,
+        mode: LocalGameMode::ComputerOpponent,
+        network_session: None,
+        network_lockstep: None,
+        network_failed_closed: false,
+        network_game_over_sent: false,
+        network_result_claim_submitted: false,
         status_message: Some(status_message.to_string()),
     }
 }
@@ -2136,6 +2948,12 @@ fn visual_bazaar_game() -> LocalGame {
         game,
         computer: None,
         local_player: PlayerId::One,
+        mode: LocalGameMode::LocalHumanVsHuman,
+        network_session: None,
+        network_lockstep: None,
+        network_failed_closed: false,
+        network_game_over_sent: false,
+        network_result_claim_submitted: false,
         status_message: Some("Visual fixture: bazaar shopping".to_string()),
     }
 }
@@ -2156,6 +2974,12 @@ fn visual_game_over_game() -> LocalGame {
         ),
         computer: None,
         local_player: PlayerId::One,
+        mode: LocalGameMode::LocalHumanVsHuman,
+        network_session: None,
+        network_lockstep: None,
+        network_failed_closed: false,
+        network_game_over_sent: false,
+        network_result_claim_submitted: false,
         status_message: None,
     }
 }
@@ -2435,6 +3259,12 @@ impl LocalGame {
             game: TwoPlayerGame::new(GameSeed::from_u64(1), GameSeed::from_u64(2)),
             computer: None,
             local_player: PlayerId::One,
+            mode: LocalGameMode::LocalHumanVsHuman,
+            network_session: None,
+            network_lockstep: None,
+            network_failed_closed: false,
+            network_game_over_sent: false,
+            network_result_claim_submitted: false,
             status_message: None,
         }
     }
@@ -2457,7 +3287,40 @@ impl LocalGame {
                 difficulty.level,
             )),
             local_player: PlayerId::One,
+            mode: LocalGameMode::ComputerOpponent,
+            network_session: None,
+            network_lockstep: None,
+            network_failed_closed: false,
+            network_game_over_sent: false,
+            network_result_claim_submitted: false,
             status_message: Some(format!("Playing {} Ernie", difficulty.name)),
+        }
+    }
+
+    fn new_networked(session: NetworkSession) -> Self {
+        let (player_one_seed, player_two_seed) = derive_player_seeds(session.base_seed);
+        let local_player = core_player_for_slot(session.local_slot);
+        let mode = if session.hosted.is_some() {
+            LocalGameMode::HostedPlay
+        } else {
+            LocalGameMode::DirectConnect
+        };
+        let status_message = Some(network_session_status_label(&session, None));
+
+        Self {
+            game: TwoPlayerGame::new(
+                GameSeed::from_u64(player_one_seed),
+                GameSeed::from_u64(player_two_seed),
+            ),
+            computer: None,
+            local_player,
+            mode,
+            network_lockstep: Some(NetworkLockstep::new(session.local_slot)),
+            network_session: Some(session),
+            network_failed_closed: false,
+            network_game_over_sent: false,
+            network_result_claim_submitted: false,
+            status_message,
         }
     }
 
@@ -2469,12 +3332,26 @@ impl LocalGame {
             }
         };
     }
+
+    fn is_networked(&self) -> bool {
+        self.network_session.is_some() && self.network_lockstep.is_some()
+    }
+}
+
+const fn core_player_for_slot(slot: PlayerSlot) -> PlayerId {
+    match slot {
+        PlayerSlot::One => PlayerId::One,
+        PlayerSlot::Two => PlayerId::Two,
+    }
 }
 
 #[derive(Resource, Debug, Default)]
 struct ClientTickClock {
     gameplay_elapsed_ms: u64,
     computer_elapsed_ms: u64,
+    network_heartbeat_elapsed_ms: u64,
+    network_checksum_elapsed_ms: u64,
+    network_last_phase: Option<GamePhase>,
 }
 
 #[derive(Resource, Debug, Default)]
@@ -5281,6 +6158,8 @@ struct KeyboardInputParams<'w> {
     local: ResMut<'w, LocalGame>,
     settings: ResMut<'w, ClientSettings>,
     settings_edit: ResMut<'w, SettingsEditState>,
+    network_runtime: ResMut<'w, ClientNetworkRuntime>,
+    network_state: ResMut<'w, ClientNetworkState>,
     sound: ResMut<'w, SoundEventState>,
     repeat: ResMut<'w, InputRepeatState>,
     recon: ResMut<'w, ReconPanel>,
@@ -5306,6 +6185,8 @@ fn handle_keyboard_input(mut input: KeyboardInputParams) {
             &input.keys,
             &mut input.local,
             &mut input.settings,
+            &mut input.network_runtime,
+            &mut input.network_state,
             &mut input.sound,
         ),
         ClientScreen::Settings => {
@@ -5317,15 +6198,26 @@ fn handle_keyboard_input(mut input: KeyboardInputParams) {
             );
         }
         ClientScreen::Game => handle_game_input(
-            &input.keys,
-            &mut input.local,
-            &input.settings,
-            &mut input.repeat,
-            &mut input.recon,
-            &mut input.bazaar_ui,
+            GameInputContext {
+                keys: &input.keys,
+                local: &mut input.local,
+                network_runtime: &mut input.network_runtime,
+                network_state: &mut input.network_state,
+                settings: &input.settings,
+                repeat: &mut input.repeat,
+                recon: &mut input.recon,
+                bazaar_ui: &mut input.bazaar_ui,
+            },
             elapsed_ms,
         ),
-        ClientScreen::Sleep | ClientScreen::About | ClientScreen::Roster => {}
+        ClientScreen::Sleep => handle_sleep_input(
+            &input.keys,
+            &mut input.settings,
+            &mut input.network_runtime,
+            &mut input.network_state,
+            &mut input.sound,
+        ),
+        ClientScreen::About | ClientScreen::Roster => {}
     }
 }
 
@@ -5336,6 +6228,8 @@ struct MouseButtonParams<'w, 's> {
     buttons: Query<'w, 's, &'static MenuButton>,
     local: ResMut<'w, LocalGame>,
     settings: ResMut<'w, ClientSettings>,
+    network_runtime: ResMut<'w, ClientNetworkRuntime>,
+    network_state: ResMut<'w, ClientNetworkState>,
     themes: Res<'w, ThemePacks>,
     sound: ResMut<'w, SoundEventState>,
     bazaar_ui: ResMut<'w, BazaarUiState>,
@@ -5363,10 +6257,22 @@ fn handle_mouse_buttons(mut input: MouseButtonParams) {
         handle_bazaar_click(
             world,
             theme,
-            &mut input.local.game,
+            &mut input.local,
+            &mut input.network_runtime,
+            &mut input.network_state,
             &mut input.bazaar_ui,
             input.settings.content_mode,
         );
+        return;
+    }
+    if input.settings.screen == ClientScreen::Challenge
+        && select_challenge_entry_at_world(
+            world,
+            input.settings.challenge_mode,
+            &mut input.network_state,
+        )
+    {
+        queue_sound(&mut input.sound, SoundEvent::MenuAction);
         return;
     }
     let Some(button) = input
@@ -5381,6 +6287,8 @@ fn handle_mouse_buttons(mut input: MouseButtonParams) {
         button.action,
         &mut input.local,
         &mut input.settings,
+        &mut input.network_runtime,
+        &mut input.network_state,
         &mut input.sound,
         &mut input.app_exit,
     );
@@ -5390,16 +6298,39 @@ fn apply_menu_action(
     action: MenuAction,
     local: &mut LocalGame,
     settings: &mut ClientSettings,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
     sound: &mut SoundEventState,
     app_exit: &mut MessageWriter<AppExit>,
 ) {
     match action {
         MenuAction::StartHumanVsComputer => {
-            *local = LocalGame::new_human_vs_computer(settings.ernie_level);
-            settings.screen = ClientScreen::Game;
-            sound.next_log_index = 0;
+            if settings.screen == ClientScreen::Challenge {
+                start_selected_challenge_mode(
+                    local,
+                    settings,
+                    network_runtime,
+                    network_state,
+                    sound,
+                );
+            } else {
+                *local = LocalGame::new_human_vs_computer(settings.ernie_level);
+                settings.screen = ClientScreen::Game;
+                sound.next_log_index = 0;
+            }
         }
-        MenuAction::GoTo(screen) => settings.screen = screen,
+        MenuAction::GoTo(screen) => {
+            if settings.screen == ClientScreen::Challenge && screen == ClientScreen::Startup {
+                cancel_network_challenge(network_runtime, network_state);
+            }
+            if settings.screen == ClientScreen::Game
+                && local.is_networked()
+                && screen != ClientScreen::Game
+            {
+                leave_network_game(local, network_runtime, network_state, "left online game");
+            }
+            settings.screen = screen;
+        }
         MenuAction::Quit => {
             app_exit.write(AppExit::Success);
         }
@@ -5429,7 +6360,10 @@ fn handle_screen_shortcuts(
         Some(ClientScreen::Roster)
     } else if keys.just_pressed(KeyCode::F6) {
         Some(ClientScreen::Sleep)
-    } else if keys.just_pressed(KeyCode::Escape) {
+    } else if keys.just_pressed(KeyCode::Escape)
+        && settings.screen != ClientScreen::Challenge
+        && settings.screen != ClientScreen::Sleep
+    {
         Some(ClientScreen::Game)
     } else {
         None
@@ -5437,6 +6371,31 @@ fn handle_screen_shortcuts(
 
     if let Some(screen) = target {
         settings.screen = screen;
+        queue_sound(sound, SoundEvent::MenuAction);
+    }
+}
+
+fn handle_sleep_input(
+    keys: &ButtonInput<KeyCode>,
+    settings: &mut ClientSettings,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+    sound: &mut SoundEventState,
+) {
+    if keys.just_pressed(KeyCode::Escape) || keys.just_pressed(KeyCode::KeyW) {
+        cancel_network_challenge(network_runtime, network_state);
+        network_state.sleep_availability_attempted = false;
+        settings.screen = ClientScreen::Startup;
+        queue_sound(sound, SoundEvent::MenuAction);
+    }
+    if keys.just_pressed(KeyCode::KeyD) && network_state.pending_challenge.is_some() {
+        deny_pending_direct_challenge(network_runtime, network_state);
+        queue_sound(sound, SoundEvent::ChallengeRejected);
+    }
+    if (keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::KeyC))
+        && network_state.pending_challenge.is_some()
+    {
+        accept_pending_direct_challenge(network_runtime, network_state);
         queue_sound(sound, SoundEvent::MenuAction);
     }
 }
@@ -5470,6 +6429,8 @@ fn handle_challenge_input(
     keys: &ButtonInput<KeyCode>,
     local: &mut LocalGame,
     settings: &mut ClientSettings,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
     sound: &mut SoundEventState,
 ) {
     if keys.just_pressed(KeyCode::Digit1) {
@@ -5492,6 +6453,26 @@ fn handle_challenge_input(
         settings.challenge_mode = ChallengeMode::BrowseLobby;
         queue_sound(sound, SoundEvent::MenuAction);
     }
+    if keys.just_pressed(KeyCode::Digit6) {
+        settings.challenge_mode = ChallengeMode::BrowseLan;
+        queue_sound(sound, SoundEvent::MenuAction);
+    }
+    if matches!(
+        settings.challenge_mode,
+        ChallengeMode::BrowseLobby | ChallengeMode::BrowseLan
+    ) && (keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::KeyK))
+    {
+        select_challenge_entry(network_state, settings.challenge_mode, -1);
+        queue_sound(sound, SoundEvent::MenuAction);
+    }
+    if matches!(
+        settings.challenge_mode,
+        ChallengeMode::BrowseLobby | ChallengeMode::BrowseLan
+    ) && (keys.just_pressed(KeyCode::ArrowDown) || keys.just_pressed(KeyCode::KeyI))
+    {
+        select_challenge_entry(network_state, settings.challenge_mode, 1);
+        queue_sound(sound, SoundEvent::MenuAction);
+    }
     if keys.just_pressed(KeyCode::ArrowLeft) || keys.just_pressed(KeyCode::KeyJ) {
         adjust_ernie_level(settings, -1);
         queue_sound(sound, SoundEvent::MenuAction);
@@ -5500,14 +6481,640 @@ fn handle_challenge_input(
         adjust_ernie_level(settings, 1);
         queue_sound(sound, SoundEvent::MenuAction);
     }
-    if (keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::KeyC))
-        && settings.challenge_mode == ChallengeMode::ComputerOpponent
-    {
-        *local = LocalGame::new_human_vs_computer(settings.ernie_level);
-        settings.screen = ClientScreen::Game;
-        sound.next_log_index = 0;
+    if keys.just_pressed(KeyCode::Escape) {
+        cancel_network_challenge(network_runtime, network_state);
+        settings.screen = ClientScreen::Startup;
         queue_sound(sound, SoundEvent::MenuAction);
     }
+    if keys.just_pressed(KeyCode::KeyD) && network_state.pending_challenge.is_some() {
+        deny_pending_direct_challenge(network_runtime, network_state);
+        queue_sound(sound, SoundEvent::MenuAction);
+    }
+    if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::KeyC) {
+        start_selected_challenge_mode(local, settings, network_runtime, network_state, sound);
+        queue_sound(sound, SoundEvent::MenuAction);
+    }
+}
+
+fn start_selected_challenge_mode(
+    local: &mut LocalGame,
+    settings: &mut ClientSettings,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+    sound: &mut SoundEventState,
+) {
+    if network_state.pending_challenge.is_some() {
+        accept_pending_direct_challenge(network_runtime, network_state);
+        return;
+    }
+
+    match settings.challenge_mode {
+        ChallengeMode::ComputerOpponent => {
+            *local = LocalGame::new_human_vs_computer(settings.ernie_level);
+            settings.screen = ClientScreen::Game;
+            sound.next_log_index = 0;
+        }
+        ChallengeMode::HostDirect => {
+            host_direct_challenge(settings, network_runtime, network_state)
+        }
+        ChallengeMode::JoinDirect => {
+            join_direct_challenge(settings, network_runtime, network_state)
+        }
+        ChallengeMode::HostViaLobby => {
+            host_via_lobby_challenge(settings, network_runtime, network_state)
+        }
+        ChallengeMode::BrowseLobby => {
+            start_or_browse_hosted_lobby(settings, network_runtime, network_state)
+        }
+        ChallengeMode::BrowseLan => start_or_browse_lan(settings, network_runtime, network_state),
+    }
+}
+
+fn host_direct_challenge(
+    settings: &ClientSettings,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+) {
+    let Ok(bind_addr) =
+        parse_network_addr(&settings.direct_listen_addr, "host bind", network_state)
+    else {
+        return;
+    };
+    try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::Host {
+            bind_addr,
+            identity: direct_identity(settings),
+        },
+    );
+}
+
+fn start_lan_advertising(
+    settings: &ClientSettings,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+) {
+    if network_state.lan_advertising {
+        return;
+    }
+    let share_addr = effective_direct_share_addr(settings, network_state);
+    let Ok(share_addr) = parse_network_addr(&share_addr, "LAN share address", network_state) else {
+        return;
+    };
+    try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::StartLanAdvertising {
+            identity: direct_identity(settings),
+            share_addr,
+        },
+    );
+}
+
+fn join_direct_challenge(
+    settings: &ClientSettings,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+) {
+    let Ok(peer_addr) =
+        parse_network_addr(&settings.direct_join_addr, "join address", network_state)
+    else {
+        return;
+    };
+    try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::Join {
+            peer_addr,
+            identity: direct_identity(settings),
+            challenge_text: "battle?".to_string(),
+        },
+    );
+}
+
+fn host_via_lobby_challenge(
+    settings: &ClientSettings,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+) {
+    let Ok(bind_addr) =
+        parse_network_addr(&settings.direct_listen_addr, "host bind", network_state)
+    else {
+        return;
+    };
+    network_state.lobby_registration = None;
+    network_state.hosted_status = None;
+    network_state.hosted_start = None;
+    try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::Host {
+            bind_addr,
+            identity: direct_identity(settings),
+        },
+    );
+}
+
+fn start_sleep_availability(
+    settings: &ClientSettings,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+) {
+    network_state.sleep_availability_attempted = true;
+    let Ok(bind_addr) =
+        parse_network_addr(&settings.direct_listen_addr, "sleep bind", network_state)
+    else {
+        return;
+    };
+    if !matches!(network_state.lifecycle, NetworkLifecycleState::Idle) {
+        network_state.push_message(format!(
+            "Sleep availability not started; network is {:?}",
+            network_state.lifecycle
+        ));
+        return;
+    }
+    network_state.lobby_registration = None;
+    network_state.hosted_status = None;
+    network_state.hosted_start = None;
+    try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::Host {
+            bind_addr,
+            identity: direct_identity(settings),
+        },
+    );
+}
+
+fn register_hosted_lobby(
+    settings: &ClientSettings,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+) {
+    let Ok(server_addr) = parse_network_addr(&settings.lobby_addr, "lobby address", network_state)
+    else {
+        return;
+    };
+    let direct_addr = effective_direct_share_addr(settings, network_state);
+    network_state.lobby_server_addr = Some(server_addr);
+    try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::RegisterLobby {
+            server_addr,
+            request: LobbyRegister {
+                player: hosted_player(settings),
+                direct_addr,
+                ranked: settings.hosted_ranked,
+            },
+        },
+    );
+}
+
+fn browse_hosted_lobby(
+    settings: &ClientSettings,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+) {
+    let Ok(server_addr) = parse_network_addr(&settings.lobby_addr, "lobby address", network_state)
+    else {
+        return;
+    };
+    try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::BrowseLobby {
+            server_addr,
+            ranked_only: false,
+        },
+    );
+}
+
+fn browse_lan(network_runtime: &mut ClientNetworkRuntime, network_state: &mut ClientNetworkState) {
+    try_send_network_command(network_runtime, network_state, NetworkCommand::BrowseLan);
+}
+
+fn start_or_browse_lan(
+    settings: &ClientSettings,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+) {
+    let Some(entry) = selected_lan_entry(network_state).cloned() else {
+        browse_lan(network_runtime, network_state);
+        return;
+    };
+    if !entry.compatible {
+        network_state.push_message(format!(
+            "Selected LAN host uses incompatible protocol v{}.{}",
+            entry.protocol_major, entry.protocol_minor
+        ));
+        return;
+    }
+    if entry.availability != LanAvailability::Available {
+        network_state.push_message(format!(
+            "Selected LAN host is not available: {:?}",
+            entry.availability
+        ));
+        return;
+    }
+    let Some(peer_addr) = entry.addr else {
+        network_state.push_message("Selected LAN host did not publish a usable address");
+        return;
+    };
+    try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::Join {
+            peer_addr,
+            identity: direct_identity(settings),
+            challenge_text: "battle?".to_string(),
+        },
+    );
+}
+
+fn start_or_browse_hosted_lobby(
+    settings: &ClientSettings,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+) {
+    if selected_lobby_entry(network_state).is_none() {
+        browse_hosted_lobby(settings, network_runtime, network_state);
+        return;
+    }
+    start_selected_hosted_game(settings, network_runtime, network_state);
+}
+
+fn start_selected_hosted_game(
+    settings: &ClientSettings,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+) {
+    let Some(entry) = selected_lobby_entry(network_state).cloned() else {
+        network_state.push_message("No lobby opponent selected");
+        return;
+    };
+    if entry.protocol_major != PROTOCOL_MAJOR {
+        network_state.push_message(format!(
+            "Selected lobby entry uses incompatible protocol v{}.{}",
+            entry.protocol_major, entry.protocol_minor
+        ));
+        return;
+    }
+    if entry.host.player_id == hosted_player_id(settings) {
+        network_state.push_message("Cannot challenge your own lobby entry");
+        return;
+    }
+    let Ok(server_addr) = parse_network_addr(&settings.lobby_addr, "lobby address", network_state)
+    else {
+        return;
+    };
+    try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::StartHostedGame {
+            server_addr,
+            session_id: entry.session_id,
+            joiner: hosted_player(settings),
+        },
+    );
+}
+
+fn accept_pending_direct_challenge(
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+) {
+    if let Some(challenge) = &network_state.pending_challenge {
+        if challenge.hosted_session_id.is_some() || challenge.hosted_player_id.is_some() {
+            accept_pending_hosted_challenge(network_runtime, network_state);
+            return;
+        }
+    }
+    try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::Accept {
+            seed: direct_accept_seed(),
+            ranked: false,
+        },
+    );
+}
+
+fn accept_pending_hosted_challenge(
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+) {
+    let Some(start) = hosted_start_for_accept(network_state) else {
+        network_state.push_message("Hosted challenge does not match server-owned session status");
+        return;
+    };
+    try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::AcceptHosted {
+            hosted_start: start,
+        },
+    );
+}
+
+fn poll_registered_hosted_status(
+    settings: &ClientSettings,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+) {
+    let Some(entry) = network_state.lobby_registration.clone() else {
+        return;
+    };
+    let server_addr = network_state
+        .lobby_server_addr
+        .or_else(|| settings.lobby_addr.parse::<SocketAddr>().ok());
+    let Some(server_addr) = server_addr else {
+        return;
+    };
+    try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::PollHostedStatus {
+            server_addr,
+            session_id: entry.session_id,
+            requester_player_id: entry.host.player_id,
+        },
+    );
+}
+
+fn join_hosted_direct_after_start(
+    settings: &ClientSettings,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+    start: HostedGameStart,
+) {
+    let Some(entry) = lobby_entry_for_session(network_state, &start.session_id).cloned() else {
+        network_state
+            .push_message("Hosted start returned for an entry no longer in the lobby list");
+        return;
+    };
+    let Ok(peer_addr) =
+        parse_network_addr(&entry.direct_addr, "hosted direct address", network_state)
+    else {
+        return;
+    };
+    try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::JoinHostedDirect {
+            peer_addr,
+            identity: direct_identity(settings),
+            challenge_text: "hosted battle?".to_string(),
+            hosted_session_id: start.session_id.clone(),
+            hosted_player_id: hosted_player_id(settings),
+            hosted_start: start,
+        },
+    );
+}
+
+fn hosted_start_for_accept(network_state: &ClientNetworkState) -> Option<HostedGameStart> {
+    let challenge = network_state.pending_challenge.as_ref()?;
+    let start = network_state.hosted_start.clone().or_else(|| {
+        let status = network_state.hosted_status.as_ref()?;
+        match &status.status {
+            HostedSessionStatusKind::Started(start) => Some(start.clone()),
+            _ => None,
+        }
+    })?;
+    if challenge.hosted_session_id.as_ref() != Some(&start.session_id) {
+        return None;
+    }
+    if challenge.hosted_player_id.as_deref() != Some(start.player_two.player_id.as_str()) {
+        return None;
+    }
+    Some(start)
+}
+
+fn selected_lobby_entry(network_state: &ClientNetworkState) -> Option<&LobbyEntry> {
+    network_state
+        .lobby_list
+        .as_ref()?
+        .entries
+        .get(network_state.lobby_selected_index)
+}
+
+fn selected_lan_entry(network_state: &ClientNetworkState) -> Option<&LanDiscoveryEntry> {
+    network_state
+        .lan_entries
+        .get(network_state.lan_selected_index)
+}
+
+fn select_challenge_entry(
+    network_state: &mut ClientNetworkState,
+    mode: ChallengeMode,
+    direction: isize,
+) {
+    match mode {
+        ChallengeMode::BrowseLobby => select_lobby_entry(network_state, direction),
+        ChallengeMode::BrowseLan => select_lan_entry(network_state, direction),
+        _ => {}
+    }
+}
+
+fn lobby_entry_for_session<'a>(
+    network_state: &'a ClientNetworkState,
+    session_id: &battletris_protocol::HostedSessionId,
+) -> Option<&'a LobbyEntry> {
+    network_state
+        .lobby_list
+        .as_ref()?
+        .entries
+        .iter()
+        .find(|entry| &entry.session_id == session_id)
+}
+
+fn select_lobby_entry(network_state: &mut ClientNetworkState, direction: isize) {
+    let Some(list) = &network_state.lobby_list else {
+        return;
+    };
+    if list.entries.is_empty() {
+        network_state.lobby_selected_index = 0;
+        return;
+    }
+    let len = list.entries.len() as isize;
+    let next = (network_state.lobby_selected_index as isize + direction).rem_euclid(len);
+    network_state.lobby_selected_index = next as usize;
+}
+
+fn select_lan_entry(network_state: &mut ClientNetworkState, direction: isize) {
+    if network_state.lan_entries.is_empty() {
+        network_state.lan_selected_index = 0;
+        return;
+    }
+    let len = network_state.lan_entries.len() as isize;
+    let next = (network_state.lan_selected_index as isize + direction).rem_euclid(len);
+    network_state.lan_selected_index = next as usize;
+}
+
+fn select_challenge_entry_at_world(
+    world: Vec2,
+    mode: ChallengeMode,
+    network_state: &mut ClientNetworkState,
+) -> bool {
+    match mode {
+        ChallengeMode::BrowseLobby => select_lobby_entry_at_world(world, network_state),
+        ChallengeMode::BrowseLan => select_lan_entry_at_world(world, network_state),
+        _ => false,
+    }
+}
+
+fn select_lobby_entry_at_world(world: Vec2, network_state: &mut ClientNetworkState) -> bool {
+    let Some(list) = &network_state.lobby_list else {
+        return false;
+    };
+    if list.entries.is_empty() {
+        return false;
+    }
+    let screen_x = (world.x + 320.0) / 0.8;
+    let screen_y = (300.0 - world.y) * 7.0 / 6.0;
+    if !(38.0..=382.0).contains(&screen_x) || !(44.0..=470.0).contains(&screen_y) {
+        return false;
+    }
+    let row = ((screen_y - 92.0) / 32.0).floor() as isize;
+    if row < 0 {
+        return false;
+    }
+    let index = row as usize;
+    if index >= list.entries.len().min(8) {
+        return false;
+    }
+    network_state.lobby_selected_index = index;
+    true
+}
+
+fn select_lan_entry_at_world(world: Vec2, network_state: &mut ClientNetworkState) -> bool {
+    if network_state.lan_entries.is_empty() {
+        return false;
+    }
+    let Some(index) = challenge_entry_index_at_world(world) else {
+        return false;
+    };
+    if index >= network_state.lan_entries.len().min(8) {
+        return false;
+    }
+    network_state.lan_selected_index = index;
+    true
+}
+
+fn challenge_entry_index_at_world(world: Vec2) -> Option<usize> {
+    let screen_x = (world.x + 320.0) / 0.8;
+    let screen_y = (300.0 - world.y) * 7.0 / 6.0;
+    if !(38.0..=382.0).contains(&screen_x) || !(44.0..=470.0).contains(&screen_y) {
+        return None;
+    }
+    let row = ((screen_y - 92.0) / 32.0).floor() as isize;
+    (row >= 0).then_some(row as usize)
+}
+
+fn deny_pending_direct_challenge(
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+) {
+    try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::Deny {
+            reason: "Challenge denied by host".to_string(),
+        },
+    );
+}
+
+fn cancel_network_challenge(
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+) {
+    cancel_hosted_registration(network_runtime, network_state);
+    try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::StopLanAdvertising,
+    );
+    if network_operation_can_cancel(&network_state.lifecycle) {
+        try_send_network_command(network_runtime, network_state, NetworkCommand::Cancel);
+    }
+}
+
+fn cancel_hosted_registration(
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+) {
+    let Some(entry) = network_state.lobby_registration.clone() else {
+        return;
+    };
+    let Some(server_addr) = network_state.lobby_server_addr else {
+        network_state.lobby_registration = None;
+        return;
+    };
+    try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::CancelHostedSession {
+            server_addr,
+            session_id: entry.session_id,
+            requester_player_id: entry.host.player_id,
+        },
+    );
+}
+
+fn leave_network_game(
+    local: &mut LocalGame,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+    reason: &str,
+) {
+    if local.is_networked() {
+        try_send_network_command(
+            network_runtime,
+            network_state,
+            NetworkCommand::Disconnect {
+                reason: reason.to_string(),
+            },
+        );
+        local.network_session = None;
+        local.network_lockstep = None;
+        local.network_failed_closed = true;
+        local.status_message = Some(reason.to_string());
+    }
+}
+
+fn network_operation_can_cancel(lifecycle: &NetworkLifecycleState) -> bool {
+    matches!(
+        lifecycle,
+        NetworkLifecycleState::Hosting { .. }
+            | NetworkLifecycleState::Joining { .. }
+            | NetworkLifecycleState::Challenged { .. }
+            | NetworkLifecycleState::Error { .. }
+    )
+}
+
+fn parse_network_addr(
+    value: &str,
+    label: &str,
+    network_state: &mut ClientNetworkState,
+) -> Result<SocketAddr, ()> {
+    value.parse::<SocketAddr>().map_err(|error| {
+        let message = format!("Invalid {label} '{value}': {error}");
+        network_state.last_error = Some(message.clone());
+        network_state.push_message(message);
+    })
+}
+
+fn direct_identity(settings: &ClientSettings) -> PlayerIdentity {
+    PlayerIdentity {
+        display_name: settings.display_name.clone(),
+    }
+}
+
+fn direct_accept_seed() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0x00B4_771E_7415)
 }
 
 fn handle_settings_input(
@@ -5660,51 +7267,96 @@ fn text_entry_keys(shifted: bool) -> [(KeyCode, char); 44] {
     ]
 }
 
-fn handle_game_input(
-    keys: &ButtonInput<KeyCode>,
-    local: &mut LocalGame,
-    settings: &ClientSettings,
-    repeat: &mut InputRepeatState,
-    recon: &mut ReconPanel,
-    bazaar_ui: &mut BazaarUiState,
-    elapsed_ms: u64,
-) {
-    if keys.just_pressed(KeyCode::KeyR) {
-        local.restart();
+struct GameInputContext<'a> {
+    keys: &'a ButtonInput<KeyCode>,
+    local: &'a mut LocalGame,
+    network_runtime: &'a mut ClientNetworkRuntime,
+    network_state: &'a mut ClientNetworkState,
+    settings: &'a ClientSettings,
+    repeat: &'a mut InputRepeatState,
+    recon: &'a mut ReconPanel,
+    bazaar_ui: &'a mut BazaarUiState,
+}
+
+fn handle_game_input(ctx: GameInputContext<'_>, elapsed_ms: u64) {
+    if ctx.keys.just_pressed(KeyCode::KeyR) {
+        if ctx.local.is_networked() {
+            ctx.local.status_message =
+                Some("Restart is unavailable during online play.".to_string());
+            return;
+        }
+        ctx.local.restart();
         return;
     }
 
-    if keys.just_pressed(KeyCode::KeyP) {
-        if local.game.phase() == GamePhase::Paused {
-            let _ = local.game.resume();
+    if ctx.keys.just_pressed(KeyCode::KeyP) {
+        if ctx.local.is_networked() {
+            ctx.local.status_message = Some("Pause is unavailable during online play.".to_string());
+            return;
+        }
+        if ctx.local.game.phase() == GamePhase::Paused {
+            let _ = ctx.local.game.resume();
         } else {
-            let _ = local.game.pause();
+            let _ = ctx.local.game.pause();
         }
     }
 
-    if keys.just_pressed(KeyCode::KeyQ) {
-        local.status_message =
+    if ctx.keys.just_pressed(KeyCode::KeyQ) {
+        ctx.local.status_message =
             Some("BattleTris is owned and operated by the legacy crew.".to_string());
     }
 
-    if keys.just_pressed(KeyCode::KeyC) && local.computer.is_some() {
-        recon.manual_condor = !recon.manual_condor;
-        if !recon.manual_condor {
-            recon.snapshot = None;
+    if ctx.keys.just_pressed(KeyCode::KeyC) && ctx.local.computer.is_some() {
+        ctx.recon.manual_condor = !ctx.recon.manual_condor;
+        if !ctx.recon.manual_condor {
+            ctx.recon.snapshot = None;
         }
     }
 
-    if local.game.phase() == GamePhase::Bazaar {
-        handle_bazaar_input(keys, &mut local.game, bazaar_ui, settings.content_mode);
+    if ctx.local.game.phase() == GamePhase::Bazaar {
+        handle_bazaar_input(
+            ctx.keys,
+            ctx.local,
+            ctx.network_runtime,
+            ctx.network_state,
+            ctx.bazaar_ui,
+            ctx.settings.content_mode,
+        );
         return;
     }
 
-    if local.game.phase() != GamePhase::Playing {
+    if ctx.local.game.phase() != GamePhase::Playing {
+        return;
+    }
+
+    if ctx.local.is_networked() {
+        send_network_player_controls(
+            ctx.keys,
+            ctx.local,
+            ctx.network_runtime,
+            ctx.network_state,
+            ctx.settings.controls,
+            ctx.repeat,
+            elapsed_ms,
+        );
+        for (label, key) in slot_keys() {
+            if ctx.keys.just_pressed(key) {
+                schedule_network_input(
+                    ctx.local,
+                    ctx.network_runtime,
+                    ctx.network_state,
+                    InputCommand::LaunchWeapon {
+                        slot_index: slot_label_to_index(label),
+                    },
+                );
+            }
+        }
         return;
     }
 
     for player in [PlayerId::One, PlayerId::Two] {
-        if local
+        if ctx
+            .local
             .computer
             .as_ref()
             .is_some_and(|computer| computer.player == player)
@@ -5712,28 +7364,30 @@ fn handle_game_input(
             continue;
         }
         send_player_controls(
-            keys,
-            &mut local.game,
+            ctx.keys,
+            &mut ctx.local.game,
             player,
-            settings.controls,
-            repeat,
+            ctx.settings.controls,
+            ctx.repeat,
             elapsed_ms,
         );
     }
 
     for (label, key) in slot_keys() {
-        if keys.just_pressed(key) {
-            let player = if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
-                PlayerId::Two
-            } else {
-                PlayerId::One
-            };
-            if local
+        if ctx.keys.just_pressed(key) {
+            let player =
+                if ctx.keys.pressed(KeyCode::ShiftLeft) || ctx.keys.pressed(KeyCode::ShiftRight) {
+                    PlayerId::Two
+                } else {
+                    PlayerId::One
+                };
+            if ctx
+                .local
                 .computer
                 .as_ref()
                 .is_none_or(|computer| computer.player != player)
             {
-                let _ = local.game.launch_weapon_slot(player, label);
+                let _ = ctx.local.game.launch_weapon_slot(player, label);
             }
         }
     }
@@ -5783,6 +7437,60 @@ fn send_player_controls(
     send_fast_drop(keys, game, player, controls.fast_drop);
 }
 
+fn send_network_player_controls(
+    keys: &ButtonInput<KeyCode>,
+    local: &mut LocalGame,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+    scheme: ControlScheme,
+    repeat: &mut InputRepeatState,
+    elapsed_ms: u64,
+) {
+    let player = local.local_player;
+    let controls = controls_for(player, scheme);
+    send_network_repeat_command(
+        keys,
+        local,
+        network_runtime,
+        network_state,
+        (controls.left, InputCommand::MoveLeft),
+        &mut repeat.left[client_player_index(player)],
+        elapsed_ms,
+    );
+    send_network_repeat_command(
+        keys,
+        local,
+        network_runtime,
+        network_state,
+        (controls.right, InputCommand::MoveRight),
+        &mut repeat.right[client_player_index(player)],
+        elapsed_ms,
+    );
+    send_network_press_command(
+        keys,
+        local,
+        network_runtime,
+        network_state,
+        controls.rotate_cw,
+        InputCommand::RotateClockwise,
+    );
+    send_network_press_command(
+        keys,
+        local,
+        network_runtime,
+        network_state,
+        controls.rotate_ccw,
+        InputCommand::RotateCounterClockwise,
+    );
+    send_network_fast_drop(
+        keys,
+        local,
+        network_runtime,
+        network_state,
+        controls.fast_drop,
+    );
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PlayerControls {
     left: KeyCode,
@@ -5827,12 +7535,20 @@ fn controls_for(player: PlayerId, scheme: ControlScheme) -> PlayerControls {
 
 fn handle_bazaar_input(
     keys: &ButtonInput<KeyCode>,
-    game: &mut TwoPlayerGame,
+    local: &mut LocalGame,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
     bazaar_ui: &mut BazaarUiState,
     content_mode: ContentMode,
 ) {
+    let is_networked = local.is_networked();
     if keys.just_pressed(KeyCode::Enter) {
-        match game.bazaar_done(PlayerId::One) {
+        let events = if is_networked {
+            send_network_bazaar_done(local, network_runtime, network_state, bazaar_ui)
+        } else {
+            local.game.bazaar_done(PlayerId::One)
+        };
+        match events {
             events if events.is_empty() => {
                 bazaar_ui.last_message = UiTextTone::bazaar_waiting_copy(
                     content_mode,
@@ -5847,8 +7563,8 @@ fn handle_bazaar_input(
             }
         }
     }
-    if keys.just_pressed(KeyCode::Space) {
-        match game.bazaar_done(PlayerId::Two) {
+    if keys.just_pressed(KeyCode::Space) && !is_networked {
+        match local.game.bazaar_done(PlayerId::Two) {
             events if events.is_empty() => {
                 bazaar_ui.last_message = UiTextTone::bazaar_waiting_copy(
                     content_mode,
@@ -5871,10 +7587,22 @@ fn handle_bazaar_input(
         bazaar_ui.selected = adjacent_catalog_token(bazaar_ui.selected, 1);
     }
     if keys.just_pressed(KeyCode::KeyA) || keys.just_pressed(KeyCode::Equal) {
-        buy_selected_bazaar_weapon(game, bazaar_ui, PlayerId::One);
+        buy_selected_bazaar_weapon(
+            local,
+            network_runtime,
+            network_state,
+            bazaar_ui,
+            PlayerId::One,
+        );
     }
     if keys.just_pressed(KeyCode::KeyX) || keys.just_pressed(KeyCode::Minus) {
-        remove_selected_bazaar_weapon(game, bazaar_ui, PlayerId::One);
+        remove_selected_bazaar_weapon(
+            local,
+            network_runtime,
+            network_state,
+            bazaar_ui,
+            PlayerId::One,
+        );
     }
 
     for (token, key) in bazaar_catalog_keys() {
@@ -5885,7 +7613,25 @@ fn handle_bazaar_input(
                 PlayerId::One
             };
             bazaar_ui.selected = token;
-            buy_bazaar_weapon(game, bazaar_ui, player, token);
+            if is_networked {
+                buy_bazaar_weapon(
+                    local,
+                    network_runtime,
+                    network_state,
+                    bazaar_ui,
+                    local.local_player,
+                    token,
+                );
+            } else {
+                buy_bazaar_weapon(
+                    local,
+                    network_runtime,
+                    network_state,
+                    bazaar_ui,
+                    player,
+                    token,
+                );
+            }
         }
     }
 }
@@ -6018,6 +7764,8 @@ fn tick_game(
     settings: Res<ClientSettings>,
     mut local: ResMut<LocalGame>,
     mut clock: ResMut<ClientTickClock>,
+    mut network_runtime: ResMut<ClientNetworkRuntime>,
+    mut network_state: ResMut<ClientNetworkState>,
     capture: Option<Res<VisualCapture>>,
 ) {
     if capture.is_some() {
@@ -6034,6 +7782,17 @@ fn tick_game(
         return;
     }
 
+    if local.is_networked() {
+        tick_network_game(
+            &mut local,
+            &mut clock,
+            &mut network_runtime,
+            &mut network_state,
+            &settings,
+        );
+        return;
+    }
+
     while clock.gameplay_elapsed_ms >= CLIENT_FIXED_TICK_MS {
         clock.gameplay_elapsed_ms -= CLIENT_FIXED_TICK_MS;
         let _ = local.game.tick_player(PlayerId::One, CLIENT_FIXED_TICK_MS);
@@ -6042,6 +7801,195 @@ fn tick_game(
             break;
         }
     }
+}
+
+fn tick_network_game(
+    local: &mut LocalGame,
+    clock: &mut ClientTickClock,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+    settings: &ClientSettings,
+) {
+    while clock.gameplay_elapsed_ms >= CLIENT_FIXED_TICK_MS {
+        if local.network_failed_closed {
+            clock.gameplay_elapsed_ms = 0;
+            return;
+        }
+        clock.gameplay_elapsed_ms -= CLIENT_FIXED_TICK_MS;
+        clock.network_heartbeat_elapsed_ms = clock
+            .network_heartbeat_elapsed_ms
+            .saturating_add(CLIENT_FIXED_TICK_MS);
+        clock.network_checksum_elapsed_ms = clock
+            .network_checksum_elapsed_ms
+            .saturating_add(CLIENT_FIXED_TICK_MS);
+
+        let Some(mut lockstep) = local.network_lockstep.take() else {
+            local.status_message = Some("Network lockstep state is missing.".to_string());
+            return;
+        };
+
+        let watermark = lockstep.mark_local_watermark(lockstep.current_tick());
+        try_send_network_command(
+            network_runtime,
+            network_state,
+            NetworkCommand::SendTickWatermark(watermark.clone()),
+        );
+
+        if clock.network_heartbeat_elapsed_ms >= NETWORK_HEARTBEAT_INTERVAL_MS {
+            clock.network_heartbeat_elapsed_ms = 0;
+            try_send_network_command(
+                network_runtime,
+                network_state,
+                NetworkCommand::SendHeartbeat(Heartbeat {
+                    player: watermark.player,
+                    current_tick: lockstep.current_tick(),
+                    watermark_tick: watermark.through_tick,
+                }),
+            );
+        }
+
+        let previous_phase = clock.network_last_phase.unwrap_or(local.game.phase());
+        match lockstep.advance_ready(&mut local.game) {
+            Ok(_) => {
+                if let Some(session) = local.network_session.as_mut() {
+                    session.current_tick = lockstep.current_tick();
+                    session.peer_watermark = lockstep.peer_watermark();
+                    local.status_message =
+                        Some(network_session_status_label(session, Some(&lockstep)));
+                }
+
+                let current_phase = local.game.phase();
+                if previous_phase != current_phase {
+                    send_network_checksum(local, &lockstep, network_runtime, network_state);
+                    clock.network_last_phase = Some(current_phase);
+                }
+                if clock.network_checksum_elapsed_ms >= NETWORK_CHECKSUM_INTERVAL_MS {
+                    clock.network_checksum_elapsed_ms = 0;
+                    send_network_checksum(local, &lockstep, network_runtime, network_state);
+                }
+                if current_phase == GamePhase::GameOver && !local.network_game_over_sent {
+                    if let Some(game_over) = game_over_message_with_tick(local, &lockstep) {
+                        local.network_game_over_sent = try_send_network_command(
+                            network_runtime,
+                            network_state,
+                            NetworkCommand::SendGameOver(game_over),
+                        );
+                        send_network_checksum(local, &lockstep, network_runtime, network_state);
+                    }
+                }
+                if current_phase == GamePhase::GameOver && !local.network_result_claim_submitted {
+                    submit_hosted_ranked_result_claim(
+                        local,
+                        lockstep.current_tick(),
+                        network_runtime,
+                        network_state,
+                        settings,
+                    );
+                }
+                local.network_lockstep = Some(lockstep);
+            }
+            Err(error) => {
+                let message = format!("Network lockstep error: {error:?}");
+                local.status_message = Some(message.clone());
+                network_state.last_error = Some(message.clone());
+                network_state.push_message(message.clone());
+                warn!("{message}");
+                try_send_network_command(
+                    network_runtime,
+                    network_state,
+                    NetworkCommand::Disconnect { reason: message },
+                );
+                local.network_lockstep = Some(lockstep);
+                break;
+            }
+        }
+
+        if local.game.phase() != GamePhase::Playing {
+            break;
+        }
+    }
+}
+
+fn send_network_checksum(
+    local: &LocalGame,
+    lockstep: &NetworkLockstep,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+) {
+    if local.network_failed_closed {
+        return;
+    }
+    try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::SendChecksum(lockstep.checksum_message(&local.game)),
+    );
+}
+
+fn submit_hosted_ranked_result_claim(
+    local: &mut LocalGame,
+    duration_ticks: u64,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+    settings: &ClientSettings,
+) {
+    local.network_result_claim_submitted = true;
+    let Some(session) = local.network_session.clone() else {
+        return;
+    };
+    if !session.ranked {
+        set_local_result_status(local, FinalResultStatus::Unranked);
+        network_state.result_status = FinalResultStatus::Unranked;
+        return;
+    }
+    if local.network_failed_closed {
+        let status = FinalResultStatus::Rejected("desynced".to_string());
+        set_local_result_status(local, status.clone());
+        network_state.result_status = status;
+        return;
+    }
+    let Ok(server_addr) = parse_network_addr(&settings.lobby_addr, "lobby address", network_state)
+    else {
+        let status = FinalResultStatus::Rejected("connection error".to_string());
+        set_local_result_status(local, status.clone());
+        network_state.result_status = status;
+        return;
+    };
+    let claim = match build_ranked_result_claim(&session, &local.game, duration_ticks) {
+        Ok(claim) => claim,
+        Err(reason) => {
+            let status = FinalResultStatus::Rejected(reason);
+            set_local_result_status(local, status.clone());
+            network_state.result_status = status;
+            return;
+        }
+    };
+    network_state.result_status = FinalResultStatus::None;
+    local.status_message = Some("Submitting hosted ranked result claim".to_string());
+    try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::SubmitResult { server_addr, claim },
+    );
+}
+
+fn game_over_message(local: &LocalGame) -> Option<GameOver> {
+    let lockstep = local.network_lockstep.as_ref()?;
+    game_over_message_with_tick(local, lockstep)
+}
+
+fn game_over_message_with_tick(local: &LocalGame, lockstep: &NetworkLockstep) -> Option<GameOver> {
+    local.game.event_log().iter().rev().find_map(|logged| {
+        if let BattleEvent::GameOver { winner, loser } = logged.event {
+            Some(GameOver {
+                winner: protocol_slot_for_player(winner),
+                loser: protocol_slot_for_player(loser),
+                sequence: lockstep.current_tick().saturating_sub(1),
+            })
+        } else {
+            None
+        }
+    })
 }
 
 fn update_recon_panel(mut recon: ResMut<ReconPanel>, local: Res<LocalGame>) {
@@ -6281,6 +8229,7 @@ struct RenderGameParams<'w, 's> {
     local: Res<'w, LocalGame>,
     settings: Res<'w, ClientSettings>,
     settings_edit: Res<'w, SettingsEditState>,
+    network_state: Res<'w, ClientNetworkState>,
     roster: Res<'w, RosterRecords>,
     themes: Res<'w, ThemePacks>,
     atlases: Res<'w, ThemeAtlasHandles>,
@@ -6346,6 +8295,7 @@ fn render_game(mut render: RenderGameParams) {
         &render.local.game,
         &render.settings,
         &render.settings_edit,
+        &render.network_state,
         &render.roster,
     );
     for (bazaar_text, mut text) in &mut render.bazaar_text {
@@ -6360,19 +8310,16 @@ fn render_game(mut render: RenderGameParams) {
         text.0 = legacy_game_text_label(&render.local, &render.settings, legacy_text.role);
     }
     for (challenge_text, mut text) in &mut render.challenge_text {
-        text.0 = challenge_label(challenge_text.role, &render.settings);
+        text.0 = challenge_label(challenge_text.role, &render.settings, &render.network_state);
     }
     for (roster_text, mut text) in &mut render.roster_text {
-        text.0 = roster_text_label(&render.roster, roster_text.role);
+        text.0 = roster_text_label(&render.roster, &render.network_state, roster_text.role);
     }
     for (button, mut text) in &mut render.menu_button_text {
         if button.screen == ClientScreen::Challenge
             && matches!(button.action, MenuAction::StartHumanVsComputer)
         {
-            text.0 = format!(
-                "Play {} Ernie",
-                selected_ernie_difficulty(&render.settings).name
-            );
+            text.0 = challenge_primary_button_label(&render.settings, &render.network_state);
         }
     }
     for (knob, mut transform) in &mut render.challenge_slider_knob {
@@ -6954,6 +8901,19 @@ fn send_press_command(
     }
 }
 
+fn send_network_press_command(
+    keys: &ButtonInput<KeyCode>,
+    local: &mut LocalGame,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+    key: KeyCode,
+    command: InputCommand,
+) {
+    if keys.just_pressed(key) {
+        schedule_network_input(local, network_runtime, network_state, command);
+    }
+}
+
 fn send_repeat_command(
     keys: &ButtonInput<KeyCode>,
     game: &mut TwoPlayerGame,
@@ -6970,6 +8930,23 @@ fn send_repeat_command(
     }
 }
 
+fn send_network_repeat_command(
+    keys: &ButtonInput<KeyCode>,
+    local: &mut LocalGame,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+    binding: (KeyCode, InputCommand),
+    repeat: &mut HeldKeyRepeat,
+    elapsed_ms: u64,
+) {
+    let (key, command) = binding;
+    let (next, emit) = repeat.observe(keys.pressed(key), keys.just_pressed(key), elapsed_ms);
+    *repeat = next;
+    if emit {
+        schedule_network_input(local, network_runtime, network_state, command);
+    }
+}
+
 fn send_fast_drop(
     keys: &ButtonInput<KeyCode>,
     game: &mut TwoPlayerGame,
@@ -6982,6 +8959,59 @@ fn send_fast_drop(
         Command::StopFastDrop
     };
     let _ = game.command(player, command);
+}
+
+fn send_network_fast_drop(
+    keys: &ButtonInput<KeyCode>,
+    local: &mut LocalGame,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+    key: KeyCode,
+) {
+    if keys.just_pressed(key) {
+        schedule_network_input(
+            local,
+            network_runtime,
+            network_state,
+            InputCommand::StartFastDrop,
+        );
+    }
+    if keys.just_released(key) {
+        schedule_network_input(
+            local,
+            network_runtime,
+            network_state,
+            InputCommand::StopFastDrop,
+        );
+    }
+}
+
+fn schedule_network_input(
+    local: &mut LocalGame,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+    command: InputCommand,
+) -> bool {
+    let Some(lockstep) = local.network_lockstep.as_mut() else {
+        return false;
+    };
+    let input = lockstep.schedule_local_input(command);
+    if let Some(session) = local.network_session.as_mut() {
+        session.current_tick = lockstep.current_tick();
+    }
+    try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::SendScheduledInput(input),
+    )
+}
+
+fn slot_label_to_index(label: u8) -> u8 {
+    if label == 0 {
+        9
+    } else {
+        label - 1
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -7150,7 +9180,7 @@ fn legacy_score_label(local: &LocalGame) -> String {
     let opponent = opponent_player(player);
     let own = game.player(player);
     let other = game.player(opponent);
-    format!(
+    let mut text = format!(
         "Your score:          {}\nOpponent's score:    {}\n\nYour lines:          {}\nOpponent's lines:    {}\n\nYour funds:          {}\nOpponent's funds:    {}\n\nLines 'til bazaar:   {}",
         own.score(),
         other.score(),
@@ -7159,6 +9189,48 @@ fn legacy_score_label(local: &LocalGame) -> String {
         own.funds(),
         other.funds(),
         game.lines_until_bazaar(),
+    );
+    if let Some(session) = &local.network_session {
+        text.push_str("\n\n");
+        text.push_str(&network_session_status_label(
+            session,
+            local.network_lockstep.as_ref(),
+        ));
+    }
+    text
+}
+
+fn network_session_status_label(
+    session: &NetworkSession,
+    lockstep: Option<&NetworkLockstep>,
+) -> String {
+    let mode = if session.hosted.is_some() {
+        "Hosted Play"
+    } else {
+        "Direct-Connect"
+    };
+    let community = session
+        .community_label
+        .as_deref()
+        .unwrap_or("unranked direct");
+    let tick = lockstep
+        .map(NetworkLockstep::current_tick)
+        .unwrap_or(session.current_tick);
+    let peer_watermark = lockstep
+        .and_then(NetworkLockstep::peer_watermark)
+        .or(session.peer_watermark)
+        .map(|tick| tick.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    format!(
+        "Network: {mode}  slot {:?}  peer {}\nSeed {}  tick {}  peer watermark {}\nCommunity: {}  ranked: {}  result: {:?}",
+        session.local_slot,
+        session.peer_identity.display_name,
+        session.base_seed,
+        tick,
+        peer_watermark,
+        community,
+        session.ranked,
+        session.final_result_status,
     )
 }
 
@@ -7196,7 +9268,17 @@ fn legacy_game_message_label(local: &LocalGame, content_mode: ContentMode) -> St
             GameMode::HumanVsComputer { difficulty, .. } => {
                 format!("Playing {} Ernie", difficulty.name)
             }
-            GameMode::HumanVsHuman => "Playing local game".to_string(),
+            GameMode::HumanVsHuman => match local.mode {
+                LocalGameMode::DirectConnect | LocalGameMode::HostedPlay => local
+                    .network_session
+                    .as_ref()
+                    .map(|session| {
+                        network_session_status_label(session, local.network_lockstep.as_ref())
+                    })
+                    .unwrap_or_else(|| "Playing network game".to_string()),
+                LocalGameMode::LocalHumanVsHuman => "Playing local game".to_string(),
+                LocalGameMode::ComputerOpponent => "Playing computer game".to_string(),
+            },
         },
         GamePhase::Paused => "Paused...".to_string(),
         GamePhase::Bazaar => String::new(),
@@ -7232,41 +9314,42 @@ fn screen_body_label(
     _game: &TwoPlayerGame,
     settings: &ClientSettings,
     settings_edit: &SettingsEditState,
+    network_state: &ClientNetworkState,
     _roster: &RosterRecords,
 ) -> String {
     match settings.screen {
         ClientScreen::Startup => String::new(),
         ClientScreen::Challenge => {
-            let difficulty = selected_ernie_difficulty(settings);
-            let lobby_preview = lobby_registration_preview(settings);
             format!(
-                "Challenge\nMode: {}\n1 Computer Opponent  2 Host Direct  3 Join Direct\n4 Host Via Lobby  5 Browse Lobby\n\nIdentity: {} ({}) on community {}\nHost bind: {}\nShare address: {}\nJoin address: {}\nLobby: {}  Hosted ranked: {}\nProtocol v{}.{} ({}, {})\n\nDirect IP needs inbound TCP allowed on the host port.\nPeers must reach each other directly; there is no NAT traversal or relay.\n\nErnie level {} of {}  {}  {}ms delay\nUse J/Left and L/Right or Level -/+ as the slider.\nPress Enter/C only in Computer mode for unranked computer play.",
+                "Challenge\nMode: {}\n\nLeft panel: choose Computer, Direct IP, hosted availability, or a lobby opponent.\nRight panel: shows the selected mode, addresses, challenge state, and next action.\n\nControls: 1-5 choose mode. Up/Down or mouse selects lobby opponents. Enter/C starts, refreshes, challenges, or accepts. D denies. Escape/Cancel backs out.\n\nIdentity: {} ({})  Community: {}\nProtocol v{}.{} ({}, {})",
                 settings.challenge_mode.label(),
-                lobby_preview.player.display_name,
-                lobby_preview.player.player_id,
+                settings.display_name,
+                hosted_player_id(settings),
                 settings.community_label,
-                settings.direct_listen_addr,
-                settings.direct_share_addr,
-                settings.direct_join_addr,
-                settings.lobby_addr,
-                settings.hosted_ranked,
                 PROTOCOL_MAJOR,
                 PROTOCOL_MINOR,
                 CAPABILITY_DIRECT_TCP,
                 CAPABILITY_SELF_HOSTED_LOBBY,
-                difficulty.level,
-                COMPUTER_DIFFICULTIES.len() - 1,
-                difficulty.name,
-                difficulty.delay_ms,
             )
         }
         ClientScreen::Sleep => {
+            let share_addr = effective_direct_share_addr(settings, network_state);
+            let status = sleep_network_status_label(network_state);
             format!(
-                "Sleep\n{} is marked available for BattleTris challenges.\nBiff is standing by on {} for direct TCP protocol v{}.{}.\nClick Wake to return to Startup.",
+                "Sleep\n{} is available for BattleTris challenges.\n\nIdentity: {} ({})\nCommunity: {}\nLobby: {}  Hosted ranked: {}\nBind: {}\nShare: {}\nProtocol v{}.{} ({}, {})\n\n{}\n\nIncoming challenge controls: Enter/C accept, D deny.\nWake/Escape cancels availability and returns to Startup.",
                 settings.display_name,
+                hosted_player(settings).display_name,
+                hosted_player_id(settings),
+                settings.community_label,
+                settings.lobby_addr,
+                settings.hosted_ranked,
                 settings.direct_listen_addr,
+                share_addr,
                 PROTOCOL_MAJOR,
                 PROTOCOL_MINOR,
+                CAPABILITY_DIRECT_TCP,
+                CAPABILITY_SELF_HOSTED_LOBBY,
+                status,
             )
         }
         ClientScreen::About => {
@@ -7275,7 +9358,7 @@ fn screen_body_label(
         }
         ClientScreen::Roster => " ".to_string(),
         ClientScreen::Settings => format!(
-            "Theme: {:?}  Sound: {:?}  Controls: {}  Scale: {:.2}x\nHosted ranked preference: {}\n\n{}1 display name: {}\n{}2 community: {}\n{}3 host bind: {}\n{}4 share address: {}\n{}5 join address: {}\n{}6 lobby address: {}\n\nBind controls where hosting listens. Share is what another player types or what a lobby advertises.\n0.0.0.0 is allowed for bind but never kept as a share address.\nSuggested share address: {}\nHost must allow inbound TCP on the direct port. No NAT traversal or gameplay relay exists.\n\nT theme  O sound  M controls  R hosted ranked  -/= scale\nProtocol: v{}.{}\nAssets: {}\nSettings: {}",
+            "Theme: {:?}  Sound: {:?}  Controls: {}  Scale: {:.2}x\nHosted ranked preference: {}\n\n{}1 display name: {}\n{}2 community: {}\n{}3 host bind: {}\n{}4 share address: {}\n{}5 join address: {}\n{}6 lobby address: {}\n\nAddress guide:\nHost bind is where this client listens. Use 0.0.0.0:4405 to listen on all local interfaces, or a specific local LAN IP.\nShare address is what another player types and what the lobby advertises. Do not share 0.0.0.0.\nJoin address is the host's share address for Direct IP. Do not join 0.0.0.0 or 127.0.0.1 from another machine. Use the host LAN IP.\nLobby address is the self-hosted community server for presence, hosted sessions, ranked records, and roster records; it does not relay gameplay.\n127.0.0.1 only means this same computer and is useful for local tests.\nSuggested share address: {}\nHost must allow inbound TCP on the direct port. No NAT traversal or gameplay relay exists.\n\nT theme  O sound  M controls  R hosted ranked  -/= scale\nProtocol: v{}.{}\nAssets: {}\nSettings: {}",
             settings.theme,
             settings.sound_pack,
             controls_label(settings.controls),
@@ -7315,13 +9398,453 @@ fn selected_settings_marker(edit: &SettingsEditState, field: SettingsField) -> &
     }
 }
 
-fn challenge_label(role: ChallengeTextRole, settings: &ClientSettings) -> String {
+fn challenge_label(
+    role: ChallengeTextRole,
+    settings: &ClientSettings,
+    network_state: &ClientNetworkState,
+) -> String {
     match role {
-        ChallengeTextRole::UserList | ChallengeTextRole::ComputerStatus => String::new(),
-        ChallengeTextRole::UserInfo => {
-            UiTextTone::challenge_copy(settings.content_mode).to_string()
+        ChallengeTextRole::UserList => challenge_opponent_list_label(settings, network_state),
+        ChallengeTextRole::UserInfo => challenge_mode_panel_label(settings, network_state),
+        ChallengeTextRole::ComputerStatus => {
+            challenge_compact_status_label(settings, network_state)
         }
     }
+}
+
+fn challenge_opponent_list_label(
+    settings: &ClientSettings,
+    network_state: &ClientNetworkState,
+) -> String {
+    let mut text = String::from("Modes\n");
+    for (mode, key) in [
+        (ChallengeMode::ComputerOpponent, "1"),
+        (ChallengeMode::HostDirect, "2"),
+        (ChallengeMode::JoinDirect, "3"),
+        (ChallengeMode::HostViaLobby, "4"),
+        (ChallengeMode::BrowseLobby, "5"),
+        (ChallengeMode::BrowseLan, "6"),
+    ] {
+        let marker = if settings.challenge_mode == mode {
+            ">"
+        } else {
+            " "
+        };
+        let _ = writeln!(text, "{marker} {key} {}", mode.label());
+    }
+
+    let _ = write!(text, "\nOpponents\n");
+    if settings.challenge_mode == ChallengeMode::BrowseLan {
+        if network_state.lan_entries.is_empty() {
+            text.push_str("No LAN hosts loaded.\nPress Enter or Update to browse.");
+            return text;
+        }
+        for (index, entry) in network_state.lan_entries.iter().enumerate().take(8) {
+            let marker = if index == network_state.lan_selected_index {
+                ">"
+            } else {
+                " "
+            };
+            let compatibility = if entry.compatible {
+                "ok"
+            } else {
+                "bad version"
+            };
+            let availability = match entry.availability {
+                LanAvailability::Available => "available",
+                LanAvailability::Busy => "busy",
+                LanAvailability::Unknown => "unknown",
+            };
+            let address = entry
+                .addr
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|| format!("{}:{}", entry.hostname, entry.port));
+            let _ = writeln!(
+                text,
+                "{marker} {}\n  {}  {}  {}",
+                truncate_label(&entry.display_name, 24),
+                availability,
+                compatibility,
+                address,
+            );
+        }
+        return text;
+    }
+    if settings.challenge_mode != ChallengeMode::BrowseLobby {
+        text.push_str("Browse Lobby or Browse LAN lists\navailable players here.");
+        return text;
+    }
+    let Some(list) = &network_state.lobby_list else {
+        text.push_str("No lobby list loaded.\nPress Enter or Update to browse.");
+        return text;
+    };
+    if list.entries.is_empty() {
+        text.push_str("No available players.\nPress Update to refresh.");
+        return text;
+    }
+    for (index, entry) in list.entries.iter().enumerate().take(8) {
+        let marker = if index == network_state.lobby_selected_index {
+            ">"
+        } else {
+            " "
+        };
+        let compatibility = if entry.protocol_major == PROTOCOL_MAJOR {
+            "ok"
+        } else {
+            "bad version"
+        };
+        let ranked = if entry.ranked { "ranked" } else { "casual" };
+        let _ = writeln!(
+            text,
+            "{marker} {}\n  {}  {}  v{}.{}",
+            truncate_label(&entry.host.display_name, 24),
+            ranked,
+            compatibility,
+            entry.protocol_major,
+            entry.protocol_minor,
+        );
+    }
+    text
+}
+
+fn challenge_mode_panel_label(
+    settings: &ClientSettings,
+    network_state: &ClientNetworkState,
+) -> String {
+    if let Some(challenge) = &network_state.pending_challenge {
+        return incoming_challenge_panel_label(challenge, network_state);
+    }
+
+    match settings.challenge_mode {
+        ChallengeMode::ComputerOpponent => computer_challenge_panel_label(settings),
+        ChallengeMode::HostDirect => host_direct_panel_label(settings, network_state),
+        ChallengeMode::JoinDirect => join_direct_panel_label(settings, network_state),
+        ChallengeMode::HostViaLobby => host_via_lobby_panel_label(settings, network_state),
+        ChallengeMode::BrowseLobby => browse_lobby_panel_label(settings, network_state),
+        ChallengeMode::BrowseLan => browse_lan_panel_label(network_state),
+    }
+}
+
+fn incoming_challenge_panel_label(
+    challenge: &Challenge,
+    network_state: &ClientNetworkState,
+) -> String {
+    let hosted = challenge
+        .hosted_session_id
+        .as_ref()
+        .map(|session| format!("Hosted session: {}", session.0))
+        .unwrap_or_else(|| "Direct IP challenge".to_string());
+    format!(
+        "Incoming Challenge\n\n{} wants to play.\nMessage: {}\n{}\n\nEnter/C accepts.\nD denies.\nEscape cancels listening.\n\n{}",
+        challenge.challenger.display_name,
+        if challenge.message.is_empty() { "battle?" } else { &challenge.message },
+        hosted,
+        challenge_status_lifecycle_label(network_state),
+    )
+}
+
+fn computer_challenge_panel_label(settings: &ClientSettings) -> String {
+    let difficulty = selected_ernie_difficulty(settings);
+    let rated_copy = UiTextTone::challenge_copy(settings.content_mode);
+    let rated_line = if rated_copy.is_empty() {
+        String::new()
+    } else {
+        format!("\nErnie {rated_copy}")
+    };
+    format!(
+        "Computer Opponent\n\nPlay against Ernie locally.\nComputer games are unranked and do not use the network.{}\n\nErnie level {} of {}\n{}\n{} ms delay\n\nUse J/Left and L/Right to change level.\nEnter/C starts the game.",
+        rated_line,
+        difficulty.level,
+        COMPUTER_DIFFICULTIES.len() - 1,
+        difficulty.name,
+        difficulty.delay_ms,
+    )
+}
+
+fn host_direct_panel_label(
+    settings: &ClientSettings,
+    network_state: &ClientNetworkState,
+) -> String {
+    format!(
+        "Host Direct\n\nListen for one manual Direct IP challenge.\nThis fallback does not use lobby presence and is always unranked.\n\nBind: {}\nShare: {}\n\nGive the share address to the joiner. Never give 0.0.0.0 to another machine.\n\n{}",
+        settings.direct_listen_addr,
+        effective_direct_share_addr(settings, network_state),
+        challenge_status_lifecycle_label(network_state),
+    )
+}
+
+fn join_direct_panel_label(
+    settings: &ClientSettings,
+    network_state: &ClientNetworkState,
+) -> String {
+    format!(
+        "Join Direct\n\nConnect to a host by manual Direct IP.\nUse this when lobby browse or LAN discovery is unavailable.\n\nJoin address: {}\nYour name: {}\n\nThe host must accept the challenge before the game starts.\n\n{}",
+        settings.direct_join_addr,
+        settings.display_name,
+        challenge_status_lifecycle_label(network_state),
+    )
+}
+
+fn host_via_lobby_panel_label(
+    settings: &ClientSettings,
+    network_state: &ClientNetworkState,
+) -> String {
+    let registration = network_state.lobby_registration.as_ref().map_or_else(
+        || "Not registered yet".to_string(),
+        |entry| {
+            format!(
+                "Registered as {}\nSession: {}",
+                entry.host.display_name, entry.session_id.0
+            )
+        },
+    );
+    format!(
+        "Host Via Lobby\n\nBecome available in the self-hosted lobby, then wait for a challenger to connect directly.\n\nLobby: {}\nCommunity: {}\nShare: {}\nRanked requested: {}\n{}\n\n{}",
+        settings.lobby_addr,
+        settings.community_label,
+        effective_direct_share_addr(settings, network_state),
+        settings.hosted_ranked,
+        registration,
+        challenge_status_lifecycle_label(network_state),
+    )
+}
+
+fn browse_lobby_panel_label(
+    settings: &ClientSettings,
+    network_state: &ClientNetworkState,
+) -> String {
+    let selected = selected_lobby_entry(network_state).map_or_else(
+        || "No opponent selected".to_string(),
+        |entry| {
+            format!(
+                "Selected: {} ({})\nDirect: {}\nSession: {}\nRanked: {}\nProtocol: v{}.{}",
+                entry.host.display_name,
+                entry.host.player_id,
+                entry.direct_addr,
+                entry.session_id.0,
+                entry.ranked,
+                entry.protocol_major,
+                entry.protocol_minor,
+            )
+        },
+    );
+    format!(
+        "Browse Lobby\n\nFind available players from the self-hosted lobby and challenge one. Gameplay still connects directly to the host.\n\nLobby: {}\nCommunity: {}\n{}\n\nUp/Down or mouse selects.\nEnter/C refreshes when empty or challenges the selected player.\n\n{}",
+        settings.lobby_addr,
+        settings.community_label,
+        selected,
+        challenge_status_lifecycle_label(network_state),
+    )
+}
+
+fn browse_lan_panel_label(network_state: &ClientNetworkState) -> String {
+    let selected = selected_lan_entry(network_state).map_or_else(
+        || "No LAN host selected".to_string(),
+        |entry| {
+            let address = entry
+                .addr
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|| format!("{}:{}", entry.hostname, entry.port));
+            format!(
+                "Selected: {}\nDirect: {}\nAvailability: {:?}\nProtocol: v{}.{}",
+                entry.display_name,
+                address,
+                entry.availability,
+                entry.protocol_major,
+                entry.protocol_minor,
+            )
+        },
+    );
+    format!(
+        "Browse LAN\n\nFind direct hosts advertised on the local network. This is best-effort; firewalls or mDNS blocking may hide hosts. Manual Direct IP remains the fallback.\n\n{}\n\nUp/Down or mouse selects.\nEnter/C refreshes when empty or challenges the selected host.\n\n{}",
+        selected,
+        challenge_status_lifecycle_label(network_state),
+    )
+}
+
+fn challenge_compact_status_label(
+    settings: &ClientSettings,
+    network_state: &ClientNetworkState,
+) -> String {
+    match settings.challenge_mode {
+        ChallengeMode::ComputerOpponent => {
+            let difficulty = selected_ernie_difficulty(settings);
+            format!("Ernie: {}  level {}", difficulty.name, difficulty.level)
+        }
+        ChallengeMode::BrowseLan if !network_state.lan_entries.is_empty() => {
+            format!("LAN hosts: {}", network_state.lan_entries.len())
+        }
+        _ => challenge_status_lifecycle_label(network_state),
+    }
+}
+
+fn challenge_primary_button_label(
+    settings: &ClientSettings,
+    network_state: &ClientNetworkState,
+) -> String {
+    if network_state.pending_challenge.is_some() {
+        return "Accept".to_string();
+    }
+    match settings.challenge_mode {
+        ChallengeMode::ComputerOpponent => {
+            format!("Play {} Ernie", selected_ernie_difficulty(settings).name)
+        }
+        ChallengeMode::HostDirect => "Host Direct".to_string(),
+        ChallengeMode::JoinDirect => "Join Direct".to_string(),
+        ChallengeMode::HostViaLobby => "Host Via Lobby".to_string(),
+        ChallengeMode::BrowseLobby => selected_lobby_entry(network_state).map_or_else(
+            || "Browse Lobby".to_string(),
+            |entry| format!("Challenge {}", entry.host.display_name),
+        ),
+        ChallengeMode::BrowseLan => selected_lan_entry(network_state).map_or_else(
+            || "Browse LAN".to_string(),
+            |entry| format!("Challenge {}", entry.display_name),
+        ),
+    }
+}
+
+fn challenge_status_lifecycle_label(network_state: &ClientNetworkState) -> String {
+    let mut status = match &network_state.lifecycle {
+        NetworkLifecycleState::Idle => {
+            if network_state.lobby_list.is_some() {
+                "Status: browsing results ready".to_string()
+            } else {
+                "Status: idle".to_string()
+            }
+        }
+        NetworkLifecycleState::Hosting { bind_addr } => {
+            if network_state.lobby_registration.is_some() {
+                format!("Status: available via lobby; awaiting challenger on {bind_addr}")
+            } else {
+                format!("Status: listening on {bind_addr}; awaiting challenge")
+            }
+        }
+        NetworkLifecycleState::Joining { peer_addr } => {
+            format!("Status: challenging {peer_addr}; awaiting host response")
+        }
+        NetworkLifecycleState::Challenged { challenge } => format!(
+            "Status: incoming challenge from {}; accept or deny",
+            challenge.challenger.display_name
+        ),
+        NetworkLifecycleState::Connected { session } => format!(
+            "Status: accepted; starting game with {} as {:?}",
+            session.peer_identity.display_name, session.local_slot
+        ),
+        NetworkLifecycleState::Disconnecting => "Status: disconnecting".to_string(),
+        NetworkLifecycleState::Error { message } => {
+            if message.contains("denied") {
+                format!("Status: denied - {message}")
+            } else {
+                format!("Status: error - {message}")
+            }
+        }
+    };
+    if let Some(entry) = &network_state.lobby_registration {
+        let _ = write!(
+            status,
+            "\nLobby session: {} at {}",
+            entry.session_id.0, entry.direct_addr
+        );
+    }
+    if let Some(hosted_status) = &network_state.hosted_status {
+        let _ = write!(status, "\nHosted status: {:?}", hosted_status.status);
+    }
+    if let Some(start) = &network_state.hosted_start {
+        let _ = write!(
+            status,
+            "\nHosted start: {} seed {} ranked {}",
+            start.session_id.0, start.seed, start.ranked
+        );
+    }
+    if let Some(error) = &network_state.last_error {
+        let _ = write!(status, "\nLast error: {error}");
+    }
+    if let Some(message) = network_state.transient_messages.last() {
+        let _ = write!(status, "\nLast status: {message}");
+    }
+    status
+}
+
+fn challenge_network_status_label(network_state: &ClientNetworkState) -> String {
+    let mut status = match &network_state.lifecycle {
+        NetworkLifecycleState::Idle => "Network: idle".to_string(),
+        NetworkLifecycleState::Hosting { bind_addr } => {
+            format!("Network: hosting on {bind_addr}")
+        }
+        NetworkLifecycleState::Joining { peer_addr } => {
+            format!("Network: joining {peer_addr}")
+        }
+        NetworkLifecycleState::Challenged { challenge } => format!(
+            "Incoming challenge from {}: Enter/C accept, D deny, Escape cancel",
+            challenge.challenger.display_name
+        ),
+        NetworkLifecycleState::Connected { session } => format!(
+            "Network: connected to {} as {:?}; starting game",
+            session.peer_identity.display_name, session.local_slot
+        ),
+        NetworkLifecycleState::Disconnecting => "Network: disconnecting".to_string(),
+        NetworkLifecycleState::Error { message } => format!("Network error: {message}"),
+    };
+    if let Some(bind_addr) = network_state.listening_bind_addr {
+        let share_addr = network_state
+            .listening_share_addr
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let _ = write!(
+            status,
+            "\nListening bind: {bind_addr}\nListening share: {share_addr}"
+        );
+    }
+    if let Some(error) = &network_state.last_error {
+        let _ = write!(status, "\nLast error: {error}");
+    }
+    if let Some(message) = network_state.transient_messages.last() {
+        let _ = write!(status, "\nLast status: {message}");
+    }
+    status
+}
+
+fn sleep_network_status_label(network_state: &ClientNetworkState) -> String {
+    let mut status = challenge_network_status_label(network_state);
+    if let Some(entry) = &network_state.lobby_registration {
+        let _ = write!(
+            status,
+            "\nLobby available as {} at {}",
+            entry.host.display_name, entry.direct_addr
+        );
+    }
+    if let Some(status_response) = &network_state.hosted_status {
+        let _ = write!(
+            status,
+            "\nHosted session {:?}: {:?}",
+            status_response.session_id, status_response.status
+        );
+    }
+    if let Some(challenge) = &network_state.pending_challenge {
+        let _ = write!(
+            status,
+            "\n\nChallenge prompt: {} says '{}' hosted session {:?}",
+            challenge.challenger.display_name, challenge.message, challenge.hosted_session_id
+        );
+    }
+    status
+}
+
+fn effective_direct_share_addr(
+    settings: &ClientSettings,
+    network_state: &ClientNetworkState,
+) -> String {
+    if let Ok(addr) = settings.direct_share_addr.parse::<SocketAddr>() {
+        if !addr.ip().is_unspecified() {
+            return addr.to_string();
+        }
+    }
+    if let Some(addr) = network_state.listening_share_addr {
+        if !addr.ip().is_unspecified() {
+            return addr.to_string();
+        }
+    }
+    suggested_share_addr_for(&settings.direct_listen_addr)
 }
 
 fn challenge_ernie_slider_x(settings: &ClientSettings) -> f32 {
@@ -7513,6 +10036,14 @@ fn lobby_registration_preview(settings: &ClientSettings) -> LobbyRegister {
     }
 }
 
+fn hosted_player(settings: &ClientSettings) -> HostedPlayer {
+    lobby_registration_preview(settings).player
+}
+
+fn hosted_player_id(settings: &ClientSettings) -> String {
+    player_id_from_display_name(&settings.display_name)
+}
+
 fn player_id_from_display_name(display_name: &str) -> String {
     let mut id = String::new();
     for ch in display_name.trim().chars() {
@@ -7560,7 +10091,14 @@ fn assets_dir() -> PathBuf {
         .join("assets")
 }
 
-fn roster_text_label(roster: &RosterRecords, role: RosterTextRole) -> String {
+fn roster_text_label(
+    roster: &RosterRecords,
+    network_state: &ClientNetworkState,
+    role: RosterTextRole,
+) -> String {
+    if let Some(records) = &network_state.ranked_records {
+        return hosted_roster_text_label(records, role);
+    }
     match role {
         RosterTextRole::UserList => roster_user_list_label(roster),
         RosterTextRole::UserInfo1 => roster_user_info_label(roster, 0),
@@ -7571,21 +10109,103 @@ fn roster_text_label(roster: &RosterRecords, role: RosterTextRole) -> String {
     }
 }
 
+fn hosted_roster_text_label(records: &RankedRecords, role: RosterTextRole) -> String {
+    let rows = hosted_roster_rows(records);
+    match role {
+        RosterTextRole::UserList => {
+            if rows.is_empty() {
+                return format!(
+                    "Community: {}\nNo hosted records",
+                    truncate_label(&records.community_label, 18)
+                );
+            }
+            let mut text = format!(
+                "Community: {}\n",
+                truncate_label(&records.community_label, 18)
+            );
+            text.push_str(
+                &rows
+                    .iter()
+                    .take(19)
+                    .map(|row| truncate_label(&row.player_key, 20))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            text
+        }
+        RosterTextRole::UserInfo1 => hosted_roster_user_info_label(&rows, 0),
+        RosterTextRole::UserInfo2 => " ".to_string(),
+        RosterTextRole::Player1Name => rows
+            .first()
+            .map(|row| truncate_label(&row.player_key, 14))
+            .unwrap_or_else(|| " ".to_string()),
+        RosterTextRole::Player2Name
+        | RosterTextRole::Player1Score
+        | RosterTextRole::Player2Score => " ".to_string(),
+    }
+}
+
+fn hosted_roster_user_info_label(rows: &[RosterRow], index: usize) -> String {
+    let Some(row) = rows.get(index) else {
+        return "No hosted Community\nrecords have been fetched.\n\nNickname: hosted\nPlan: server-owned".to_string();
+    };
+
+    format!(
+        "Source: hosted Community\n          Name: {}\n          Rank: {}\n          Wins: {}\n        Losses: {}\n Highest score: {}\n Highest lines: {}\n Highest funds: {}\n        Streak: {}\n\nNickname: hosted\nPlan: server-owned records",
+        truncate_label(&row.display_name, 20),
+        row.rank,
+        row.wins,
+        row.losses,
+        row.high_score,
+        row.high_lines,
+        row.high_funds,
+        row.streak,
+    )
+}
+
+fn hosted_roster_rows(records: &RankedRecords) -> Vec<RosterRow> {
+    records
+        .records
+        .iter()
+        .map(|record| RosterRow {
+            player_key: record.player_id.clone(),
+            rank: record.rank,
+            display_name: record.display_name.clone(),
+            wins: record.wins,
+            losses: record.losses,
+            high_score: record.high_score,
+            high_lines: record.high_lines,
+            high_funds: record.high_funds,
+            streak: "server".to_string(),
+            fastest_kill_secs: None,
+            quickest_death_secs: None,
+            longest_game_secs: None,
+        })
+        .collect()
+}
+
 fn roster_user_list_label(roster: &RosterRecords) -> String {
     if let Some(error) = &roster.error {
-        return format!("Records unavailable\n{}", truncate_label(error, 22));
+        return format!(
+            "Local/offline records unavailable\n{}",
+            truncate_label(error, 22)
+        );
     }
     if roster.rows.is_empty() {
-        return "No records".to_string();
+        return "Local/offline records\nNo records".to_string();
     }
 
-    roster
-        .rows
-        .iter()
-        .take(20)
-        .map(|row| truncate_label(&row.player_key, 20))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut text = String::from("Local/offline records\n");
+    text.push_str(
+        &roster
+            .rows
+            .iter()
+            .take(19)
+            .map(|row| truncate_label(&row.player_key, 20))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    text
 }
 
 fn roster_user_info_label(roster: &RosterRecords, index: usize) -> String {
@@ -7594,7 +10214,7 @@ fn roster_user_info_label(roster: &RosterRecords, index: usize) -> String {
     }
     let Some(row) = roster.rows.get(index) else {
         return if index == 0 {
-            "No ranked human-vs-human\nresults have been recorded.\n\nNickname: none\nPlan: none"
+            "No local/offline ranked\nhuman-vs-human results have\nbeen recorded.\n\nNickname: local\nPlan: offline records"
                 .to_string()
         } else {
             " ".to_string()
@@ -7602,7 +10222,7 @@ fn roster_user_info_label(roster: &RosterRecords, index: usize) -> String {
     };
 
     format!(
-        "          Name: {}\n          Rank: {}\n          Wins: {}\n        Losses: {}\n Highest score: {}\n Highest lines: {}\n Highest funds: {}\n        Streak: {}\n  Fastest kill: {}\nQuickest death: {}\n  Longest game: {}\n\nNickname: none\nPlan: none",
+        "Source: local/offline\n          Name: {}\n          Rank: {}\n          Wins: {}\n        Losses: {}\n Highest score: {}\n Highest lines: {}\n Highest funds: {}\n        Streak: {}\n  Fastest kill: {}\nQuickest death: {}\n  Longest game: {}\n\nNickname: local\nPlan: offline records",
         truncate_label(&row.display_name, 20),
         row.rank,
         row.wins,
@@ -8135,29 +10755,153 @@ fn bazaar_catalog_keys() -> [(WeaponToken, KeyCode); 10] {
     ]
 }
 
+fn send_network_bazaar_buy(
+    local: &mut LocalGame,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+    player: PlayerId,
+    token: WeaponToken,
+) -> Result<usize, String> {
+    if player != local.local_player {
+        return Err("online Bazaar only accepts local player purchases".to_string());
+    }
+    let buy = BazaarBuy {
+        player: protocol_slot_for_player(player),
+        weapon: token.legacy_id(),
+        sequence: local.game.event_log().len() as u64,
+    };
+    let Some(lockstep) = local.network_lockstep.as_ref() else {
+        return Err("network lockstep state is missing".to_string());
+    };
+    lockstep
+        .apply_bazaar_buy(&mut local.game, buy.clone())
+        .map_err(|error| format!("{error:?}"))?;
+    let index = staged_slot_index_for_token(&local.game, player, token).unwrap_or(0);
+    if !try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::SendBazaarBuy(buy),
+    ) {
+        return Err("network send failed".to_string());
+    }
+    Ok(index)
+}
+
+fn send_network_bazaar_remove(
+    local: &mut LocalGame,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+    player: PlayerId,
+    token: WeaponToken,
+) -> Result<(), String> {
+    if player != local.local_player {
+        return Err("online Bazaar only accepts local player removals".to_string());
+    }
+    let slot_index = staged_slot_index_for_token(&local.game, player, token)
+        .ok_or_else(|| "no staged weapon in requested slot".to_string())?;
+    let remove = BazaarRemove {
+        player: protocol_slot_for_player(player),
+        slot_index: slot_index.try_into().expect("Bazaar slot index fits in u8"),
+        sequence: local.game.event_log().len() as u64,
+    };
+    let Some(lockstep) = local.network_lockstep.as_ref() else {
+        return Err("network lockstep state is missing".to_string());
+    };
+    lockstep
+        .apply_bazaar_remove(&mut local.game, remove.clone())
+        .map_err(|error| format!("{error:?}"))?;
+    if !try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::SendBazaarRemove(remove),
+    ) {
+        return Err("network send failed".to_string());
+    }
+    Ok(())
+}
+
+fn send_network_bazaar_done(
+    local: &mut LocalGame,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+    _ui: &mut BazaarUiState,
+) -> Vec<LoggedEvent> {
+    let player = local.local_player;
+    let done = BazaarDone {
+        player: protocol_slot_for_player(player),
+    };
+    let Some(lockstep) = local.network_lockstep.as_ref() else {
+        return Vec::new();
+    };
+    let events = lockstep.apply_bazaar_done(&mut local.game, done.clone());
+    if !events.is_empty() {
+        try_send_network_command(
+            network_runtime,
+            network_state,
+            NetworkCommand::SendBazaarDone {
+                player: done.player,
+            },
+        );
+        send_network_checksum(local, lockstep, network_runtime, network_state);
+    }
+    events
+}
+
+fn staged_slot_index_for_token(
+    game: &TwoPlayerGame,
+    player: PlayerId,
+    token: WeaponToken,
+) -> Option<usize> {
+    game.bazaar_session(player).and_then(|session| {
+        session
+            .staged_arsenal()
+            .slots()
+            .iter()
+            .position(|slot| slot.as_ref().is_some_and(|slot| slot.token == token))
+    })
+}
+
+const fn protocol_slot_for_player(player: PlayerId) -> PlayerSlot {
+    match player {
+        PlayerId::One => PlayerSlot::One,
+        PlayerId::Two => PlayerSlot::Two,
+    }
+}
+
 fn handle_bazaar_click(
     world: Vec2,
     theme: &LoadedTheme,
-    game: &mut TwoPlayerGame,
+    local: &mut LocalGame,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
     ui: &mut BazaarUiState,
     content_mode: ContentMode,
 ) {
-    let player = PlayerId::One;
+    let player = if local.is_networked() {
+        local.local_player
+    } else {
+        PlayerId::One
+    };
     if let Some(token) = bazaar_catalog_token_at(world, theme) {
         ui.selected = token;
         ui.last_message = format!("Selected {}.", weapon_spec(token).name);
         return;
     }
     if bazaar_add_rect(theme).contains(world) {
-        buy_selected_bazaar_weapon(game, ui, player);
+        buy_selected_bazaar_weapon(local, network_runtime, network_state, ui, player);
         return;
     }
     if bazaar_remove_rect(theme).contains(world) {
-        remove_selected_bazaar_weapon(game, ui, player);
+        remove_selected_bazaar_weapon(local, network_runtime, network_state, ui, player);
         return;
     }
     if bazaar_done_rect(theme).contains(world) {
-        match game.bazaar_done(player) {
+        let events = if local.is_networked() {
+            send_network_bazaar_done(local, network_runtime, network_state, ui)
+        } else {
+            local.game.bazaar_done(player)
+        };
+        match events {
             events if events.is_empty() => {
                 ui.last_message =
                     UiTextTone::bazaar_waiting_copy(content_mode, BazaarWaitingText::LocalRepeated)
@@ -8169,23 +10913,46 @@ fn handle_bazaar_click(
         }
         return;
     }
-    if let Some(token) = bazaar_arsenal_token_at(world, theme, game, player) {
+    if let Some(token) = bazaar_arsenal_token_at(world, theme, &local.game, player) {
         ui.selected = token;
-        remove_selected_bazaar_weapon(game, ui, player);
+        remove_selected_bazaar_weapon(local, network_runtime, network_state, ui, player);
     }
 }
 
-fn buy_selected_bazaar_weapon(game: &mut TwoPlayerGame, ui: &mut BazaarUiState, player: PlayerId) {
-    buy_bazaar_weapon(game, ui, player, ui.selected);
+fn buy_selected_bazaar_weapon(
+    local: &mut LocalGame,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+    ui: &mut BazaarUiState,
+    player: PlayerId,
+) {
+    buy_bazaar_weapon(
+        local,
+        network_runtime,
+        network_state,
+        ui,
+        player,
+        ui.selected,
+    );
 }
 
 fn buy_bazaar_weapon(
-    game: &mut TwoPlayerGame,
+    local: &mut LocalGame,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
     ui: &mut BazaarUiState,
     player: PlayerId,
     token: WeaponToken,
 ) {
-    match game.bazaar_buy(player, token) {
+    let result = if local.is_networked() {
+        send_network_bazaar_buy(local, network_runtime, network_state, player, token)
+    } else {
+        local
+            .game
+            .bazaar_buy(player, token)
+            .map_err(|error| format!("{error:?}"))
+    };
+    match result {
         Ok(index) => {
             ui.last_message = format!(
                 "Added {} to slot {}.",
@@ -8194,18 +10961,28 @@ fn buy_bazaar_weapon(
             );
         }
         Err(error) => {
-            ui.last_message = format!("Could not add {}: {error:?}.", weapon_spec(token).name);
+            ui.last_message = format!("Could not add {}: {error}.", weapon_spec(token).name);
         }
     }
 }
 
 fn remove_selected_bazaar_weapon(
-    game: &mut TwoPlayerGame,
+    local: &mut LocalGame,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
     ui: &mut BazaarUiState,
     player: PlayerId,
 ) {
     let token = ui.selected;
-    match game.bazaar_remove_staged(player, token) {
+    let result = if local.is_networked() {
+        send_network_bazaar_remove(local, network_runtime, network_state, player, token)
+    } else {
+        local
+            .game
+            .bazaar_remove_staged(player, token)
+            .map_err(|error| format!("{error:?}"))
+    };
+    match result {
         Ok(()) => {
             ui.last_message = format!(
                 "Removed staged {} and refunded its entry price.",
@@ -8214,7 +10991,7 @@ fn remove_selected_bazaar_weapon(
         }
         Err(error) => {
             ui.last_message = format!(
-                "Could not remove {}: only newly staged purchases can be refunded ({error:?}).",
+                "Could not remove {}: only newly staged purchases can be refunded ({error}).",
                 weapon_spec(token).name,
             );
         }
@@ -8284,6 +11061,7 @@ fn arsenal_slot_label(index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use battletris_protocol::{PlayerIdentity, PlayerSlot, StartGame};
 
     #[test]
     fn next_piece_preview_does_not_advance_core_state() {
@@ -8292,6 +11070,166 @@ mod tests {
         let second = game.player(PlayerId::One).next_piece_kind_preview();
 
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn network_reducer_tracks_listening_addresses() {
+        let mut state = ClientNetworkState::default();
+        let bind_addr = "0.0.0.0:4405".parse().unwrap();
+        let share_addr = "192.168.1.20:4405".parse().unwrap();
+
+        reduce_client_network_event(
+            &mut state,
+            NetworkEvent::Listening {
+                bind_addr,
+                share_addr,
+            },
+        );
+
+        assert_eq!(
+            state.lifecycle,
+            NetworkLifecycleState::Hosting { bind_addr }
+        );
+        assert_eq!(state.listening_bind_addr, Some(bind_addr));
+        assert_eq!(state.listening_share_addr, Some(share_addr));
+        assert!(state.pending_challenge.is_none());
+    }
+
+    #[test]
+    fn network_reducer_tracks_pending_challenge() {
+        let mut state = ClientNetworkState::default();
+        let challenge = Challenge {
+            challenger: PlayerIdentity {
+                display_name: "Joiner".to_string(),
+            },
+            message: "play?".to_string(),
+            hosted_session_id: None,
+            hosted_player_id: None,
+        };
+
+        reduce_client_network_event(
+            &mut state,
+            NetworkEvent::IncomingChallenge {
+                challenge: challenge.clone(),
+            },
+        );
+
+        assert_eq!(state.pending_challenge, Some(challenge.clone()));
+        assert_eq!(
+            state.lifecycle,
+            NetworkLifecycleState::Challenged { challenge }
+        );
+    }
+
+    #[test]
+    fn network_reducer_tracks_connected_session_and_watermark() {
+        let mut state = ClientNetworkState::default();
+        let session = NetworkSession::direct(
+            PlayerSlot::One,
+            PlayerIdentity {
+                display_name: "Peer".to_string(),
+            },
+            StartGame {
+                receiving_peer_slot: PlayerSlot::One,
+                seed: 99,
+                ranked: false,
+            },
+        );
+
+        reduce_client_network_event(
+            &mut state,
+            NetworkEvent::Connected {
+                session: Box::new(session.clone()),
+            },
+        );
+        reduce_client_network_event(
+            &mut state,
+            NetworkEvent::TickWatermark(TickWatermark {
+                player: PlayerSlot::Two,
+                through_tick: 42,
+            }),
+        );
+
+        assert_eq!(state.connected_session.as_ref().unwrap().base_seed, 99);
+        assert_eq!(
+            state.connected_session.as_ref().unwrap().peer_watermark,
+            Some(42)
+        );
+        assert_eq!(state.result_status, FinalResultStatus::Unranked);
+    }
+
+    #[test]
+    fn networked_local_game_uses_session_seed_and_slot() {
+        let session = NetworkSession::direct(
+            PlayerSlot::Two,
+            PlayerIdentity {
+                display_name: "Host".to_string(),
+            },
+            StartGame {
+                receiving_peer_slot: PlayerSlot::Two,
+                seed: 1234,
+                ranked: false,
+            },
+        );
+
+        let local = LocalGame::new_networked(session.clone());
+
+        assert_eq!(local.local_player, PlayerId::Two);
+        assert_eq!(local.mode, LocalGameMode::DirectConnect);
+        assert!(local.computer.is_none());
+        assert!(local.network_lockstep.is_some());
+        assert_eq!(local.network_session.as_ref().unwrap().base_seed, 1234);
+        assert_eq!(local.game.mode(), GameMode::HumanVsHuman);
+        let expected_status = network_session_status_label(&session, None);
+        assert_eq!(
+            local.status_message.as_deref(),
+            Some(expected_status.as_str())
+        );
+    }
+
+    #[test]
+    fn network_weapon_slot_labels_map_to_protocol_indices() {
+        assert_eq!(slot_label_to_index(1), 0);
+        assert_eq!(slot_label_to_index(9), 8);
+        assert_eq!(slot_label_to_index(0), 9);
+    }
+
+    #[test]
+    fn direct_challenge_acceptance_is_unranked() {
+        let start = StartGame {
+            receiving_peer_slot: PlayerSlot::One,
+            seed: 7,
+            ranked: false,
+        };
+        let session = NetworkSession::direct(
+            PlayerSlot::One,
+            PlayerIdentity {
+                display_name: "Peer".to_string(),
+            },
+            start,
+        );
+
+        assert!(!session.ranked);
+        assert_eq!(session.final_result_status, FinalResultStatus::Unranked);
+    }
+
+    #[test]
+    fn network_reducer_surfaces_result_rejection() {
+        let mut state = ClientNetworkState::default();
+
+        reduce_client_network_event(
+            &mut state,
+            NetworkEvent::RejectedResult(RankedResultRejected {
+                session_id: None,
+                reason: "mismatch".to_string(),
+            }),
+        );
+
+        assert_eq!(state.last_error.as_deref(), Some("mismatch"));
+        assert_eq!(
+            state.result_status,
+            FinalResultStatus::Rejected("mismatch".to_string())
+        );
     }
 
     #[test]
@@ -8687,6 +11625,12 @@ mod tests {
             ),
             computer: None,
             local_player: PlayerId::One,
+            mode: LocalGameMode::LocalHumanVsHuman,
+            network_session: None,
+            network_lockstep: None,
+            network_failed_closed: false,
+            network_game_over_sent: false,
+            network_result_claim_submitted: false,
             status_message: None,
         };
 

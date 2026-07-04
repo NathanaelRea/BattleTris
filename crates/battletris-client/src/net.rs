@@ -8,16 +8,16 @@ use std::collections::HashMap;
 use std::{collections::BTreeMap, net::SocketAddr, thread, time::Duration};
 
 use battletris_core::{
-    game::{BattleEvent, Command, GamePhase, PlayerId, ShoppingError, TwoPlayerGame},
+    game::{BattleEvent, Command, GamePhase, LoggedEvent, PlayerId, ShoppingError, TwoPlayerGame},
     weapons::WeaponToken,
 };
 use battletris_protocol::{
     ArsenalEntry, ArsenalSnapshot, BazaarBuy, BazaarDone, BazaarRemove,
     BoardSnapshot as WireBoardSnapshot, Challenge, DirectConnection, Disconnect, GameChecksum,
-    GameOver, Heartbeat, HostedGameStart, HostedJoinRequest, HostedPlayer, HostedSessionId,
-    HostedSessionStatus, HostedSessionStatusRequest, InputCommand, JoinedDirectGame,
-    LanAdvertisement, LobbyEntry, LobbyList, LobbyListRequest, LobbyRegister, PlayerIdentity,
-    PlayerInput, PlayerSlot, ProtocolError, RankedRecords, RankedRecordsRequest,
+    GameOver, Heartbeat, HostedGameStart, HostedJoinRequest, HostedPlayer, HostedSessionCancel,
+    HostedSessionId, HostedSessionStatus, HostedSessionStatusRequest, InputCommand,
+    JoinedDirectGame, LanAdvertisement, LobbyEntry, LobbyList, LobbyListRequest, LobbyRegister,
+    PlayerIdentity, PlayerInput, PlayerSlot, ProtocolError, RankedRecords, RankedRecordsRequest,
     RankedResultAccepted, RankedResultClaim, RankedResultPending, RankedResultRejected,
     ScoreSnapshot, StartGame, TickWatermark, WireMessage,
 };
@@ -369,8 +369,16 @@ pub enum NetworkCommand {
         session_id: HostedSessionId,
         requester_player_id: String,
     },
+    /// Cancel an available hosted lobby session.
+    CancelHostedSession {
+        server_addr: SocketAddr,
+        session_id: HostedSessionId,
+        requester_player_id: String,
+    },
     /// Accept an incoming challenge.
     Accept { seed: u64, ranked: bool },
+    /// Accept an incoming challenge using server-owned hosted metadata.
+    AcceptHosted { hosted_start: HostedGameStart },
     /// Deny an incoming challenge.
     Deny { reason: String },
     /// Send a scheduled deterministic player input.
@@ -381,6 +389,8 @@ pub enum NetworkCommand {
     SendHeartbeat(Heartbeat),
     /// Send a whole-game checksum diagnostic.
     SendChecksum(GameChecksum),
+    /// Send final game-over metadata.
+    SendGameOver(GameOver),
     /// Send a Bazaar buy intent.
     SendBazaarBuy(BazaarBuy),
     /// Send a Bazaar remove intent.
@@ -581,7 +591,11 @@ async fn run_network_loop(io: &mut NetworkIo, shutdown_rx: &mut oneshot::Receive
                     }
                     message = timeout(PEER_IDLE_TIMEOUT, connection.recv()) => {
                         match message {
-                            Ok(Ok(message)) => handle_peer_message(message, session, io).await,
+                            Ok(Ok(message)) => {
+                                if handle_peer_message(message, session, io).await {
+                                    active = ActiveConnection::Idle;
+                                }
+                            }
                             Ok(Err(error)) => {
                                 emit_error(io, format_protocol_error("direct peer read failed", &error)).await;
                                 emit_state(io, NetworkLifecycleState::Idle).await;
@@ -631,7 +645,7 @@ async fn handle_lifecycle_command(
             identity,
         } => {
             *active = ActiveConnection::Idle;
-            host_until_challenge(bind_addr, identity, active, io).await;
+            host_until_challenge(bind_addr, identity, active, discovery, io).await;
         }
         NetworkCommand::StartLanAdvertising {
             identity,
@@ -691,6 +705,11 @@ async fn handle_lifecycle_command(
             session_id,
             requester_player_id,
         } => poll_hosted_status(server_addr, session_id, requester_player_id, io).await,
+        NetworkCommand::CancelHostedSession {
+            server_addr,
+            session_id,
+            requester_player_id,
+        } => cancel_hosted_session(server_addr, session_id, requester_player_id, io).await,
         NetworkCommand::SubmitResult { server_addr, claim } => {
             submit_ranked_result(server_addr, claim, io).await
         }
@@ -733,6 +752,46 @@ async fn handle_lifecycle_command(
                 }
             }
         }
+        NetworkCommand::AcceptHosted { hosted_start } => {
+            discovery.stop_advertising(io).await;
+            let ActiveConnection::PendingDirect { pending } =
+                std::mem::replace(active, ActiveConnection::Idle)
+            else {
+                emit_error(io, "no pending hosted challenge to accept".to_string()).await;
+                return;
+            };
+            match timeout(
+                CHALLENGE_RESPONSE_TIMEOUT,
+                pending.accept(hosted_start.seed, hosted_start.ranked),
+            )
+            .await
+            {
+                Ok(Ok(accepted)) => {
+                    let session = NetworkSession::hosted(
+                        PlayerSlot::One,
+                        accepted.remote_identity,
+                        hosted_start,
+                    );
+                    emit_connected(io, &session).await;
+                    *active = ActiveConnection::Connected {
+                        connection: accepted.connection,
+                        session: Box::new(session),
+                    };
+                }
+                Ok(Err(error)) => {
+                    emit_error(
+                        io,
+                        format_protocol_error("accept hosted challenge failed", &error),
+                    )
+                    .await;
+                    emit_state(io, NetworkLifecycleState::Idle).await;
+                }
+                Err(_) => {
+                    emit_error(io, "timed out accepting hosted challenge".to_string()).await;
+                    emit_state(io, NetworkLifecycleState::Idle).await;
+                }
+            }
+        }
         NetworkCommand::Deny { reason } => {
             let ActiveConnection::PendingDirect { pending } =
                 std::mem::replace(active, ActiveConnection::Idle)
@@ -764,6 +823,7 @@ async fn handle_lifecycle_command(
         | NetworkCommand::SendTickWatermark(_)
         | NetworkCommand::SendHeartbeat(_)
         | NetworkCommand::SendChecksum(_)
+        | NetworkCommand::SendGameOver(_)
         | NetworkCommand::SendBazaarBuy(_)
         | NetworkCommand::SendBazaarRemove(_)
         | NetworkCommand::SendBazaarDone { .. } => {
@@ -941,10 +1001,44 @@ async fn poll_hosted_status(
     }
 }
 
+async fn cancel_hosted_session(
+    server_addr: SocketAddr,
+    session_id: HostedSessionId,
+    requester_player_id: String,
+    io: &mut NetworkIo,
+) {
+    match server_request(
+        server_addr,
+        WireMessage::HostedSessionCancel(HostedSessionCancel {
+            session_id,
+            requester_player_id,
+        }),
+    )
+    .await
+    {
+        Ok(WireMessage::HostedSessionStatus(status)) => {
+            let _ = io
+                .event_tx
+                .send(NetworkEvent::HostedSessionStatus(status))
+                .await;
+        }
+        Ok(WireMessage::RankedResultRejected(rejected)) => emit_error(io, rejected.reason).await,
+        Ok(message) => {
+            emit_error(
+                io,
+                format!("unexpected hosted cancel response: {:?}", message.kind()),
+            )
+            .await
+        }
+        Err(error) => emit_error(io, error).await,
+    }
+}
+
 async fn host_until_challenge(
     bind_addr: SocketAddr,
     identity: PlayerIdentity,
     active: &mut ActiveConnection,
+    discovery: &mut LanDiscoveryRuntime,
     io: &mut NetworkIo,
 ) {
     log_net(&format!("hosting direct game on {bind_addr}"));
@@ -952,7 +1046,15 @@ async fn host_until_challenge(
     let listener = match TcpListener::bind(bind_addr).await {
         Ok(listener) => listener,
         Err(error) => {
-            emit_error(io, format!("bind direct host {bind_addr} failed: {error}")).await;
+            let message = if error.kind() == std::io::ErrorKind::AddrInUse {
+                "Host bind failed: address already in use. Try another port or cancel the old host."
+                    .to_string()
+            } else {
+                format!(
+                    "Host bind failed on {bind_addr}: {error}. Try another local address or port."
+                )
+            };
+            emit_error(io, message).await;
             emit_state(io, NetworkLifecycleState::Idle).await;
             return;
         }
@@ -977,10 +1079,12 @@ async fn host_until_challenge(
     )
     .await;
 
-    tokio::select! {
-        pending = timeout(HANDSHAKE_TIMEOUT, battletris_protocol::accept_pending_direct_challenge(&listener, identity)) => {
-            match pending {
-                Ok(Ok(pending)) => {
+    loop {
+        tokio::select! {
+            pending = battletris_protocol::accept_pending_direct_challenge(&listener, identity.clone()) => {
+                match pending {
+                    Ok(pending) => {
+                    discovery.stop_advertising(io).await;
                     log_net(&format!(
                         "incoming direct challenge peer={} hosted_session={:?}",
                         pending.remote_identity.display_name,
@@ -990,27 +1094,39 @@ async fn host_until_challenge(
                     emit_state(io, NetworkLifecycleState::Challenged { challenge: challenge.clone() }).await;
                     let _ = io.event_tx.send(NetworkEvent::IncomingChallenge { challenge }).await;
                     *active = ActiveConnection::PendingDirect { pending };
+                    break;
                 }
-                Ok(Err(error)) => {
+                    Err(error) => {
                     log_net(&format_protocol_error("direct host handshake failed", &error));
                     emit_error(io, format_protocol_error("direct host handshake failed", &error)).await;
                     emit_state(io, NetworkLifecycleState::Idle).await;
+                    break;
                 }
-                Err(_) => {
-                    log_net("timed out waiting for direct challenge");
-                    emit_error(io, "timed out waiting for direct challenge".to_string()).await;
-                    emit_state(io, NetworkLifecycleState::Idle).await;
                 }
             }
-        }
-        command = io.command_rx.recv() => {
-            match command {
-                Some(NetworkCommand::Cancel) => emit_state(io, NetworkLifecycleState::Idle).await,
-                Some(other) => {
-                    emit_error(io, format!("direct host canceled by {:?}", command_name(&other))).await;
-                    emit_state(io, NetworkLifecycleState::Idle).await;
+            command = io.command_rx.recv() => {
+                match command {
+                    Some(NetworkCommand::Cancel) => {
+                        discovery.stop_advertising(io).await;
+                        emit_state(io, NetworkLifecycleState::Idle).await;
+                        break;
+                    }
+                    Some(NetworkCommand::StartLanAdvertising { identity, share_addr }) => discovery.start_advertising(identity, share_addr, io).await,
+                    Some(NetworkCommand::StopLanAdvertising) => discovery.stop_advertising(io).await,
+                    Some(NetworkCommand::BrowseLan) => discovery.browse(io).await,
+                    Some(NetworkCommand::RegisterLobby { server_addr, request }) => register_lobby(server_addr, request, io).await,
+                    Some(NetworkCommand::BrowseLobby { server_addr, ranked_only }) => browse_lobby(server_addr, ranked_only, io).await,
+                    Some(NetworkCommand::StartHostedGame { server_addr, session_id, joiner }) => start_hosted_game(server_addr, session_id, joiner, io).await,
+                    Some(NetworkCommand::PollHostedStatus { server_addr, session_id, requester_player_id }) => poll_hosted_status(server_addr, session_id, requester_player_id, io).await,
+                    Some(NetworkCommand::CancelHostedSession { server_addr, session_id, requester_player_id }) => cancel_hosted_session(server_addr, session_id, requester_player_id, io).await,
+                    Some(NetworkCommand::FetchRankedRecords { server_addr, limit }) => fetch_ranked_records(server_addr, limit, io).await,
+                    Some(other) => {
+                        emit_error(io, format!("direct host canceled by {:?}", command_name(&other))).await;
+                        emit_state(io, NetworkLifecycleState::Idle).await;
+                        break;
+                    }
+                    None => break,
                 }
-                None => {}
             }
         }
     }
@@ -1043,7 +1159,7 @@ async fn join_direct(
     match joined {
         Ok(Ok(joined)) => connect_joined(joined, active, io).await,
         Ok(Err(ProtocolError::ChallengeDenied { reason })) => {
-            emit_error(io, format!("direct challenge denied: {reason}")).await;
+            emit_error(io, format!("Challenge denied: {reason}.")).await;
             emit_state(io, NetworkLifecycleState::Idle).await;
         }
         Ok(Err(error)) => {
@@ -1055,7 +1171,9 @@ async fn join_direct(
             log_net(&format!("timed out connecting to direct peer {peer_addr}"));
             emit_error(
                 io,
-                format!("timed out connecting to direct peer {peer_addr}"),
+                format!(
+                    "Join timed out. Check the host share address and firewall. Tried {peer_addr}."
+                ),
             )
             .await;
             emit_state(io, NetworkLifecycleState::Idle).await;
@@ -1125,7 +1243,7 @@ async fn join_hosted_direct(
             };
         }
         Ok(Err(ProtocolError::ChallengeDenied { reason })) => {
-            emit_error(io, format!("hosted direct challenge denied: {reason}")).await;
+            emit_error(io, format!("Challenge denied: {reason}.")).await;
             emit_state(io, NetworkLifecycleState::Idle).await;
         }
         Ok(Err(error)) => {
@@ -1139,7 +1257,7 @@ async fn join_hosted_direct(
         Err(_) => {
             emit_error(
                 io,
-                format!("timed out connecting to hosted direct peer {peer_addr}"),
+                format!("Join timed out. Check the host share address and firewall. Tried hosted direct peer {peer_addr}."),
             )
             .await;
             emit_state(io, NetworkLifecycleState::Idle).await;
@@ -1191,6 +1309,7 @@ async fn handle_connected_command(
         NetworkCommand::SendTickWatermark(watermark) => Some(WireMessage::TickWatermark(watermark)),
         NetworkCommand::SendHeartbeat(heartbeat) => Some(WireMessage::Heartbeat(heartbeat)),
         NetworkCommand::SendChecksum(checksum) => Some(WireMessage::GameChecksum(checksum)),
+        NetworkCommand::SendGameOver(game_over) => Some(WireMessage::GameOver(game_over)),
         NetworkCommand::SendBazaarBuy(buy) => Some(WireMessage::BazaarBuy(buy)),
         NetworkCommand::SendBazaarRemove(remove) => Some(WireMessage::BazaarRemove(remove)),
         NetworkCommand::SendBazaarDone { player } => {
@@ -1217,7 +1336,9 @@ async fn handle_connected_command(
         | NetworkCommand::BrowseLobby { .. }
         | NetworkCommand::StartHostedGame { .. }
         | NetworkCommand::PollHostedStatus { .. }
+        | NetworkCommand::CancelHostedSession { .. }
         | NetworkCommand::Accept { .. }
+        | NetworkCommand::AcceptHosted { .. }
         | NetworkCommand::Deny { .. } => {
             emit_error(
                 io,
@@ -1250,7 +1371,7 @@ async fn handle_peer_message(
     message: WireMessage,
     session: &mut NetworkSession,
     io: &mut NetworkIo,
-) {
+) -> bool {
     match message {
         WireMessage::PlayerInput(input) => {
             let _ = io.event_tx.send(NetworkEvent::InputReceived(input)).await;
@@ -1291,8 +1412,16 @@ async fn handle_peer_message(
             let _ = io.event_tx.send(NetworkEvent::PendingResult(pending)).await;
         }
         WireMessage::Disconnect(disconnect) => {
-            emit_error(io, format!("peer disconnected: {}", disconnect.reason)).await;
+            emit_error(
+                io,
+                format!(
+                    "Peer disconnected. The online game has ended. Reason: {}",
+                    disconnect.reason
+                ),
+            )
+            .await;
             emit_state(io, NetworkLifecycleState::Idle).await;
+            return true;
         }
         other => {
             emit_error(
@@ -1302,6 +1431,7 @@ async fn handle_peer_message(
             .await;
         }
     }
+    false
 }
 
 async fn emit_connected(io: &mut NetworkIo, session: &NetworkSession) {
@@ -1330,8 +1460,8 @@ async fn server_request(
 ) -> Result<WireMessage, String> {
     let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(server_addr))
         .await
-        .map_err(|_| format!("timed out connecting to lobby server {server_addr}"))?
-        .map_err(|error| format!("connect to lobby server {server_addr} failed: {error}"))?;
+        .map_err(|_| format!("Lobby server unavailable. Direct IP can still be used. Timed out connecting to {server_addr}."))?
+        .map_err(|error| format!("Lobby server unavailable. Direct IP can still be used. Connect to {server_addr} failed: {error}."))?;
     battletris_protocol::write_message(&mut stream, &message)
         .await
         .map_err(|error| format_protocol_error("write lobby server request failed", &error))?;
@@ -1340,7 +1470,7 @@ async fn server_request(
         battletris_protocol::read_message(&mut stream),
     )
     .await
-    .map_err(|_| "timed out waiting for lobby server response".to_string())?
+    .map_err(|_| "Lobby server unavailable. Direct IP can still be used. Timed out waiting for lobby server response.".to_string())?
     .map_err(|error| format_protocol_error("read lobby server response failed", &error))
 }
 
@@ -1423,7 +1553,6 @@ impl LanDiscoveryRuntime {
                     emit_lan_unavailable(io, format!("LAN advertisement failed: {error}")).await
                 }
             }
-            return;
         }
 
         #[cfg(not(feature = "lan-discovery"))]
@@ -1511,7 +1640,6 @@ impl LanDiscoveryRuntime {
                     entries: entries.into_values().collect(),
                 })
                 .await;
-            return;
         }
 
         #[cfg(not(feature = "lan-discovery"))]
@@ -1639,12 +1767,15 @@ fn command_name(command: &NetworkCommand) -> &'static str {
         NetworkCommand::FetchRankedRecords { .. } => "fetch ranked records",
         NetworkCommand::StartHostedGame { .. } => "start hosted game",
         NetworkCommand::PollHostedStatus { .. } => "poll hosted status",
+        NetworkCommand::CancelHostedSession { .. } => "cancel hosted session",
         NetworkCommand::Accept { .. } => "accept",
+        NetworkCommand::AcceptHosted { .. } => "accept hosted",
         NetworkCommand::Deny { .. } => "deny",
         NetworkCommand::SendScheduledInput(_) => "send scheduled input",
         NetworkCommand::SendTickWatermark(_) => "send tick watermark",
         NetworkCommand::SendHeartbeat(_) => "send heartbeat",
         NetworkCommand::SendChecksum(_) => "send checksum",
+        NetworkCommand::SendGameOver(_) => "send game over",
         NetworkCommand::SendBazaarBuy(_) => "send bazaar buy",
         NetworkCommand::SendBazaarRemove(_) => "send bazaar remove",
         NetworkCommand::SendBazaarDone { .. } => "send bazaar done",
@@ -1695,10 +1826,13 @@ pub fn reduce_state(
         | NetworkCommand::FetchRankedRecords { .. }
         | NetworkCommand::StartHostedGame { .. }
         | NetworkCommand::PollHostedStatus { .. }
+        | NetworkCommand::CancelHostedSession { .. }
+        | NetworkCommand::AcceptHosted { .. }
         | NetworkCommand::SendScheduledInput(_)
         | NetworkCommand::SendTickWatermark(_)
         | NetworkCommand::SendHeartbeat(_)
         | NetworkCommand::SendChecksum(_)
+        | NetworkCommand::SendGameOver(_)
         | NetworkCommand::SendBazaarBuy(_)
         | NetworkCommand::SendBazaarRemove(_)
         | NetworkCommand::SendBazaarDone { .. }
@@ -1896,8 +2030,12 @@ impl NetworkLockstep {
     }
 
     /// Applies a Bazaar done intent through core APIs.
-    pub fn apply_bazaar_done(&self, game: &mut TwoPlayerGame, done: BazaarDone) {
-        let _ = game.bazaar_done(core_player(done.player));
+    pub fn apply_bazaar_done(
+        &self,
+        game: &mut TwoPlayerGame,
+        done: BazaarDone,
+    ) -> Vec<LoggedEvent> {
+        game.bazaar_done(core_player(done.player))
     }
 
     /// Builds a checksum diagnostic for the current whole-game state.

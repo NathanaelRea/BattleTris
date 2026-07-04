@@ -4,8 +4,8 @@ use std::{env, net::SocketAddr, process, sync::Arc};
 
 use battletris_db::{CommunityLabel, PersistencePaths, PlayerStore};
 use battletris_protocol::{
-    read_message_with_header, write_message, LobbyList, RankedResultAccepted, RankedResultPending,
-    RankedResultRejected, WireMessage,
+    read_message_with_header, write_message, HostedSessionStatus, HostedSessionStatusKind,
+    LobbyList, RankedResultAccepted, RankedResultPending, RankedResultRejected, WireMessage,
 };
 use battletris_server::{HostedLobbyServer, VerificationOutcome};
 use tokio::{net::TcpListener, sync::Mutex};
@@ -99,6 +99,21 @@ async fn handle_connection(
             let lobby = state.lobby.lock().await;
             match lobby.session_status(&request.session_id, &request.requester_player_id) {
                 Ok(status) => WireMessage::HostedSessionStatus(status),
+                Err(error) => WireMessage::RankedResultRejected(RankedResultRejected {
+                    session_id: Some(request.session_id),
+                    reason: error.to_string(),
+                }),
+            }
+        }
+        WireMessage::HostedSessionCancel(request) => {
+            let mut lobby = state.lobby.lock().await;
+            match lobby.cancel_session(&request.session_id, &request.requester_player_id) {
+                Ok(()) => WireMessage::HostedSessionStatus(HostedSessionStatus {
+                    session_id: request.session_id,
+                    status: HostedSessionStatusKind::Unavailable {
+                        reason: "session canceled".to_string(),
+                    },
+                }),
                 Err(error) => WireMessage::RankedResultRejected(RankedResultRejected {
                     session_id: Some(request.session_id),
                     reason: error.to_string(),

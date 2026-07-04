@@ -142,6 +142,8 @@ pub enum MessageKind {
     RankedRecordsRequest = 34,
     /// Server-owned ranked records response for a hosted community.
     RankedRecords = 35,
+    /// Request cancellation/expiry of an available hosted session.
+    HostedSessionCancel = 36,
 }
 
 impl MessageKind {
@@ -184,6 +186,7 @@ impl MessageKind {
             33 => Some(Self::GameChecksum),
             34 => Some(Self::RankedRecordsRequest),
             35 => Some(Self::RankedRecords),
+            36 => Some(Self::HostedSessionCancel),
             _ => None,
         }
     }
@@ -600,6 +603,15 @@ pub struct HostedSessionStatusRequest {
     pub requester_player_id: String,
 }
 
+/// Host-owned request to cancel an available hosted lobby session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedSessionCancel {
+    /// Session being canceled.
+    pub session_id: HostedSessionId,
+    /// Player id of the hosting participant.
+    pub requester_player_id: String,
+}
+
 /// Server-owned hosted lobby session status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedSessionStatus {
@@ -810,6 +822,8 @@ pub enum WireMessage {
     RankedRecordsRequest(RankedRecordsRequest),
     /// Server-owned ranked records response.
     RankedRecords(RankedRecords),
+    /// Host-owned hosted session cancellation request.
+    HostedSessionCancel(HostedSessionCancel),
 }
 
 impl WireMessage {
@@ -852,6 +866,7 @@ impl WireMessage {
             Self::GameChecksum(_) => MessageKind::GameChecksum,
             Self::RankedRecordsRequest(_) => MessageKind::RankedRecordsRequest,
             Self::RankedRecords(_) => MessageKind::RankedRecords,
+            Self::HostedSessionCancel(_) => MessageKind::HostedSessionCancel,
         }
     }
 }
@@ -1309,6 +1324,7 @@ fn encode_payload(message: &WireMessage) -> Result<Vec<u8>, ProtocolError> {
         WireMessage::GameChecksum(value) => to_stdvec(value),
         WireMessage::RankedRecordsRequest(value) => to_stdvec(value),
         WireMessage::RankedRecords(value) => to_stdvec(value),
+        WireMessage::HostedSessionCancel(value) => to_stdvec(value),
     }
 }
 
@@ -1395,6 +1411,9 @@ fn decode_payload(kind: MessageKind, payload: &[u8]) -> Result<WireMessage, Prot
             from_bytes(payload).map(WireMessage::RankedRecordsRequest)
         }
         MessageKind::RankedRecords => from_bytes(payload).map(WireMessage::RankedRecords),
+        MessageKind::HostedSessionCancel => {
+            from_bytes(payload).map(WireMessage::HostedSessionCancel)
+        }
     }
 }
 

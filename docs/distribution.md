@@ -45,6 +45,19 @@ Direct IP troubleshooting checklist:
 5. Confirm the joiner can route to the host address. Home-router NAT, guest Wi-Fi
    isolation, VPN split routing, and carrier NAT can all block direct reachability.
 
+Support checklist for common failures:
+
+1. `Host bind failed: address already in use` means another host is using the
+   port. Cancel the old host or choose a different port.
+2. `Join timed out` means the joiner could not complete the direct TCP/handshake
+   path. Recheck the host share address, firewall, and Wi-Fi/VPN routing.
+3. Do not join `0.0.0.0` or `127.0.0.1` from another machine. Use the host LAN
+   IP, for example `192.168.1.23:4405`.
+4. `Challenge denied` is a host decision, not a transport failure. The joiner can
+   retry after the host listens again.
+5. `Peer disconnected`, `peer idle timeout`, or `Desync detected` end the online
+   game intentionally. Return to Challenge/Sleep and start a new session.
+
 ## Self-Hosted Lobby
 
 The optional lobby provides community presence, server-issued hosted session
@@ -77,6 +90,16 @@ Ranked trust limits:
 3. The model prevents accidental single-client writes, but it does not provide
    anti-cheat, cryptographic identity, or protection against colluding modified
    clients.
+
+Hosted lobby troubleshooting checklist:
+
+1. `Lobby server unavailable` does not block Direct IP. Verify the server is
+   running and that clients use the server's reachable address, not `0.0.0.0`.
+2. A hosted game still needs the host direct share address to be reachable by the
+   joiner. The lobby is presence and authority, not a gameplay relay.
+3. `Ranked result pending` means the server accepted the first claim and is
+   waiting for the peer. `Ranked result rejected` means the server rejected the
+   claim; record the reason from the client status text.
 
 ## Networking Limitations
 
