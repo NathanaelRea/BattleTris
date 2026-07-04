@@ -191,6 +191,26 @@ fn run_client(run_config: ClientRunConfig) {
                 update_screen_visibility,
                 update_menu_button_visuals,
             ),
+        )
+        .add_systems(
+            Update,
+            (
+                handle_settings_ui_interactions.after(handle_keyboard_input),
+                update_settings_ui_visibility,
+                update_settings_ui_dropdown_visibility
+                    .after(handle_keyboard_input)
+                    .after(handle_settings_ui_interactions),
+                update_settings_ui_text
+                    .after(handle_keyboard_input)
+                    .after(handle_settings_ui_interactions),
+                update_settings_ui_theme
+                    .after(handle_settings_ui_interactions)
+                    .after(update_theme_entities),
+                update_settings_ui_visuals
+                    .after(handle_keyboard_input)
+                    .after(handle_settings_ui_interactions)
+                    .after(update_settings_ui_theme),
+            ),
         );
 
     if let Some(visual_capture) = visual_capture {
@@ -241,6 +261,8 @@ enum ChallengeMode {
     ComputerOpponent,
     HostDirect,
     JoinDirect,
+    LegacyHost,
+    LegacyJoin,
     HostViaLobby,
     BrowseLobby,
     BrowseLan,
@@ -252,9 +274,57 @@ impl ChallengeMode {
             Self::ComputerOpponent => "Computer Opponent",
             Self::HostDirect => "Host Direct",
             Self::JoinDirect => "Join Direct",
+            Self::LegacyHost => "Legacy Host",
+            Self::LegacyJoin => "Legacy Join",
             Self::HostViaLobby => "Host Via Lobby",
             Self::BrowseLobby => "Browse Lobby",
             Self::BrowseLan => "Browse LAN",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ChallengeStyle {
+    Legacy,
+    Modern,
+}
+
+impl ChallengeStyle {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Legacy => "Legacy",
+            Self::Modern => "Modern",
+        }
+    }
+
+    const fn toggled(self) -> Self {
+        match self {
+            Self::Legacy => Self::Modern,
+            Self::Modern => Self::Legacy,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum UiStyleChoice {
+    Original,
+    Modern,
+}
+
+impl UiStyleChoice {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Original => "Original",
+            Self::Modern => "Modern",
+        }
+    }
+
+    const fn toggled(self) -> Self {
+        match self {
+            Self::Original => Self::Modern,
+            Self::Modern => Self::Original,
         }
     }
 }
@@ -269,38 +339,83 @@ enum SettingsField {
     LobbyAddress,
 }
 
-impl SettingsField {
-    const ALL: [Self; 6] = [
-        Self::DisplayName,
-        Self::CommunityLabel,
-        Self::HostBindAddress,
-        Self::ShareAddress,
-        Self::JoinAddress,
-        Self::LobbyAddress,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsControl {
+    UiStyle,
+    Theme,
+    SoundPack,
+    ChallengeStyle,
+    HostedRanked,
+    PixelScale,
+    Text(SettingsField),
+}
+
+impl SettingsControl {
+    const ALL: [Self; 12] = [
+        Self::UiStyle,
+        Self::Theme,
+        Self::SoundPack,
+        Self::ChallengeStyle,
+        Self::HostedRanked,
+        Self::PixelScale,
+        Self::Text(SettingsField::DisplayName),
+        Self::Text(SettingsField::CommunityLabel),
+        Self::Text(SettingsField::HostBindAddress),
+        Self::Text(SettingsField::ShareAddress),
+        Self::Text(SettingsField::JoinAddress),
+        Self::Text(SettingsField::LobbyAddress),
     ];
 
-    const fn label(self) -> &'static str {
+    const fn text_field(self) -> Option<SettingsField> {
         match self {
-            Self::DisplayName => "display name",
-            Self::CommunityLabel => "community",
-            Self::HostBindAddress => "host bind",
-            Self::ShareAddress => "share address",
-            Self::JoinAddress => "join address",
-            Self::LobbyAddress => "lobby address",
+            Self::Text(field) => Some(field),
+            Self::UiStyle
+            | Self::Theme
+            | Self::SoundPack
+            | Self::ChallengeStyle
+            | Self::HostedRanked
+            | Self::PixelScale => None,
         }
     }
 }
 
 #[derive(Resource, Debug, Clone)]
 struct SettingsEditState {
+    control: SettingsControl,
     field: SettingsField,
+    open_dropdown: Option<SettingsControl>,
 }
 
 impl Default for SettingsEditState {
     fn default() -> Self {
         Self {
+            control: SettingsControl::UiStyle,
             field: SettingsField::DisplayName,
+            open_dropdown: None,
         }
+    }
+}
+
+impl SettingsEditState {
+    fn set_focused_control(&mut self, control: SettingsControl) {
+        self.control = control;
+        if let Some(field) = control.text_field() {
+            self.field = field;
+        }
+    }
+
+    fn focus(&mut self, control: SettingsControl) {
+        self.set_focused_control(control);
+        self.open_dropdown = None;
+    }
+
+    fn toggle_dropdown(&mut self, control: SettingsControl) {
+        self.set_focused_control(control);
+        self.open_dropdown = (self.open_dropdown != Some(control)).then_some(control);
+    }
+
+    fn close_dropdown(&mut self) {
+        self.open_dropdown = None;
     }
 }
 
@@ -456,8 +571,9 @@ fn pump_network_events(mut input: NetworkPumpParams) {
                     );
                 }
                 if listening
-                    && (input.settings.challenge_mode == ChallengeMode::HostViaLobby
-                        || input.settings.challenge_mode == ChallengeMode::HostDirect
+                    && ((input.settings.challenge_style == ChallengeStyle::Modern
+                        && (input.settings.challenge_mode == ChallengeMode::HostViaLobby
+                            || input.settings.challenge_mode == ChallengeMode::HostDirect))
                         || input.settings.screen == ClientScreen::Sleep)
                 {
                     start_lan_advertising(
@@ -467,7 +583,8 @@ fn pump_network_events(mut input: NetworkPumpParams) {
                     );
                 }
                 if listening
-                    && (input.settings.challenge_mode == ChallengeMode::HostViaLobby
+                    && ((input.settings.challenge_style == ChallengeStyle::Modern
+                        && input.settings.challenge_mode == ChallengeMode::HostViaLobby)
                         || input.settings.screen == ClientScreen::Sleep)
                 {
                     register_hosted_lobby(
@@ -1006,7 +1123,8 @@ fn refresh_hosted_lobby(
     }
     let elapsed_ms = time.delta().as_millis().min(u128::from(u64::MAX)) as u64;
     if settings.screen == ClientScreen::Sleep
-        || settings.challenge_mode == ChallengeMode::HostViaLobby
+        || (settings.challenge_style == ChallengeStyle::Modern
+            && settings.challenge_mode == ChallengeMode::HostViaLobby)
     {
         state.hosted_poll_elapsed_ms = state.hosted_poll_elapsed_ms.saturating_add(elapsed_ms);
         if state.hosted_poll_elapsed_ms >= HOSTED_STATUS_POLL_INTERVAL_MS {
@@ -1015,6 +1133,7 @@ fn refresh_hosted_lobby(
         }
     }
     if settings.screen == ClientScreen::Challenge
+        && settings.challenge_style == ChallengeStyle::Modern
         && settings.challenge_mode == ChallengeMode::BrowseLobby
         && state.lobby_list.is_some()
     {
@@ -1089,6 +1208,20 @@ impl ContentMode {
 }
 
 impl SoundPackChoice {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::GeneratedDefault => "Generated Default",
+            Self::Muted => "Muted",
+        }
+    }
+
+    const fn toggled(self) -> Self {
+        match self {
+            Self::GeneratedDefault => Self::Muted,
+            Self::Muted => Self::GeneratedDefault,
+        }
+    }
+
     const fn directory(self) -> &'static str {
         match self {
             Self::GeneratedDefault => "generated-default",
@@ -1098,6 +1231,13 @@ impl SoundPackChoice {
 }
 
 impl ThemeChoice {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Original => "Original",
+            Self::HighContrast => "High Contrast",
+        }
+    }
+
     const fn directory(self) -> &'static str {
         match self {
             Self::Original => "original",
@@ -2762,11 +2902,13 @@ enum ControlScheme {
 struct ClientSettings {
     screen: ClientScreen,
     content_mode: ContentMode,
+    ui_style: UiStyleChoice,
     theme: ThemeChoice,
     sound_pack: SoundPackChoice,
     controls: ControlScheme,
     pixel_scale: f32,
     ernie_level: usize,
+    challenge_style: ChallengeStyle,
     challenge_mode: ChallengeMode,
     display_name: String,
     community_label: String,
@@ -2785,11 +2927,13 @@ impl Default for ClientSettings {
         Self {
             screen: ClientScreen::Startup,
             content_mode: ContentMode::Normal,
+            ui_style: UiStyleChoice::Original,
             theme: ThemeChoice::Original,
             sound_pack: SoundPackChoice::GeneratedDefault,
             controls: ControlScheme::Original,
             pixel_scale: 1.0,
             ernie_level: DEFAULT_ERNIE_LEVEL,
+            challenge_style: ChallengeStyle::Legacy,
             challenge_mode: ChallengeMode::ComputerOpponent,
             display_name: default_display_name(),
             community_label: CommunityLabel::local().as_str().to_string(),
@@ -2856,11 +3000,13 @@ impl ClientSettings {
 
     fn persisted(&self) -> PersistedClientSettings {
         PersistedClientSettings {
+            ui_style: self.ui_style,
             theme: self.theme,
             sound_pack: self.sound_pack,
             controls: self.controls,
             pixel_scale: self.pixel_scale,
             ernie_level: self.ernie_level,
+            challenge_style: self.challenge_style,
             display_name: self.display_name.clone(),
             community_label: self.community_label.clone(),
             direct_listen_addr: self.direct_listen_addr.clone(),
@@ -2872,11 +3018,13 @@ impl ClientSettings {
     }
 
     fn apply_persisted(&mut self, persisted: PersistedClientSettings) {
+        self.ui_style = persisted.ui_style;
         self.theme = persisted.theme;
         self.sound_pack = persisted.sound_pack;
         self.controls = persisted.controls;
         self.pixel_scale = sanitize_pixel_scale(persisted.pixel_scale);
         self.ernie_level = sanitize_ernie_level(persisted.ernie_level);
+        self.challenge_style = persisted.challenge_style;
         self.display_name =
             sanitize_nonempty_setting(persisted.display_name, default_display_name());
         self.community_label =
@@ -2895,11 +3043,13 @@ impl ClientSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 struct PersistedClientSettings {
+    ui_style: UiStyleChoice,
     theme: ThemeChoice,
     sound_pack: SoundPackChoice,
     controls: ControlScheme,
     pixel_scale: f32,
     ernie_level: usize,
+    challenge_style: ChallengeStyle,
     display_name: String,
     community_label: String,
     direct_listen_addr: String,
@@ -2912,11 +3062,13 @@ struct PersistedClientSettings {
 impl Default for PersistedClientSettings {
     fn default() -> Self {
         Self {
+            ui_style: UiStyleChoice::Original,
             theme: ThemeChoice::Original,
             sound_pack: SoundPackChoice::GeneratedDefault,
             controls: ControlScheme::Original,
             pixel_scale: 1.0,
             ernie_level: DEFAULT_ERNIE_LEVEL,
+            challenge_style: ChallengeStyle::Legacy,
             display_name: default_display_name(),
             community_label: "local".to_string(),
             direct_listen_addr: "0.0.0.0:4405".to_string(),
@@ -3835,6 +3987,108 @@ struct ScreenText;
 struct GenericScreenShell;
 
 #[derive(Component)]
+struct SettingsUiRoot;
+
+#[derive(Component)]
+struct SettingsUiBackground;
+
+#[derive(Component)]
+struct SettingsUiBiffImage;
+
+#[derive(Component)]
+struct SettingsUiTitleText;
+
+#[derive(Component)]
+struct SettingsUiBackButton;
+
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+struct SettingsUiControlButton {
+    control: SettingsControl,
+    action: SettingsUiAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsUiAction {
+    Focus,
+    Activate,
+    ToggleDropdown,
+    Select(SettingsSelectOption),
+    Decrement,
+    Increment,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsSelectOption {
+    UiStyle(UiStyleChoice),
+    Theme(ThemeChoice),
+    SoundPack(SoundPackChoice),
+    ChallengeStyle(ChallengeStyle),
+}
+
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+struct SettingsUiDropdownMenu {
+    control: SettingsControl,
+}
+
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+struct SettingsUiSurface {
+    role: SettingsUiSurfaceRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsUiSurfaceRole {
+    Background,
+    Panel,
+    Dropdown,
+}
+
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+struct SettingsUiTextColor {
+    role: SettingsUiTextColorRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsUiTextColorRole {
+    Title,
+    Section,
+    Label,
+    Value,
+    Hint,
+    Status,
+    Button,
+}
+
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+struct SettingsUiValueText {
+    value: SettingsUiValue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsUiValue {
+    UiStyle,
+    Theme,
+    SoundPack,
+    ChallengeStyle,
+    HostedRanked,
+    PixelScale,
+    Field(SettingsField),
+}
+
+#[derive(Component)]
+struct SettingsUiStatusText;
+
+type SettingsUiBackButtonVisualQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static Interaction,
+        &'static mut BackgroundColor,
+        &'static mut BorderColor,
+    ),
+    (With<SettingsUiBackButton>, Without<SettingsUiControlButton>),
+>;
+
+#[derive(Component)]
 struct StartupOnlyShell;
 
 #[derive(Component)]
@@ -4043,6 +4297,7 @@ struct MenuButton {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MenuAction {
+    StartSelectedChallenge,
     StartHumanVsComputer,
     GoTo(ClientScreen),
     Quit,
@@ -4108,6 +4363,7 @@ fn setup(
     let theme = themes.get(settings.theme);
 
     spawn_screen_shell(&mut commands, theme, &asset_server);
+    spawn_settings_ui_shell(&mut commands, theme, &asset_server);
     spawn_challenge_shell(&mut commands, theme, &asset_server);
     spawn_about_shell(&mut commands, theme, &asset_server);
     spawn_roster_shell(&mut commands, theme, &asset_server);
@@ -4778,6 +5034,733 @@ fn spawn_screen_shell(commands: &mut Commands, theme: &LoadedTheme, asset_server
     }
     for spec in secondary_screen_buttons(theme) {
         spawn_menu_button(commands, theme, asset_server, spec);
+    }
+}
+
+fn spawn_settings_ui_shell(
+    commands: &mut Commands,
+    theme: &LoadedTheme,
+    asset_server: &AssetServer,
+) {
+    commands
+        .spawn((
+            SettingsUiRoot,
+            SettingsUiBackground,
+            SettingsUiSurface {
+                role: SettingsUiSurfaceRole::Background,
+            },
+            Node {
+                width: percent(100),
+                height: percent(100),
+                display: Display::Flex,
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                row_gap: px(14),
+                padding: UiRect::px(34.0, 34.0, 28.0, 28.0),
+                ..default()
+            },
+            BackgroundColor(theme.screen.background),
+            BorderColor::all(Color::NONE),
+            Visibility::Hidden,
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                SettingsUiTitleText,
+                Text::new("Settings"),
+                themed_text_font_at_size(theme, ThemedTextFontRole::Title, 21.0, asset_server),
+                TextColor(theme.screen.title_text),
+                SettingsUiTextColor {
+                    role: SettingsUiTextColorRole::Title,
+                },
+                ThemedTextColor {
+                    role: ThemedTextColorRole::ScreenTitle,
+                },
+                ThemedTextFont {
+                    role: ThemedTextFontRole::Title,
+                },
+            ));
+            parent.spawn((
+                SettingsUiBiffImage,
+                ImageNode::new(asset_server.load(theme.sprites.biff.clone())),
+                Node {
+                    position_type: PositionType::Absolute,
+                    width: px(LEGACY_ROSTER_BIFF_WIDTH),
+                    height: px(LEGACY_ROSTER_BIFF_HEIGHT),
+                    left: px(78),
+                    bottom: px(118),
+                    ..default()
+                },
+            ));
+            parent
+                .spawn((
+                    SettingsUiSurface {
+                        role: SettingsUiSurfaceRole::Panel,
+                    },
+                    Node {
+                        width: px(572),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: px(4),
+                        padding: UiRect::all(px(10)),
+                        border: UiRect::all(px(2)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::NONE),
+                    BorderColor::all(Color::NONE),
+                ))
+                .with_children(|parent| {
+                    parent.spawn(settings_ui_text(
+                        "General",
+                        13.0,
+                        Color::srgb(0.82, 0.9, 1.0),
+                        SettingsUiTextColorRole::Section,
+                    ));
+                    spawn_settings_dropdown_ui_row(
+                        parent,
+                        "UI Style",
+                        SettingsControl::UiStyle,
+                        SettingsUiValue::UiStyle,
+                    );
+                    spawn_settings_dropdown_ui_row(
+                        parent,
+                        "Theme",
+                        SettingsControl::Theme,
+                        SettingsUiValue::Theme,
+                    );
+                    spawn_settings_dropdown_ui_row(
+                        parent,
+                        "Sound",
+                        SettingsControl::SoundPack,
+                        SettingsUiValue::SoundPack,
+                    );
+                    spawn_settings_dropdown_ui_row(
+                        parent,
+                        "Challenge Style",
+                        SettingsControl::ChallengeStyle,
+                        SettingsUiValue::ChallengeStyle,
+                    );
+                    spawn_settings_checkbox_ui_row(
+                        parent,
+                        "Hosted Ranked",
+                        SettingsControl::HostedRanked,
+                    );
+                    spawn_settings_scale_ui_row(parent);
+
+                    parent.spawn((
+                        Node {
+                            height: px(6),
+                            ..default()
+                        },
+                    ));
+                    parent.spawn(settings_ui_text(
+                        "Text Inputs",
+                        13.0,
+                        Color::srgb(0.82, 0.9, 1.0),
+                        SettingsUiTextColorRole::Section,
+                    ));
+                    for (label, field) in [
+                        ("Display Name", SettingsField::DisplayName),
+                        ("Community", SettingsField::CommunityLabel),
+                        ("Host Bind", SettingsField::HostBindAddress),
+                        ("Share Address", SettingsField::ShareAddress),
+                        ("Join Address", SettingsField::JoinAddress),
+                        ("Lobby Address", SettingsField::LobbyAddress),
+                    ] {
+                        spawn_settings_text_input_ui_row(parent, label, field);
+                    }
+
+                    parent.spawn((
+                        Text::new("Tab/Shift+Tab focus. Type in text boxes. Enter validates/toggles. Click controls to focus."),
+                        pixel_text_font(10.0),
+                        TextColor(Color::srgb(0.72, 0.76, 0.82)),
+                        SettingsUiTextColor {
+                            role: SettingsUiTextColorRole::Hint,
+                        },
+                        Node {
+                            width: percent(100),
+                            margin: UiRect::top(px(4)),
+                            ..default()
+                        },
+                    ));
+                    parent.spawn((
+                        SettingsUiStatusText,
+                        Text::new(""),
+                        pixel_text_font(10.0),
+                        TextColor(Color::srgb(0.58, 0.66, 0.76)),
+                        SettingsUiTextColor {
+                            role: SettingsUiTextColorRole::Status,
+                        },
+                        Node {
+                            width: percent(100),
+                            ..default()
+                        },
+                    ));
+                });
+            parent
+                .spawn(settings_ui_back_button_node(theme))
+                .with_child((
+                    Text::new("Back"),
+                    themed_text_font_at_size(theme, ThemedTextFontRole::Button, 12.0, asset_server),
+                    TextColor(theme.button.text),
+                    SettingsUiTextColor {
+                        role: SettingsUiTextColorRole::Button,
+                    },
+                    ThemedTextColor {
+                        role: ThemedTextColorRole::Button,
+                    },
+                    ThemedTextFont {
+                        role: ThemedTextFontRole::Button,
+                    },
+                ));
+        });
+}
+
+fn settings_ui_back_button_node(theme: &LoadedTheme) -> impl Bundle {
+    (
+        Button,
+        SettingsUiBackButton,
+        Node {
+            width: px(theme.layout.rects.settings_back.width),
+            height: px(theme.layout.rects.settings_back.height),
+            align_items: AlignItems::Center,
+            justify_content: JustifyContent::Center,
+            border: UiRect::all(px(2)),
+            ..default()
+        },
+        BorderColor::all(Color::srgb(0.52, 0.58, 0.66)),
+        BackgroundColor(theme.button.normal),
+    )
+}
+
+fn spawn_settings_dropdown_ui_row(
+    parent: &mut ChildSpawnerCommands,
+    label: &'static str,
+    control: SettingsControl,
+    value: SettingsUiValue,
+) {
+    parent
+        .spawn(Node {
+            flex_direction: FlexDirection::Column,
+            row_gap: px(2),
+            ..default()
+        })
+        .with_children(|parent| {
+            spawn_settings_control_row(parent, label, |parent| {
+                parent
+                    .spawn(settings_ui_button_node(
+                        control,
+                        SettingsUiAction::ToggleDropdown,
+                        px(312),
+                    ))
+                    .with_children(|parent| {
+                        parent.spawn((
+                            SettingsUiValueText { value },
+                            Text::new(""),
+                            pixel_text_font(11.0),
+                            TextColor(Color::srgb(0.94, 0.96, 1.0)),
+                            SettingsUiTextColor {
+                                role: SettingsUiTextColorRole::Value,
+                            },
+                            Node {
+                                flex_grow: 1.0,
+                                ..default()
+                            },
+                        ));
+                        parent.spawn(settings_ui_text(
+                            "v",
+                            11.0,
+                            Color::srgb(0.94, 0.96, 1.0),
+                            SettingsUiTextColorRole::Value,
+                        ));
+                    });
+            });
+
+            parent
+                .spawn((
+                    SettingsUiDropdownMenu { control },
+                    SettingsUiSurface {
+                        role: SettingsUiSurfaceRole::Dropdown,
+                    },
+                    Node {
+                        display: Display::None,
+                        position_type: PositionType::Absolute,
+                        flex_direction: FlexDirection::Column,
+                        width: px(312),
+                        left: px(148),
+                        top: px(22),
+                        row_gap: px(2),
+                        padding: UiRect::all(px(2)),
+                        border: UiRect::all(px(2)),
+                        ..default()
+                    },
+                    GlobalZIndex(10),
+                    BorderColor::all(Color::srgb(0.52, 0.58, 0.66)),
+                    BackgroundColor(Color::srgb(0.04, 0.05, 0.07)),
+                ))
+                .with_children(|parent| {
+                    spawn_settings_dropdown_options(parent, control);
+                });
+        });
+}
+
+fn spawn_settings_dropdown_options(parent: &mut ChildSpawnerCommands, control: SettingsControl) {
+    match control {
+        SettingsControl::UiStyle => {
+            for (label, option) in [
+                (
+                    "Original",
+                    SettingsSelectOption::UiStyle(UiStyleChoice::Original),
+                ),
+                (
+                    "Modern",
+                    SettingsSelectOption::UiStyle(UiStyleChoice::Modern),
+                ),
+            ] {
+                spawn_settings_dropdown_option(parent, control, label, option);
+            }
+        }
+        SettingsControl::Theme => {
+            for (label, option) in [
+                (
+                    "Original",
+                    SettingsSelectOption::Theme(ThemeChoice::Original),
+                ),
+                (
+                    "High Contrast",
+                    SettingsSelectOption::Theme(ThemeChoice::HighContrast),
+                ),
+            ] {
+                spawn_settings_dropdown_option(parent, control, label, option);
+            }
+        }
+        SettingsControl::SoundPack => {
+            for (label, option) in [
+                (
+                    "Generated Default",
+                    SettingsSelectOption::SoundPack(SoundPackChoice::GeneratedDefault),
+                ),
+                (
+                    "Muted",
+                    SettingsSelectOption::SoundPack(SoundPackChoice::Muted),
+                ),
+            ] {
+                spawn_settings_dropdown_option(parent, control, label, option);
+            }
+        }
+        SettingsControl::ChallengeStyle => {
+            for (label, option) in [
+                (
+                    "Legacy",
+                    SettingsSelectOption::ChallengeStyle(ChallengeStyle::Legacy),
+                ),
+                (
+                    "Modern",
+                    SettingsSelectOption::ChallengeStyle(ChallengeStyle::Modern),
+                ),
+            ] {
+                spawn_settings_dropdown_option(parent, control, label, option);
+            }
+        }
+        SettingsControl::HostedRanked | SettingsControl::PixelScale | SettingsControl::Text(_) => {}
+    }
+}
+
+fn spawn_settings_dropdown_option(
+    parent: &mut ChildSpawnerCommands,
+    control: SettingsControl,
+    label: &'static str,
+    option: SettingsSelectOption,
+) {
+    parent
+        .spawn(settings_ui_button_node(
+            control,
+            SettingsUiAction::Select(option),
+            px(312),
+        ))
+        .with_child(settings_ui_text(
+            label,
+            11.0,
+            Color::srgb(0.94, 0.96, 1.0),
+            SettingsUiTextColorRole::Value,
+        ));
+}
+
+fn spawn_settings_checkbox_ui_row(
+    parent: &mut ChildSpawnerCommands,
+    label: &'static str,
+    control: SettingsControl,
+) {
+    spawn_settings_control_row(parent, label, |parent| {
+        parent
+            .spawn(settings_ui_button_node(
+                control,
+                SettingsUiAction::Activate,
+                px(34),
+            ))
+            .with_children(|parent| {
+                parent.spawn((
+                    SettingsUiValueText {
+                        value: SettingsUiValue::HostedRanked,
+                    },
+                    Text::new(""),
+                    pixel_text_font(13.0),
+                    TextColor(Color::srgb(0.94, 0.96, 1.0)),
+                    SettingsUiTextColor {
+                        role: SettingsUiTextColorRole::Value,
+                    },
+                ));
+            });
+    });
+}
+
+fn spawn_settings_scale_ui_row(parent: &mut ChildSpawnerCommands) {
+    spawn_settings_control_row(parent, "Pixel Scale", |parent| {
+        parent
+            .spawn(settings_ui_button_node(
+                SettingsControl::PixelScale,
+                SettingsUiAction::Decrement,
+                px(34),
+            ))
+            .with_child(settings_ui_text(
+                "-",
+                12.0,
+                Color::srgb(0.94, 0.96, 1.0),
+                SettingsUiTextColorRole::Button,
+            ));
+        parent.spawn((
+            SettingsUiValueText {
+                value: SettingsUiValue::PixelScale,
+            },
+            Text::new(""),
+            pixel_text_font(11.0),
+            TextColor(Color::srgb(0.94, 0.96, 1.0)),
+            SettingsUiTextColor {
+                role: SettingsUiTextColorRole::Value,
+            },
+            Node {
+                width: px(80),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+        ));
+        parent
+            .spawn(settings_ui_button_node(
+                SettingsControl::PixelScale,
+                SettingsUiAction::Increment,
+                px(34),
+            ))
+            .with_child(settings_ui_text(
+                "+",
+                12.0,
+                Color::srgb(0.94, 0.96, 1.0),
+                SettingsUiTextColorRole::Button,
+            ));
+    });
+}
+
+fn spawn_settings_text_input_ui_row(
+    parent: &mut ChildSpawnerCommands,
+    label: &'static str,
+    field: SettingsField,
+) {
+    spawn_settings_control_row(parent, label, |parent| {
+        parent
+            .spawn(settings_ui_button_node(
+                SettingsControl::Text(field),
+                SettingsUiAction::Focus,
+                px(360),
+            ))
+            .with_children(|parent| {
+                parent.spawn((
+                    SettingsUiValueText {
+                        value: SettingsUiValue::Field(field),
+                    },
+                    Text::new(""),
+                    pixel_text_font(11.0),
+                    TextColor(Color::srgb(0.94, 0.96, 1.0)),
+                    SettingsUiTextColor {
+                        role: SettingsUiTextColorRole::Value,
+                    },
+                ));
+            });
+    });
+}
+
+fn spawn_settings_control_row(
+    parent: &mut ChildSpawnerCommands,
+    label: &'static str,
+    spawn_control: impl FnOnce(&mut ChildSpawnerCommands),
+) {
+    parent
+        .spawn(Node {
+            height: px(22),
+            align_items: AlignItems::Center,
+            column_gap: px(10),
+            ..default()
+        })
+        .with_children(|parent| {
+            parent.spawn((
+                Text::new(label),
+                pixel_text_font(11.0),
+                TextColor(Color::srgb(0.78, 0.82, 0.88)),
+                SettingsUiTextColor {
+                    role: SettingsUiTextColorRole::Label,
+                },
+                Node {
+                    width: px(138),
+                    ..default()
+                },
+            ));
+            spawn_control(parent);
+        });
+}
+
+fn settings_ui_button_node(
+    control: SettingsControl,
+    action: SettingsUiAction,
+    width: Val,
+) -> impl Bundle {
+    (
+        Button,
+        SettingsUiControlButton { control, action },
+        Node {
+            width,
+            height: px(22),
+            align_items: AlignItems::Center,
+            justify_content: JustifyContent::SpaceBetween,
+            padding: UiRect::horizontal(px(7)),
+            border: UiRect::all(px(2)),
+            ..default()
+        },
+        BorderColor::all(Color::srgb(0.52, 0.58, 0.66)),
+        BackgroundColor(Color::srgb(0.07, 0.08, 0.1)),
+    )
+}
+
+fn settings_ui_text(
+    text: impl Into<String>,
+    font_size: f32,
+    color: Color,
+    role: SettingsUiTextColorRole,
+) -> impl Bundle {
+    (
+        Text::new(text),
+        pixel_text_font(font_size),
+        TextColor(color),
+        SettingsUiTextColor { role },
+    )
+}
+
+fn settings_ui_surface_style(
+    style: UiStyleChoice,
+    theme: &LoadedTheme,
+    role: SettingsUiSurfaceRole,
+) -> (Color, BorderColor) {
+    match style {
+        UiStyleChoice::Original => match role {
+            SettingsUiSurfaceRole::Background => (
+                settings_ui_page_background(style, theme),
+                BorderColor::DEFAULT,
+            ),
+            SettingsUiSurfaceRole::Panel => (
+                motif_text_panel_color(),
+                settings_ui_motif_border(MotifBevel::Inset),
+            ),
+            SettingsUiSurfaceRole::Dropdown => (
+                motif_page_color(),
+                settings_ui_motif_border(MotifBevel::Inset),
+            ),
+        },
+        UiStyleChoice::Modern => match role {
+            SettingsUiSurfaceRole::Background => (
+                settings_ui_page_background(style, theme),
+                BorderColor::DEFAULT,
+            ),
+            SettingsUiSurfaceRole::Panel => (Color::NONE, BorderColor::DEFAULT),
+            SettingsUiSurfaceRole::Dropdown => (
+                Color::srgb(0.04, 0.05, 0.07),
+                BorderColor::all(Color::srgb(0.52, 0.58, 0.66)),
+            ),
+        },
+    }
+}
+
+fn settings_ui_page_background(style: UiStyleChoice, theme: &LoadedTheme) -> Color {
+    match style {
+        UiStyleChoice::Original => motif_page_color(),
+        UiStyleChoice::Modern => theme.screen.background,
+    }
+}
+
+fn settings_ui_text_color(
+    style: UiStyleChoice,
+    theme: &LoadedTheme,
+    role: SettingsUiTextColorRole,
+) -> Color {
+    match style {
+        UiStyleChoice::Original => match role {
+            SettingsUiTextColorRole::Title
+            | SettingsUiTextColorRole::Section
+            | SettingsUiTextColorRole::Value
+            | SettingsUiTextColorRole::Button => motif_blue_color(),
+            SettingsUiTextColorRole::Label | SettingsUiTextColorRole::Hint => Color::BLACK,
+            SettingsUiTextColorRole::Status => motif_message_green_color(),
+        },
+        UiStyleChoice::Modern => match role {
+            SettingsUiTextColorRole::Title => theme.screen.title_text,
+            SettingsUiTextColorRole::Section => Color::srgb(0.82, 0.9, 1.0),
+            SettingsUiTextColorRole::Label => Color::srgb(0.78, 0.82, 0.88),
+            SettingsUiTextColorRole::Value => Color::srgb(0.94, 0.96, 1.0),
+            SettingsUiTextColorRole::Hint => Color::srgb(0.72, 0.76, 0.82),
+            SettingsUiTextColorRole::Status => Color::srgb(0.58, 0.66, 0.76),
+            SettingsUiTextColorRole::Button => theme.button.text,
+        },
+    }
+}
+
+fn settings_ui_control_background(
+    style: UiStyleChoice,
+    action: SettingsUiAction,
+    interaction: Interaction,
+    focused: bool,
+    enabled: bool,
+) -> Color {
+    if !enabled {
+        return Color::NONE;
+    }
+
+    match style {
+        UiStyleChoice::Original => {
+            if interaction == Interaction::Pressed {
+                motif_button_pressed_color()
+            } else if settings_ui_control_is_field_like(action) {
+                motif_text_panel_color()
+            } else if interaction == Interaction::Hovered || focused {
+                motif_button_hover_color()
+            } else {
+                motif_button_face_color()
+            }
+        }
+        UiStyleChoice::Modern => {
+            if interaction == Interaction::Pressed {
+                Color::srgb(0.18, 0.28, 0.42)
+            } else if focused {
+                Color::srgb(0.11, 0.16, 0.24)
+            } else if interaction == Interaction::Hovered {
+                Color::srgb(0.13, 0.15, 0.18)
+            } else {
+                Color::srgb(0.07, 0.08, 0.1)
+            }
+        }
+    }
+}
+
+fn settings_ui_control_border(
+    style: UiStyleChoice,
+    action: SettingsUiAction,
+    interaction: Interaction,
+    focused: bool,
+    enabled: bool,
+) -> BorderColor {
+    if !enabled {
+        return BorderColor::DEFAULT;
+    }
+
+    match style {
+        UiStyleChoice::Original => {
+            let bevel = if interaction == Interaction::Pressed
+                || settings_ui_control_is_field_like(action)
+            {
+                MotifBevel::Inset
+            } else {
+                MotifBevel::Raised
+            };
+            settings_ui_motif_border(bevel)
+        }
+        UiStyleChoice::Modern => BorderColor::all(if focused {
+            Color::srgb(0.96, 0.78, 0.28)
+        } else if interaction == Interaction::Hovered {
+            Color::srgb(0.82, 0.88, 0.96)
+        } else {
+            Color::srgb(0.52, 0.58, 0.66)
+        }),
+    }
+}
+
+fn settings_ui_back_button_background(
+    style: UiStyleChoice,
+    theme: &LoadedTheme,
+    interaction: Interaction,
+    enabled: bool,
+) -> Color {
+    if !enabled {
+        return Color::NONE;
+    }
+
+    match style {
+        UiStyleChoice::Original => {
+            if interaction == Interaction::Pressed {
+                motif_button_pressed_color()
+            } else if interaction == Interaction::Hovered {
+                motif_button_hover_color()
+            } else {
+                motif_button_face_color()
+            }
+        }
+        UiStyleChoice::Modern => {
+            if interaction == Interaction::Pressed {
+                theme.button.pressed
+            } else if interaction == Interaction::Hovered {
+                theme.button.hover
+            } else {
+                theme.button.normal
+            }
+        }
+    }
+}
+
+fn settings_ui_back_button_border(
+    style: UiStyleChoice,
+    interaction: Interaction,
+    enabled: bool,
+) -> BorderColor {
+    if !enabled {
+        return BorderColor::DEFAULT;
+    }
+
+    match style {
+        UiStyleChoice::Original => {
+            settings_ui_motif_border(if interaction == Interaction::Pressed {
+                MotifBevel::Inset
+            } else {
+                MotifBevel::Raised
+            })
+        }
+        UiStyleChoice::Modern => BorderColor::all(if interaction == Interaction::Hovered {
+            Color::srgb(0.82, 0.88, 0.96)
+        } else {
+            Color::srgb(0.52, 0.58, 0.66)
+        }),
+    }
+}
+
+fn settings_ui_control_is_field_like(action: SettingsUiAction) -> bool {
+    matches!(
+        action,
+        SettingsUiAction::Focus | SettingsUiAction::Activate | SettingsUiAction::ToggleDropdown
+    )
+}
+
+fn settings_ui_motif_border(bevel: MotifBevel) -> BorderColor {
+    let (top_left, bottom_right) = match bevel {
+        MotifBevel::Raised => (motif_highlight_color(), motif_shadow_color()),
+        MotifBevel::Inset => (motif_shadow_color(), motif_highlight_color()),
+    };
+    BorderColor {
+        top: top_left,
+        left: top_left,
+        bottom: bottom_right,
+        right: bottom_right,
     }
 }
 
@@ -6198,8 +7181,14 @@ fn spawn_challenge_button_bevel(commands: &mut Commands, center: Vec2, size: Vec
     spawn_challenge_bevel(commands, center, size, 3.5, MotifBevel::Raised);
 }
 
-fn startup_buttons(theme: &LoadedTheme) -> [MenuButtonSpec; 5] {
+fn startup_buttons(theme: &LoadedTheme) -> [MenuButtonSpec; 6] {
     let rects = theme.layout.rects;
+    let gear_size = Vec2::splat(rects.startup_about.height);
+    let gear_center = rects.startup_about.center()
+        - Vec2::new(
+            rects.startup_about.width / 2.0 + 8.0 + gear_size.x / 2.0,
+            0.0,
+        );
     [
         MenuButtonSpec {
             screen: ClientScreen::Startup,
@@ -6214,6 +7203,13 @@ fn startup_buttons(theme: &LoadedTheme) -> [MenuButtonSpec; 5] {
             center: rects.startup_sleep.center(),
             size: rects.startup_sleep.size(),
             action: MenuAction::GoTo(ClientScreen::Sleep),
+        },
+        MenuButtonSpec {
+            screen: ClientScreen::Startup,
+            label: "*",
+            center: gear_center,
+            size: gear_size,
+            action: MenuAction::GoTo(ClientScreen::Settings),
         },
         MenuButtonSpec {
             screen: ClientScreen::Startup,
@@ -6247,7 +7243,7 @@ fn secondary_screen_buttons(theme: &LoadedTheme) -> [MenuButtonSpec; 8] {
             label: "Challenge",
             center: rects.challenge_level_down.center(),
             size: rects.challenge_level_down.size(),
-            action: MenuAction::GoTo(ClientScreen::Challenge),
+            action: MenuAction::StartSelectedChallenge,
         },
         MenuButtonSpec {
             screen: ClientScreen::Challenge,
@@ -6461,6 +7457,9 @@ fn handle_mouse_buttons(mut input: MouseButtonParams) {
         queue_sound(&mut input.sound, SoundEvent::MenuAction);
         return;
     }
+    if input.settings.screen == ClientScreen::Settings {
+        return;
+    }
     let Some(button) = input
         .buttons
         .iter()
@@ -6480,6 +7479,211 @@ fn handle_mouse_buttons(mut input: MouseButtonParams) {
     );
 }
 
+fn handle_settings_ui_interactions(
+    mut settings: ResMut<ClientSettings>,
+    mut edit: ResMut<SettingsEditState>,
+    mut sound: ResMut<SoundEventState>,
+    controls: Query<(&Interaction, &SettingsUiControlButton), Changed<Interaction>>,
+    back_buttons: Query<&Interaction, (Changed<Interaction>, With<SettingsUiBackButton>)>,
+) {
+    if settings.screen != ClientScreen::Settings {
+        return;
+    }
+
+    let previous = settings.persisted();
+    let mut interacted = false;
+    for (interaction, button) in &controls {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        interacted = true;
+        match button.action {
+            SettingsUiAction::Focus => edit.focus(button.control),
+            SettingsUiAction::Activate => {
+                edit.focus(button.control);
+                activate_settings_control(&mut settings, button.control);
+            }
+            SettingsUiAction::ToggleDropdown => edit.toggle_dropdown(button.control),
+            SettingsUiAction::Select(option) => {
+                edit.focus(button.control);
+                apply_settings_select_option(&mut settings, option);
+                edit.close_dropdown();
+            }
+            SettingsUiAction::Decrement => {
+                edit.focus(button.control);
+                adjust_settings_pixel_scale(&mut settings, -0.25);
+            }
+            SettingsUiAction::Increment => {
+                edit.focus(button.control);
+                adjust_settings_pixel_scale(&mut settings, 0.25);
+            }
+        }
+    }
+    for interaction in &back_buttons {
+        if *interaction == Interaction::Pressed {
+            interacted = true;
+            edit.close_dropdown();
+            settings.screen = ClientScreen::Startup;
+        }
+    }
+
+    if interacted {
+        queue_sound(&mut sound, SoundEvent::MenuAction);
+    }
+    if settings.persisted() != previous {
+        settings.save();
+    }
+}
+
+fn update_settings_ui_visibility(
+    settings: Res<ClientSettings>,
+    mut roots: Query<&mut Visibility, With<SettingsUiRoot>>,
+) {
+    for mut visibility in &mut roots {
+        *visibility = if settings.screen == ClientScreen::Settings {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+    }
+}
+
+fn update_settings_ui_dropdown_visibility(
+    settings: Res<ClientSettings>,
+    edit: Res<SettingsEditState>,
+    mut menus: Query<(&SettingsUiDropdownMenu, &mut Node)>,
+) {
+    for (menu, mut node) in &mut menus {
+        node.display = if settings.screen == ClientScreen::Settings
+            && edit.open_dropdown == Some(menu.control)
+        {
+            Display::Flex
+        } else {
+            Display::None
+        };
+    }
+}
+
+fn update_settings_ui_text(
+    settings: Res<ClientSettings>,
+    edit: Res<SettingsEditState>,
+    mut values: Query<(&SettingsUiValueText, &mut Text)>,
+    mut statuses: Query<&mut Text, (With<SettingsUiStatusText>, Without<SettingsUiValueText>)>,
+) {
+    for (value, mut text) in &mut values {
+        text.0 = settings_ui_value_label(&settings, &edit, value.value);
+    }
+    for mut status in &mut statuses {
+        status.0 = settings_ui_status_label(&settings);
+    }
+}
+
+fn update_settings_ui_theme(
+    settings: Res<ClientSettings>,
+    themes: Res<ThemePacks>,
+    asset_server: Res<AssetServer>,
+    mut surfaces: Query<(&SettingsUiSurface, &mut BackgroundColor, &mut BorderColor)>,
+    mut text_colors: Query<(&SettingsUiTextColor, &mut TextColor)>,
+    mut biff_images: Query<&mut ImageNode, With<SettingsUiBiffImage>>,
+) {
+    let theme = themes.get(settings.theme);
+    for (surface, mut background, mut border) in &mut surfaces {
+        let (surface_background, surface_border) =
+            settings_ui_surface_style(settings.ui_style, theme, surface.role);
+        background.0 = surface_background;
+        *border = surface_border;
+    }
+    for (style_text, mut text_color) in &mut text_colors {
+        text_color.0 = settings_ui_text_color(settings.ui_style, theme, style_text.role);
+    }
+    for mut image in &mut biff_images {
+        image.image = asset_server.load(theme.sprites.biff.clone());
+    }
+}
+
+fn update_settings_ui_visuals(
+    settings: Res<ClientSettings>,
+    edit: Res<SettingsEditState>,
+    themes: Res<ThemePacks>,
+    mut controls: Query<(
+        &SettingsUiControlButton,
+        &Interaction,
+        &mut BackgroundColor,
+        &mut BorderColor,
+    )>,
+    mut back_buttons: SettingsUiBackButtonVisualQuery,
+) {
+    let enabled = settings.screen == ClientScreen::Settings;
+    let theme = themes.get(settings.theme);
+    for (button, interaction, mut background, mut border) in &mut controls {
+        let focused = enabled && edit.control == button.control;
+        background.0 = settings_ui_control_background(
+            settings.ui_style,
+            button.action,
+            *interaction,
+            focused,
+            enabled,
+        );
+        *border = settings_ui_control_border(
+            settings.ui_style,
+            button.action,
+            *interaction,
+            focused,
+            enabled,
+        );
+    }
+    for (interaction, mut background, mut border) in &mut back_buttons {
+        background.0 =
+            settings_ui_back_button_background(settings.ui_style, theme, *interaction, enabled);
+        *border = settings_ui_back_button_border(settings.ui_style, *interaction, enabled);
+    }
+}
+
+fn settings_ui_value_label(
+    settings: &ClientSettings,
+    edit: &SettingsEditState,
+    value: SettingsUiValue,
+) -> String {
+    match value {
+        SettingsUiValue::UiStyle => settings.ui_style.label().to_string(),
+        SettingsUiValue::Theme => settings.theme.label().to_string(),
+        SettingsUiValue::SoundPack => settings.sound_pack.label().to_string(),
+        SettingsUiValue::ChallengeStyle => settings.challenge_style.label().to_string(),
+        SettingsUiValue::HostedRanked => {
+            if settings.hosted_ranked {
+                "x".to_string()
+            } else {
+                String::new()
+            }
+        }
+        SettingsUiValue::PixelScale => format!("{:.2}x", settings.pixel_scale),
+        SettingsUiValue::Field(field) => {
+            let mut label = truncate_label(settings_field_value(settings, field), 40);
+            if edit.control == SettingsControl::Text(field) {
+                label.push('|');
+            }
+            label
+        }
+    }
+}
+
+fn settings_ui_status_label(settings: &ClientSettings) -> String {
+    let settings_path = settings
+        .settings_path
+        .as_ref()
+        .map(|path| truncate_label(&path.display().to_string(), 54))
+        .unwrap_or_else(|| "unavailable".to_string());
+    format!(
+        "UI: {}    Controls: {}    Lobby: {}\nProtocol v{}.{}    Settings: {}",
+        settings.ui_style.label(),
+        controls_label(settings.controls),
+        lobby_status_label(settings),
+        PROTOCOL_MAJOR,
+        PROTOCOL_MINOR,
+        settings_path,
+    )
+}
+
 fn apply_menu_action(
     action: MenuAction,
     local: &mut LocalGame,
@@ -6490,7 +7694,7 @@ fn apply_menu_action(
     app_exit: &mut MessageWriter<AppExit>,
 ) {
     match action {
-        MenuAction::StartHumanVsComputer => {
+        MenuAction::StartSelectedChallenge => {
             if settings.screen == ClientScreen::Challenge {
                 start_selected_challenge_mode(
                     local,
@@ -6499,11 +7703,12 @@ fn apply_menu_action(
                     network_state,
                     sound,
                 );
-            } else {
-                *local = LocalGame::new_human_vs_computer(settings.ernie_level);
-                settings.screen = ClientScreen::Game;
-                sound.next_log_index = 0;
             }
+        }
+        MenuAction::StartHumanVsComputer => {
+            *local = LocalGame::new_human_vs_computer(settings.ernie_level);
+            settings.screen = ClientScreen::Game;
+            sound.next_log_index = 0;
         }
         MenuAction::GoTo(screen) => {
             if settings.screen == ClientScreen::Challenge && screen == ClientScreen::Startup {
@@ -6632,14 +7837,22 @@ fn handle_challenge_input(
         queue_sound(sound, SoundEvent::MenuAction);
     }
     if keys.just_pressed(KeyCode::Digit4) {
-        settings.challenge_mode = ChallengeMode::HostViaLobby;
+        settings.challenge_mode = ChallengeMode::LegacyHost;
         queue_sound(sound, SoundEvent::MenuAction);
     }
     if keys.just_pressed(KeyCode::Digit5) {
-        settings.challenge_mode = ChallengeMode::BrowseLobby;
+        settings.challenge_mode = ChallengeMode::LegacyJoin;
         queue_sound(sound, SoundEvent::MenuAction);
     }
     if keys.just_pressed(KeyCode::Digit6) {
+        settings.challenge_mode = ChallengeMode::HostViaLobby;
+        queue_sound(sound, SoundEvent::MenuAction);
+    }
+    if keys.just_pressed(KeyCode::Digit7) {
+        settings.challenge_mode = ChallengeMode::BrowseLobby;
+        queue_sound(sound, SoundEvent::MenuAction);
+    }
+    if keys.just_pressed(KeyCode::Digit8) {
         settings.challenge_mode = ChallengeMode::BrowseLan;
         queue_sound(sound, SoundEvent::MenuAction);
     }
@@ -6694,6 +7907,11 @@ fn start_selected_challenge_mode(
         return;
     }
 
+    if settings.challenge_style == ChallengeStyle::Legacy {
+        start_legacy_challenge_mode(settings, network_state);
+        return;
+    }
+
     match settings.challenge_mode {
         ChallengeMode::ComputerOpponent => {
             *local = LocalGame::new_human_vs_computer(settings.ernie_level);
@@ -6706,6 +7924,8 @@ fn start_selected_challenge_mode(
         ChallengeMode::JoinDirect => {
             join_direct_challenge(settings, network_runtime, network_state)
         }
+        ChallengeMode::LegacyHost => start_legacy_host_challenge(settings, network_state),
+        ChallengeMode::LegacyJoin => start_legacy_join_challenge(settings, network_state),
         ChallengeMode::HostViaLobby => {
             if !settings.lobby_enabled {
                 network_state.push_message("Lobby server disabled by -X/--no-server");
@@ -6722,6 +7942,24 @@ fn start_selected_challenge_mode(
         }
         ChallengeMode::BrowseLan => start_or_browse_lan(settings, network_runtime, network_state),
     }
+}
+
+fn start_legacy_challenge_mode(settings: &ClientSettings, network_state: &mut ClientNetworkState) {
+    start_legacy_join_challenge(settings, network_state);
+}
+
+fn start_legacy_host_challenge(settings: &ClientSettings, network_state: &mut ClientNetworkState) {
+    network_state.push_message(format!(
+        "Legacy host compatibility is not wired yet. Planned bind: {}.",
+        settings.direct_listen_addr
+    ));
+}
+
+fn start_legacy_join_challenge(settings: &ClientSettings, network_state: &mut ClientNetworkState) {
+    network_state.push_message(format!(
+        "Legacy join compatibility is not wired yet. Planned peer: {}.",
+        settings.direct_join_addr
+    ));
 }
 
 fn host_direct_challenge(
@@ -7334,52 +8572,27 @@ fn handle_settings_input(
     let previous = settings.persisted();
 
     if keys.just_pressed(KeyCode::Tab) {
-        edit.field = next_settings_field(edit.field);
-        queue_sound(sound, SoundEvent::MenuAction);
-    }
-    let selected_field = selected_settings_field_key(keys);
-    if let Some(field) = selected_field {
-        edit.field = field;
-        queue_sound(sound, SoundEvent::MenuAction);
-    }
-    if keys.just_pressed(KeyCode::Backspace) || keys.just_pressed(KeyCode::Delete) {
-        settings_field_value_mut(settings, edit.field).pop();
-        queue_sound(sound, SoundEvent::MenuAction);
-    }
-    if keys.just_pressed(KeyCode::Enter) {
-        sanitize_settings_after_edit(settings, edit.field);
-        queue_sound(sound, SoundEvent::MenuAction);
-    }
-    let typed_character = selected_field
-        .is_none()
-        .then(|| text_entry_character(keys))
-        .flatten();
-    if let Some(ch) = typed_character {
-        settings_field_value_mut(settings, edit.field).push(ch);
+        let backwards = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+        edit.focus(next_settings_control(edit.control, backwards));
         queue_sound(sound, SoundEvent::MenuAction);
     }
 
-    if typed_character.is_none() && keys.just_pressed(KeyCode::KeyT) {
-        toggle_theme(settings);
-        queue_sound(sound, SoundEvent::MenuAction);
-    }
-    if typed_character.is_none() && keys.just_pressed(KeyCode::KeyO) {
-        settings.sound_pack = match settings.sound_pack {
-            SoundPackChoice::GeneratedDefault => SoundPackChoice::Muted,
-            SoundPackChoice::Muted => SoundPackChoice::GeneratedDefault,
-        };
-        queue_sound(sound, SoundEvent::MenuAction);
-    }
-    if keys.just_pressed(KeyCode::Equal) {
-        settings.pixel_scale = sanitize_pixel_scale(settings.pixel_scale + 0.25).min(2.0);
-        queue_sound(sound, SoundEvent::MenuAction);
-    }
-    if keys.just_pressed(KeyCode::Minus) {
-        settings.pixel_scale = sanitize_pixel_scale(settings.pixel_scale - 0.25).max(0.75);
-        queue_sound(sound, SoundEvent::MenuAction);
-    }
-    if typed_character.is_none() && keys.just_pressed(KeyCode::KeyR) {
-        settings.hosted_ranked = !settings.hosted_ranked;
+    if let Some(field) = edit.control.text_field() {
+        if keys.just_pressed(KeyCode::Backspace) || keys.just_pressed(KeyCode::Delete) {
+            settings_field_value_mut(settings, field).pop();
+            queue_sound(sound, SoundEvent::MenuAction);
+        }
+        if keys.just_pressed(KeyCode::Enter) {
+            sanitize_settings_after_edit(settings, field);
+            queue_sound(sound, SoundEvent::MenuAction);
+        }
+        if let Some(ch) = text_entry_character(keys) {
+            settings_field_value_mut(settings, field).push(ch);
+            queue_sound(sound, SoundEvent::MenuAction);
+        }
+    } else if handle_focused_settings_control(keys, settings, edit.control)
+        || handle_settings_shortcut(keys, settings)
+    {
         queue_sound(sound, SoundEvent::MenuAction);
     }
 
@@ -7388,25 +8601,140 @@ fn handle_settings_input(
     }
 }
 
-fn next_settings_field(field: SettingsField) -> SettingsField {
-    let index = SettingsField::ALL
-        .iter()
-        .position(|candidate| *candidate == field)
-        .unwrap_or_default();
-    SettingsField::ALL[(index + 1) % SettingsField::ALL.len()]
+fn handle_focused_settings_control(
+    keys: &ButtonInput<KeyCode>,
+    settings: &mut ClientSettings,
+    control: SettingsControl,
+) -> bool {
+    let activate = keys.just_pressed(KeyCode::Enter)
+        || keys.just_pressed(KeyCode::Space)
+        || keys.just_pressed(KeyCode::ArrowLeft)
+        || keys.just_pressed(KeyCode::ArrowRight);
+    match control {
+        SettingsControl::UiStyle
+        | SettingsControl::Theme
+        | SettingsControl::SoundPack
+        | SettingsControl::ChallengeStyle
+        | SettingsControl::HostedRanked
+            if activate =>
+        {
+            activate_settings_control(settings, control)
+        }
+        SettingsControl::PixelScale
+            if keys.just_pressed(KeyCode::ArrowLeft) || keys.just_pressed(KeyCode::Minus) =>
+        {
+            adjust_settings_pixel_scale(settings, -0.25)
+        }
+        SettingsControl::PixelScale
+            if keys.just_pressed(KeyCode::ArrowRight)
+                || keys.just_pressed(KeyCode::Equal)
+                || keys.just_pressed(KeyCode::Enter)
+                || keys.just_pressed(KeyCode::Space) =>
+        {
+            adjust_settings_pixel_scale(settings, 0.25)
+        }
+        SettingsControl::UiStyle
+        | SettingsControl::Theme
+        | SettingsControl::SoundPack
+        | SettingsControl::ChallengeStyle
+        | SettingsControl::HostedRanked
+        | SettingsControl::PixelScale
+        | SettingsControl::Text(_) => false,
+    }
 }
 
-fn selected_settings_field_key(keys: &ButtonInput<KeyCode>) -> Option<SettingsField> {
-    [
-        (KeyCode::Digit1, SettingsField::DisplayName),
-        (KeyCode::Digit2, SettingsField::CommunityLabel),
-        (KeyCode::Digit3, SettingsField::HostBindAddress),
-        (KeyCode::Digit4, SettingsField::ShareAddress),
-        (KeyCode::Digit5, SettingsField::JoinAddress),
-        (KeyCode::Digit6, SettingsField::LobbyAddress),
-    ]
-    .into_iter()
-    .find_map(|(key, field)| keys.just_pressed(key).then_some(field))
+fn handle_settings_shortcut(keys: &ButtonInput<KeyCode>, settings: &mut ClientSettings) -> bool {
+    if keys.just_pressed(KeyCode::KeyU) {
+        activate_settings_control(settings, SettingsControl::UiStyle)
+    } else if keys.just_pressed(KeyCode::KeyT) {
+        activate_settings_control(settings, SettingsControl::Theme)
+    } else if keys.just_pressed(KeyCode::KeyO) {
+        activate_settings_control(settings, SettingsControl::SoundPack)
+    } else if keys.just_pressed(KeyCode::KeyM) {
+        activate_settings_control(settings, SettingsControl::ChallengeStyle)
+    } else if keys.just_pressed(KeyCode::KeyR) {
+        activate_settings_control(settings, SettingsControl::HostedRanked)
+    } else if keys.just_pressed(KeyCode::Equal) {
+        adjust_settings_pixel_scale(settings, 0.25)
+    } else if keys.just_pressed(KeyCode::Minus) {
+        adjust_settings_pixel_scale(settings, -0.25)
+    } else {
+        false
+    }
+}
+
+fn activate_settings_control(settings: &mut ClientSettings, control: SettingsControl) -> bool {
+    match control {
+        SettingsControl::UiStyle => {
+            settings.ui_style = settings.ui_style.toggled();
+            true
+        }
+        SettingsControl::Theme => {
+            toggle_theme(settings);
+            true
+        }
+        SettingsControl::SoundPack => {
+            settings.sound_pack = settings.sound_pack.toggled();
+            true
+        }
+        SettingsControl::ChallengeStyle => {
+            settings.challenge_style = settings.challenge_style.toggled();
+            true
+        }
+        SettingsControl::HostedRanked => {
+            settings.hosted_ranked = !settings.hosted_ranked;
+            true
+        }
+        SettingsControl::PixelScale | SettingsControl::Text(_) => false,
+    }
+}
+
+fn apply_settings_select_option(
+    settings: &mut ClientSettings,
+    option: SettingsSelectOption,
+) -> bool {
+    match option {
+        SettingsSelectOption::UiStyle(ui_style) => {
+            let changed = settings.ui_style != ui_style;
+            settings.ui_style = ui_style;
+            changed
+        }
+        SettingsSelectOption::Theme(theme) => {
+            let changed = settings.theme != theme;
+            settings.theme = theme;
+            changed
+        }
+        SettingsSelectOption::SoundPack(sound_pack) => {
+            let changed = settings.sound_pack != sound_pack;
+            settings.sound_pack = sound_pack;
+            changed
+        }
+        SettingsSelectOption::ChallengeStyle(challenge_style) => {
+            let changed = settings.challenge_style != challenge_style;
+            settings.challenge_style = challenge_style;
+            changed
+        }
+    }
+}
+
+fn adjust_settings_pixel_scale(settings: &mut ClientSettings, delta: f32) -> bool {
+    let previous = settings.pixel_scale;
+    settings.pixel_scale = sanitize_pixel_scale(settings.pixel_scale + delta).clamp(0.75, 2.0);
+    settings.pixel_scale != previous
+}
+
+fn next_settings_control(control: SettingsControl, backwards: bool) -> SettingsControl {
+    let index = SettingsControl::ALL
+        .iter()
+        .position(|candidate| *candidate == control)
+        .unwrap_or_default();
+    let len = SettingsControl::ALL.len();
+    let next_index = if backwards {
+        (index + len - 1) % len
+    } else {
+        (index + 1) % len
+    };
+    SettingsControl::ALL[next_index]
 }
 
 fn text_entry_character(keys: &ButtonInput<KeyCode>) -> Option<char> {
@@ -8509,9 +9837,16 @@ fn render_game(mut render: RenderGameParams) {
     }
     for (button, mut text) in &mut render.menu_button_text {
         if button.screen == ClientScreen::Challenge
-            && matches!(button.action, MenuAction::StartHumanVsComputer)
+            && matches!(button.action, MenuAction::StartSelectedChallenge)
         {
             text.0 = challenge_primary_button_label(&render.settings, &render.network_state);
+        } else if button.screen == ClientScreen::Challenge
+            && matches!(button.action, MenuAction::StartHumanVsComputer)
+        {
+            text.0 = format!(
+                "Play {} Ernie",
+                selected_ernie_difficulty(&render.settings).name
+            );
         }
     }
     for (knob, mut transform) in &mut render.challenge_slider_knob {
@@ -8531,6 +9866,8 @@ fn render_game(mut render: RenderGameParams) {
         Color::BLACK
     } else if render.settings.screen == ClientScreen::About {
         theme.about.background
+    } else if render.settings.screen == ClientScreen::Settings {
+        settings_ui_page_background(render.settings.ui_style, theme)
     } else {
         theme.screen.background
     };
@@ -8806,7 +10143,7 @@ fn update_screen_visibility(
     {
         let visible = !game_visible
             && if let Some(button) = button {
-                button.screen == settings.screen
+                settings.screen != ClientScreen::Settings && button.screen == settings.screen
             } else if challenge_shell.is_some() {
                 settings.screen == ClientScreen::Challenge
             } else if about_shell.is_some() {
@@ -8820,6 +10157,7 @@ fn update_screen_visibility(
                     && settings.screen != ClientScreen::About
                     && settings.screen != ClientScreen::Challenge
                     && settings.screen != ClientScreen::Roster
+                    && settings.screen != ClientScreen::Settings
             } else {
                 true
             };
@@ -9491,7 +10829,7 @@ fn legacy_game_message_label(local: &LocalGame, content_mode: ContentMode) -> St
 fn menu_label(
     _game: &TwoPlayerGame,
     settings: &ClientSettings,
-    settings_edit: &SettingsEditState,
+    _settings_edit: &SettingsEditState,
 ) -> String {
     match settings.screen {
         ClientScreen::Startup => String::new(),
@@ -9500,35 +10838,21 @@ fn menu_label(
         ClientScreen::Sleep => "Sleep".to_string(),
         ClientScreen::About => "About BattleTris".to_string(),
         ClientScreen::Roster => String::new(),
-        ClientScreen::Settings => format!(
-            "Settings\nEditing {}: {}\nTab/1-6 choose  Backspace edit  Enter sanitize",
-            settings_edit.field.label(),
-            settings_field_value(settings, settings_edit.field),
-        ),
+        ClientScreen::Settings => "Settings".to_string(),
     }
 }
 
 fn screen_body_label(
     _game: &TwoPlayerGame,
     settings: &ClientSettings,
-    settings_edit: &SettingsEditState,
+    _settings_edit: &SettingsEditState,
     network_state: &ClientNetworkState,
     _roster: &RosterRecords,
 ) -> String {
     match settings.screen {
         ClientScreen::Startup => String::new(),
         ClientScreen::Challenge => {
-            format!(
-                "Challenge\nMode: {}\n\nLeft panel: choose Computer, Direct IP, hosted availability, a lobby opponent, or LAN discovery.\nRight panel: shows the selected mode, addresses, challenge state, and next action.\n\nControls: 1-6 choose mode. Up/Down or mouse selects opponents. Enter/C starts, refreshes, challenges, or accepts. D denies. Escape/Cancel backs out.\n\nIdentity: {} ({})  Community: {}\nProtocol v{}.{} ({}, {})",
-                settings.challenge_mode.label(),
-                settings.display_name,
-                hosted_player_id(settings),
-                settings.community_label,
-                PROTOCOL_MAJOR,
-                PROTOCOL_MINOR,
-                CAPABILITY_DIRECT_TCP,
-                CAPABILITY_SELF_HOSTED_LOBBY,
-            )
+            challenge_screen_body_label(settings)
         }
         ClientScreen::Sleep => {
             let share_addr = effective_direct_share_addr(settings, network_state);
@@ -9555,45 +10879,31 @@ fn screen_body_label(
                 .to_string()
         }
         ClientScreen::Roster => " ".to_string(),
-        ClientScreen::Settings => format!(
-            "Theme: {:?}  Sound: {:?}  Controls: {}  Scale: {:.2}x\nHosted ranked preference: {}  Lobby server: {}\n\n{}1 display name: {}\n{}2 community: {}\n{}3 host bind: {}\n{}4 share address: {}\n{}5 join address: {}\n{}6 lobby address: {}\n\nAddress guide:\nHost bind is where this client listens. Use 0.0.0.0:4405 to listen on all local interfaces, or a specific local LAN IP.\nShare address is what another player types and what the lobby advertises. Do not share 0.0.0.0.\nJoin address is the host's share address for Direct IP. Do not join 0.0.0.0 or 127.0.0.1 from another machine. Use the host LAN IP.\nLobby address is the self-hosted community server for presence, hosted sessions, ranked records, and roster records; it does not relay gameplay.\n127.0.0.1 only means this same computer and is useful for local tests.\nSuggested share address: {}\nHost must allow inbound TCP on the direct port. No NAT traversal or gameplay relay exists.\n\nT theme  O sound  R hosted ranked  -/= scale\nProtocol: v{}.{}\nAssets: {}\nSettings: {}",
-            settings.theme,
-            settings.sound_pack,
-            controls_label(settings.controls),
-            settings.pixel_scale,
-            settings.hosted_ranked,
-            lobby_status_label(settings),
-            selected_settings_marker(settings_edit, SettingsField::DisplayName),
-            settings.display_name,
-            selected_settings_marker(settings_edit, SettingsField::CommunityLabel),
-            settings.community_label,
-            selected_settings_marker(settings_edit, SettingsField::HostBindAddress),
-            settings.direct_listen_addr,
-            selected_settings_marker(settings_edit, SettingsField::ShareAddress),
-            settings.direct_share_addr,
-            selected_settings_marker(settings_edit, SettingsField::JoinAddress),
-            settings.direct_join_addr,
-            selected_settings_marker(settings_edit, SettingsField::LobbyAddress),
-            settings.lobby_addr,
-            suggested_share_addr_for(&settings.direct_listen_addr),
-            PROTOCOL_MAJOR,
-            PROTOCOL_MINOR,
-            settings.assets_dir.display(),
-            settings
-                .settings_path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "unavailable".to_string()),
-        ),
+        ClientScreen::Settings => String::new(),
         ClientScreen::Game => String::new(),
     }
 }
 
-fn selected_settings_marker(edit: &SettingsEditState, field: SettingsField) -> &'static str {
-    if edit.field == field {
-        "> "
-    } else {
-        "  "
+fn challenge_screen_body_label(settings: &ClientSettings) -> String {
+    match settings.challenge_style {
+        ChallengeStyle::Legacy => format!(
+            "Challenge\nStyle: Legacy\n\nLeft panel: available legacy players.\nRight panel: selected player information and legacy Direct IP details.\n\nControls: Enter/C challenges the selected legacy peer or accepts an incoming challenge. D denies. Escape/Cancel backs out.\n\nIdentity: {} ({})\nLegacy peer address: {}\nLegacy listen address: {}",
+            settings.display_name,
+            hosted_player_id(settings),
+            settings.direct_join_addr,
+            settings.direct_listen_addr,
+        ),
+        ChallengeStyle::Modern => format!(
+            "Challenge\nStyle: Modern  Mode: {}\n\nLeft panel: choose Computer, Direct IP, hosted availability, a lobby opponent, LAN discovery, or legacy compatibility.\nRight panel: shows the selected mode, addresses, challenge state, and next action.\n\nControls: 1-8 choose mode. Up/Down or mouse selects opponents. Enter/C starts, refreshes, challenges, or accepts. D denies. Escape/Cancel backs out.\n\nIdentity: {} ({})  Community: {}\nProtocol v{}.{} ({}, {})",
+            settings.challenge_mode.label(),
+            settings.display_name,
+            hosted_player_id(settings),
+            settings.community_label,
+            PROTOCOL_MAJOR,
+            PROTOCOL_MINOR,
+            CAPABILITY_DIRECT_TCP,
+            CAPABILITY_SELF_HOSTED_LOBBY,
+        ),
     }
 }
 
@@ -9623,14 +10933,20 @@ fn challenge_opponent_list_label(
     settings: &ClientSettings,
     network_state: &ClientNetworkState,
 ) -> String {
+    if settings.challenge_style == ChallengeStyle::Legacy {
+        return legacy_challenge_player_list_label(settings, network_state);
+    }
+
     let mut text = String::from("Modes\n");
     for (mode, key) in [
         (ChallengeMode::ComputerOpponent, "1"),
         (ChallengeMode::HostDirect, "2"),
         (ChallengeMode::JoinDirect, "3"),
-        (ChallengeMode::HostViaLobby, "4"),
-        (ChallengeMode::BrowseLobby, "5"),
-        (ChallengeMode::BrowseLan, "6"),
+        (ChallengeMode::LegacyHost, "4"),
+        (ChallengeMode::LegacyJoin, "5"),
+        (ChallengeMode::HostViaLobby, "6"),
+        (ChallengeMode::BrowseLobby, "7"),
+        (ChallengeMode::BrowseLan, "8"),
     ] {
         let marker = if settings.challenge_mode == mode {
             ">"
@@ -9718,6 +11034,34 @@ fn challenge_opponent_list_label(
     text
 }
 
+fn legacy_challenge_player_list_label(
+    settings: &ClientSettings,
+    network_state: &ClientNetworkState,
+) -> String {
+    let mut text = String::new();
+    let marker = if network_state.pending_challenge.is_none() {
+        ">"
+    } else {
+        " "
+    };
+    let _ = writeln!(
+        text,
+        "{marker} {:<8} {:<24} {:<8}",
+        truncate_label(&settings.display_name, 8),
+        truncate_label(&settings.direct_join_addr, 24),
+        "Waiting",
+    );
+    text.push_str("\nNo legacy server roster is configured.\nThis entry uses manual Direct IP.\n");
+    if let Some(challenge) = &network_state.pending_challenge {
+        let _ = write!(
+            text,
+            "\nIncoming\n> {:<8} wants to play",
+            truncate_label(&challenge.challenger.display_name, 8),
+        );
+    }
+    text
+}
+
 fn challenge_mode_panel_label(
     settings: &ClientSettings,
     network_state: &ClientNetworkState,
@@ -9726,10 +11070,16 @@ fn challenge_mode_panel_label(
         return incoming_challenge_panel_label(challenge, network_state);
     }
 
+    if settings.challenge_style == ChallengeStyle::Legacy {
+        return legacy_challenge_info_panel_label(settings, network_state);
+    }
+
     match settings.challenge_mode {
         ChallengeMode::ComputerOpponent => computer_challenge_panel_label(settings),
         ChallengeMode::HostDirect => host_direct_panel_label(settings, network_state),
         ChallengeMode::JoinDirect => join_direct_panel_label(settings, network_state),
+        ChallengeMode::LegacyHost => legacy_host_panel_label(settings, network_state),
+        ChallengeMode::LegacyJoin => legacy_join_panel_label(settings, network_state),
         ChallengeMode::HostViaLobby => host_via_lobby_panel_label(settings, network_state),
         ChallengeMode::BrowseLobby => browse_lobby_panel_label(settings, network_state),
         ChallengeMode::BrowseLan => browse_lan_panel_label(network_state),
@@ -9794,6 +11144,55 @@ fn join_direct_panel_label(
         settings.display_name,
         challenge_status_lifecycle_label(network_state),
     )
+}
+
+fn legacy_challenge_info_panel_label(
+    settings: &ClientSettings,
+    network_state: &ClientNetworkState,
+) -> String {
+    format!(
+        "User Information\n\nName: {}\nHost: {}\nStatus: Waiting\nProtocol: legacy packet transport\n\nLegacy Challenge mirrors the original screen: choose a player on the left, inspect details here, then press Challenge.\n\nManual Direct IP\nChallenge peer: {}\nAvailable at: {}\n\n{}",
+        settings.display_name,
+        settings.direct_join_addr,
+        settings.direct_join_addr,
+        settings.direct_listen_addr,
+        legacy_transport_status_label(network_state),
+    )
+}
+
+fn legacy_host_panel_label(
+    settings: &ClientSettings,
+    network_state: &ClientNetworkState,
+) -> String {
+    format!(
+        "Legacy Host\n\nListen for an original BattleTris peer using the legacy packet framing.\n\nBind: {}\nShare: {}\n\nLegacy gameplay compatibility still needs the old wire adapter before this can accept real legacy clients.\n\n{}",
+        settings.direct_listen_addr,
+        effective_direct_share_addr(settings, network_state),
+        legacy_transport_status_label(network_state),
+    )
+}
+
+fn legacy_join_panel_label(
+    settings: &ClientSettings,
+    network_state: &ClientNetworkState,
+) -> String {
+    format!(
+        "Legacy Join\n\nChallenge an original BattleTris peer by manual Direct IP.\n\nJoin address: {}\nYour name: {}\n\nLegacy gameplay compatibility still needs the old wire adapter before this can challenge real legacy clients.\n\n{}",
+        settings.direct_join_addr,
+        settings.display_name,
+        legacy_transport_status_label(network_state),
+    )
+}
+
+fn legacy_transport_status_label(network_state: &ClientNetworkState) -> String {
+    let mut status = "Status: legacy compatibility adapter not wired yet".to_string();
+    if let Some(message) = network_state.transient_messages.last() {
+        let _ = write!(status, "\nLast status: {message}");
+    }
+    if let Some(error) = &network_state.last_error {
+        let _ = write!(status, "\nLast error: {error}");
+    }
+    status
 }
 
 fn host_via_lobby_panel_label(
@@ -9889,6 +11288,10 @@ fn challenge_compact_status_label(
     settings: &ClientSettings,
     network_state: &ClientNetworkState,
 ) -> String {
+    if settings.challenge_style == ChallengeStyle::Legacy {
+        return "Legacy challenge view".to_string();
+    }
+
     match settings.challenge_mode {
         ChallengeMode::ComputerOpponent => {
             let difficulty = selected_ernie_difficulty(settings);
@@ -9897,6 +11300,8 @@ fn challenge_compact_status_label(
         ChallengeMode::HostViaLobby | ChallengeMode::BrowseLobby if !settings.lobby_enabled => {
             "Lobby disabled".to_string()
         }
+        ChallengeMode::LegacyHost => "Legacy host pending adapter".to_string(),
+        ChallengeMode::LegacyJoin => "Legacy join pending adapter".to_string(),
         ChallengeMode::BrowseLan if !network_state.lan_entries.is_empty() => {
             format!("LAN hosts: {}", network_state.lan_entries.len())
         }
@@ -9911,12 +11316,17 @@ fn challenge_primary_button_label(
     if network_state.pending_challenge.is_some() {
         return "Accept".to_string();
     }
+    if settings.challenge_style == ChallengeStyle::Legacy {
+        return "Challenge".to_string();
+    }
     match settings.challenge_mode {
         ChallengeMode::ComputerOpponent => {
             format!("Play {} Ernie", selected_ernie_difficulty(settings).name)
         }
         ChallengeMode::HostDirect => "Host Direct".to_string(),
         ChallengeMode::JoinDirect => "Join Direct".to_string(),
+        ChallengeMode::LegacyHost => "Legacy Host".to_string(),
+        ChallengeMode::LegacyJoin => "Legacy Join".to_string(),
         ChallengeMode::HostViaLobby if !settings.lobby_enabled => "Lobby Disabled".to_string(),
         ChallengeMode::HostViaLobby => "Host Via Lobby".to_string(),
         ChallengeMode::BrowseLobby if !settings.lobby_enabled => "Lobby Disabled".to_string(),
@@ -12177,11 +13587,13 @@ mod tests {
     #[test]
     fn client_settings_round_trip_as_toml() {
         let settings = PersistedClientSettings {
+            ui_style: UiStyleChoice::Original,
             theme: ThemeChoice::HighContrast,
             sound_pack: SoundPackChoice::Muted,
             controls: ControlScheme::Original,
             pixel_scale: 1.5,
             ernie_level: 12,
+            challenge_style: ChallengeStyle::Legacy,
             display_name: "Ada".to_string(),
             community_label: "garage".to_string(),
             direct_listen_addr: "0.0.0.0:4405".to_string(),
@@ -12197,6 +13609,7 @@ mod tests {
         assert_eq!(decoded, settings);
         assert!(encoded.contains("high-contrast"));
         assert!(encoded.contains("original"));
+        assert!(encoded.contains("legacy"));
         assert!(encoded.contains("Ada"));
     }
 
