@@ -72,6 +72,46 @@ documentation snapshots.
 
 Packaged assets live in \`assets/\` next to this README. User settings and save
 data use the platform project directories selected in ADR 0005.
+
+## Direct IP Multiplayer
+
+Manual Direct IP is the required multiplayer path. Gameplay uses direct TCP
+between the two players.
+
+LAN example:
+
+1. Host binds a direct game to \`0.0.0.0:4405\` or another local address.
+2. Host shares a reachable address such as \`192.168.1.23:4405\`.
+3. Host allows inbound TCP on the direct gameplay port in the firewall.
+4. Joiner enters the host share address. Never use \`0.0.0.0\` as a join/share
+   address.
+
+If connecting fails, confirm both clients use the same release, the host is still
+listening, the firewall allows inbound TCP, and the joiner can route to the host
+address. NAT, guest Wi-Fi isolation, and VPN routing can block direct play.
+
+## Self-Hosted Lobby
+
+An operator can run a small community lobby with:
+
+\`bin/battletris-server${exe_suffix} --listen 0.0.0.0:4404 --community garage\`
+
+Clients set Lobby Address to the server's reachable address, for example
+\`192.168.1.10:4404\`. Hosted games still require the host direct gameplay share
+address to be reachable by the joiner. The lobby issues session metadata and
+ranked-result authority; it does not relay gameplay frames.
+
+Ranked hosted results require a server-issued session and matching Result Claims
+from both participants. This is not anti-cheat and does not protect against
+colluding modified clients.
+
+## Limitations
+
+There is no NAT traversal, internet relay, authoritative tick server, or
+anti-cheat. LAN discovery is best effort; manual Direct IP remains supported when
+discovery fails.
+
+More detail is in \`docs/distribution.md\`.
 README
 
 cat >"$package_dir/release-manifest.toml" <<MANIFEST

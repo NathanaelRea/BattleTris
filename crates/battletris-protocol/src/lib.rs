@@ -120,6 +120,28 @@ pub enum MessageKind {
     RankedResultAccepted = 23,
     /// Server rejected a ranked result claim.
     RankedResultRejected = 24,
+    /// Highest deterministic tick through which a peer has sent all local input.
+    TickWatermark = 25,
+    /// Sparse keepalive carrying the sender's current tick watermark.
+    Heartbeat = 26,
+    /// Bazaar purchase intent.
+    BazaarBuy = 27,
+    /// Bazaar removal intent.
+    BazaarRemove = 28,
+    /// Join request for a self-hosted lobby session.
+    HostedJoinRequest = 29,
+    /// Host or joiner status poll for a self-hosted lobby session.
+    HostedSessionStatusRequest = 30,
+    /// Server status for a self-hosted lobby session.
+    HostedSessionStatus = 31,
+    /// Server accepted a ranked claim and is waiting for the peer claim.
+    RankedResultPending = 32,
+    /// Deterministic whole-game checksum diagnostic.
+    GameChecksum = 33,
+    /// Request server-owned ranked records for a hosted community.
+    RankedRecordsRequest = 34,
+    /// Server-owned ranked records response for a hosted community.
+    RankedRecords = 35,
 }
 
 impl MessageKind {
@@ -151,6 +173,17 @@ impl MessageKind {
             22 => Some(Self::RankedResultClaim),
             23 => Some(Self::RankedResultAccepted),
             24 => Some(Self::RankedResultRejected),
+            25 => Some(Self::TickWatermark),
+            26 => Some(Self::Heartbeat),
+            27 => Some(Self::BazaarBuy),
+            28 => Some(Self::BazaarRemove),
+            29 => Some(Self::HostedJoinRequest),
+            30 => Some(Self::HostedSessionStatusRequest),
+            31 => Some(Self::HostedSessionStatus),
+            32 => Some(Self::RankedResultPending),
+            33 => Some(Self::GameChecksum),
+            34 => Some(Self::RankedRecordsRequest),
+            35 => Some(Self::RankedRecords),
             _ => None,
         }
     }
@@ -235,6 +268,10 @@ pub struct Challenge {
     pub challenger: PlayerIdentity,
     /// Optional short challenge text.
     pub message: String,
+    /// Server-issued hosted session id when this direct challenge belongs to a hosted game.
+    pub hosted_session_id: Option<HostedSessionId>,
+    /// Server-scoped joining player id for hosted challenges.
+    pub hosted_player_id: Option<String>,
 }
 
 /// Acceptance of a challenge.
@@ -293,6 +330,26 @@ pub struct PlayerInput {
     pub tick: u64,
     /// Input command.
     pub command: InputCommand,
+}
+
+/// Highest deterministic tick through which a peer has sent all local input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TickWatermark {
+    /// Player that owns this tick watermark.
+    pub player: PlayerSlot,
+    /// Inclusive tick through which all local input has been sent.
+    pub through_tick: u64,
+}
+
+/// Sparse keepalive carrying liveness and deterministic progress.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Heartbeat {
+    /// Player that sent the heartbeat.
+    pub player: PlayerSlot,
+    /// Sender's current local network tick.
+    pub current_tick: u64,
+    /// Sender's current input watermark.
+    pub watermark_tick: u64,
 }
 
 /// Full score, funds, and line-count snapshot for one player.
@@ -410,6 +467,28 @@ pub struct BazaarDone {
     pub player: PlayerSlot,
 }
 
+/// Bazaar purchase intent. Arsenal snapshots remain diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BazaarBuy {
+    /// Player buying the weapon.
+    pub player: PlayerSlot,
+    /// Stable legacy weapon token ID.
+    pub weapon: u8,
+    /// Deterministic per-player Bazaar action sequence.
+    pub sequence: u64,
+}
+
+/// Bazaar removal intent. Arsenal snapshots remain diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BazaarRemove {
+    /// Player removing from an arsenal slot.
+    pub player: PlayerSlot,
+    /// Normalized arsenal slot index `0..9`.
+    pub slot_index: u8,
+    /// Deterministic per-player Bazaar action sequence.
+    pub sequence: u64,
+}
+
 /// Bazaar progress snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BazaarState {
@@ -503,6 +582,47 @@ pub struct HostedGameStart {
     pub community_label: String,
 }
 
+/// Join request for a server-owned hosted lobby session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedJoinRequest {
+    /// Session the joiner wants to start.
+    pub session_id: HostedSessionId,
+    /// Joining player identity.
+    pub joiner: HostedPlayer,
+}
+
+/// Host or joiner poll request for server-owned session status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedSessionStatusRequest {
+    /// Session being polled.
+    pub session_id: HostedSessionId,
+    /// Player id of the polling participant.
+    pub requester_player_id: String,
+}
+
+/// Server-owned hosted lobby session status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedSessionStatus {
+    /// Session being reported.
+    pub session_id: HostedSessionId,
+    /// Current status value.
+    pub status: HostedSessionStatusKind,
+}
+
+/// Status value for a server-owned hosted lobby session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HostedSessionStatusKind {
+    /// Session exists and is waiting for a joiner.
+    WaitingForPeer,
+    /// Session has started with server-owned deterministic metadata.
+    Started(HostedGameStart),
+    /// Session is no longer joinable or reportable.
+    Unavailable {
+        /// User-facing reason the session is unavailable.
+        reason: String,
+    },
+}
+
 /// Participant claim for a completed hosted ranked game.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RankedResultClaim {
@@ -528,8 +648,12 @@ pub struct RankedResultClaim {
     pub loser_funds: i64,
     /// Game duration in seconds.
     pub duration_secs: u64,
+    /// Deterministic simulation duration in network ticks.
+    pub duration_ticks: u64,
     /// Deterministic event count observed by the reporter.
     pub event_count: u64,
+    /// Final deterministic whole-game checksum observed by the reporter.
+    pub final_checksum: u64,
 }
 
 /// Server accepted and recorded a hosted ranked result.
@@ -546,6 +670,71 @@ pub struct RankedResultRejected {
     pub session_id: Option<HostedSessionId>,
     /// User-facing rejection reason.
     pub reason: String,
+}
+
+/// First ranked result claim accepted while the server waits for the peer claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RankedResultPending {
+    /// Pending session id.
+    pub session_id: HostedSessionId,
+    /// User-facing pending status.
+    pub reason: String,
+}
+
+/// Deterministic whole-game checksum diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameChecksum {
+    /// Player reporting the checksum.
+    pub reporter: PlayerSlot,
+    /// Deterministic tick covered by the checksum.
+    pub tick: u64,
+    /// Whole-game checksum value.
+    pub checksum: u64,
+    /// Deterministic event count covered by the checksum.
+    pub event_count: u64,
+}
+
+/// Request for server-owned ranked records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RankedRecordsRequest {
+    /// Maximum rows requested, after server-side clamping.
+    pub limit: u16,
+}
+
+/// Server-owned ranked records response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RankedRecords {
+    /// Server/community ranking label.
+    pub community_label: String,
+    /// Records sorted by server rank policy.
+    pub records: Vec<RankedPlayerRecord>,
+}
+
+/// Public server-owned player record row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RankedPlayerRecord {
+    /// Stable server/community player id.
+    pub player_id: String,
+    /// User-facing display name.
+    pub display_name: String,
+    /// Current rank value.
+    pub rank: u64,
+    /// Ranked wins.
+    pub wins: u64,
+    /// Ranked losses.
+    pub losses: u64,
+    /// Best score in a ranked game.
+    pub high_score: u64,
+    /// Best line count in a ranked game.
+    pub high_lines: u64,
+    /// Best funds value in a ranked game.
+    pub high_funds: u64,
+}
+
+/// Derives the two core game seeds from one protocol base seed.
+#[must_use]
+pub const fn derive_player_seeds(base_seed: u64) -> (u64, u64) {
+    (base_seed, base_seed.wrapping_add(1))
 }
 
 /// Every known public wire message. These are intentionally distinct from local core events.
@@ -599,6 +788,28 @@ pub enum WireMessage {
     RankedResultAccepted(RankedResultAccepted),
     /// Server rejected a ranked result claim.
     RankedResultRejected(RankedResultRejected),
+    /// Tick watermark.
+    TickWatermark(TickWatermark),
+    /// Sparse heartbeat.
+    Heartbeat(Heartbeat),
+    /// Bazaar buy intent.
+    BazaarBuy(BazaarBuy),
+    /// Bazaar remove intent.
+    BazaarRemove(BazaarRemove),
+    /// Hosted join request.
+    HostedJoinRequest(HostedJoinRequest),
+    /// Hosted session status request.
+    HostedSessionStatusRequest(HostedSessionStatusRequest),
+    /// Hosted session status.
+    HostedSessionStatus(HostedSessionStatus),
+    /// Pending ranked result status.
+    RankedResultPending(RankedResultPending),
+    /// Whole-game checksum diagnostic.
+    GameChecksum(GameChecksum),
+    /// Server-owned ranked records request.
+    RankedRecordsRequest(RankedRecordsRequest),
+    /// Server-owned ranked records response.
+    RankedRecords(RankedRecords),
 }
 
 impl WireMessage {
@@ -630,6 +841,17 @@ impl WireMessage {
             Self::RankedResultClaim(_) => MessageKind::RankedResultClaim,
             Self::RankedResultAccepted(_) => MessageKind::RankedResultAccepted,
             Self::RankedResultRejected(_) => MessageKind::RankedResultRejected,
+            Self::TickWatermark(_) => MessageKind::TickWatermark,
+            Self::Heartbeat(_) => MessageKind::Heartbeat,
+            Self::BazaarBuy(_) => MessageKind::BazaarBuy,
+            Self::BazaarRemove(_) => MessageKind::BazaarRemove,
+            Self::HostedJoinRequest(_) => MessageKind::HostedJoinRequest,
+            Self::HostedSessionStatusRequest(_) => MessageKind::HostedSessionStatusRequest,
+            Self::HostedSessionStatus(_) => MessageKind::HostedSessionStatus,
+            Self::RankedResultPending(_) => MessageKind::RankedResultPending,
+            Self::GameChecksum(_) => MessageKind::GameChecksum,
+            Self::RankedRecordsRequest(_) => MessageKind::RankedRecordsRequest,
+            Self::RankedRecords(_) => MessageKind::RankedRecords,
         }
     }
 }
@@ -705,6 +927,11 @@ pub enum ProtocolError {
         /// Peer-advertised minor version.
         minor: u16,
     },
+    /// The remote host denied a direct challenge.
+    ChallengeDenied {
+        /// User-facing denial reason.
+        reason: String,
+    },
 }
 
 impl From<io::Error> for ProtocolError {
@@ -755,6 +982,53 @@ pub struct AcceptedDirectGame {
     pub challenge: Challenge,
 }
 
+/// A direct TCP peer that has completed hello/challenge and is waiting for host decision.
+#[derive(Debug)]
+pub struct PendingDirectChallenge {
+    /// Established direct protocol connection.
+    pub connection: DirectConnection,
+    /// Remote peer identity from its hello message.
+    pub remote_identity: PlayerIdentity,
+    /// Remote challenge request.
+    pub challenge: Challenge,
+    host_identity: PlayerIdentity,
+}
+
+impl PendingDirectChallenge {
+    /// Accepts the pending challenge and sends deterministic start data.
+    pub async fn accept(
+        mut self,
+        seed: u64,
+        ranked: bool,
+    ) -> Result<AcceptedDirectGame, ProtocolError> {
+        self.connection
+            .send(&WireMessage::ChallengeAccepted(ChallengeAccepted {
+                accepter: self.host_identity,
+            }))
+            .await?;
+        self.connection
+            .send(&WireMessage::StartGame(StartGame {
+                receiving_peer_slot: PlayerSlot::Two,
+                seed,
+                ranked,
+            }))
+            .await?;
+
+        Ok(AcceptedDirectGame {
+            connection: self.connection,
+            remote_identity: self.remote_identity,
+            challenge: self.challenge,
+        })
+    }
+
+    /// Denies the pending challenge with a user-facing reason.
+    pub async fn deny(mut self, reason: String) -> Result<(), ProtocolError> {
+        self.connection
+            .send(&WireMessage::ChallengeDenied(ChallengeDenied { reason }))
+            .await
+    }
+}
+
 /// Result of joining a direct challenge.
 #[derive(Debug)]
 pub struct JoinedDirectGame {
@@ -773,6 +1047,17 @@ pub async fn accept_direct_game(
     seed: u64,
     ranked: bool,
 ) -> Result<AcceptedDirectGame, ProtocolError> {
+    accept_pending_direct_challenge(listener, host_identity)
+        .await?
+        .accept(seed, ranked)
+        .await
+}
+
+/// Accepts one TCP peer and performs hello/challenge up to the host decision point.
+pub async fn accept_pending_direct_challenge(
+    listener: &TcpListener,
+    host_identity: PlayerIdentity,
+) -> Result<PendingDirectChallenge, ProtocolError> {
     let (stream, _) = listener.accept().await?;
     let mut connection = DirectConnection::from_stream(stream);
 
@@ -788,23 +1073,11 @@ pub async fn accept_direct_game(
         }
     };
 
-    connection
-        .send(&WireMessage::ChallengeAccepted(ChallengeAccepted {
-            accepter: host_identity,
-        }))
-        .await?;
-    connection
-        .send(&WireMessage::StartGame(StartGame {
-            receiving_peer_slot: PlayerSlot::Two,
-            seed,
-            ranked,
-        }))
-        .await?;
-
-    Ok(AcceptedDirectGame {
+    Ok(PendingDirectChallenge {
         connection,
         remote_identity,
         challenge,
+        host_identity,
     })
 }
 
@@ -814,23 +1087,36 @@ pub async fn join_direct_game(
     identity: PlayerIdentity,
     challenge_text: String,
 ) -> Result<JoinedDirectGame, ProtocolError> {
-    let mut connection = DirectConnection::connect(addr).await?;
-
-    connection.send(&hello_for(identity.clone())).await?;
-    let remote_identity = expect_hello(connection.recv().await?)?;
-    connection
-        .send(&WireMessage::Challenge(Challenge {
+    join_direct_game_with_challenge(
+        addr,
+        Challenge {
             challenger: identity,
             message: challenge_text,
-        }))
+            hosted_session_id: None,
+            hosted_player_id: None,
+        },
+    )
+    .await
+}
+
+/// Connects to a direct TCP peer and performs hello/challenge/start with explicit challenge metadata.
+pub async fn join_direct_game_with_challenge(
+    addr: SocketAddr,
+    challenge: Challenge,
+) -> Result<JoinedDirectGame, ProtocolError> {
+    let mut connection = DirectConnection::connect(addr).await?;
+
+    connection
+        .send(&hello_for(challenge.challenger.clone()))
         .await?;
+    let remote_identity = expect_hello(connection.recv().await?)?;
+    connection.send(&WireMessage::Challenge(challenge)).await?;
 
     match connection.recv().await? {
         WireMessage::ChallengeAccepted(_) => {}
-        WireMessage::ChallengeDenied(_denied) => {
-            return Err(ProtocolError::UnexpectedMessage {
-                expected: "challenge accepted",
-                actual: MessageKind::ChallengeDenied,
+        WireMessage::ChallengeDenied(denied) => {
+            return Err(ProtocolError::ChallengeDenied {
+                reason: denied.reason,
             });
         }
         message => {
@@ -863,6 +1149,18 @@ pub async fn read_message<R>(reader: &mut R) -> Result<WireMessage, ProtocolErro
 where
     R: AsyncRead + Unpin,
 {
+    read_message_with_header(reader)
+        .await
+        .map(|(_, message)| message)
+}
+
+/// Reads a single framed wire message and returns the validated frame header with it.
+pub async fn read_message_with_header<R>(
+    reader: &mut R,
+) -> Result<(FrameHeader, WireMessage), ProtocolError>
+where
+    R: AsyncRead + Unpin,
+{
     let mut header_bytes = [0_u8; HEADER_LEN];
     reader.read_exact(&mut header_bytes).await?;
 
@@ -871,7 +1169,7 @@ where
     frame.extend_from_slice(&header_bytes);
     frame.resize(HEADER_LEN + raw_header.payload_len as usize, 0);
     reader.read_exact(&mut frame[HEADER_LEN..]).await?;
-    decode_message(&frame)
+    decode_message(&frame).map(|message| (raw_header, message))
 }
 
 /// Writes a single framed wire message to an async stream.
@@ -1000,6 +1298,17 @@ fn encode_payload(message: &WireMessage) -> Result<Vec<u8>, ProtocolError> {
         WireMessage::RankedResultClaim(value) => to_stdvec(value),
         WireMessage::RankedResultAccepted(value) => to_stdvec(value),
         WireMessage::RankedResultRejected(value) => to_stdvec(value),
+        WireMessage::TickWatermark(value) => to_stdvec(value),
+        WireMessage::Heartbeat(value) => to_stdvec(value),
+        WireMessage::BazaarBuy(value) => to_stdvec(value),
+        WireMessage::BazaarRemove(value) => to_stdvec(value),
+        WireMessage::HostedJoinRequest(value) => to_stdvec(value),
+        WireMessage::HostedSessionStatusRequest(value) => to_stdvec(value),
+        WireMessage::HostedSessionStatus(value) => to_stdvec(value),
+        WireMessage::RankedResultPending(value) => to_stdvec(value),
+        WireMessage::GameChecksum(value) => to_stdvec(value),
+        WireMessage::RankedRecordsRequest(value) => to_stdvec(value),
+        WireMessage::RankedRecords(value) => to_stdvec(value),
     }
 }
 
@@ -1067,6 +1376,25 @@ fn decode_payload(kind: MessageKind, payload: &[u8]) -> Result<WireMessage, Prot
         MessageKind::RankedResultRejected => {
             from_bytes(payload).map(WireMessage::RankedResultRejected)
         }
+        MessageKind::TickWatermark => from_bytes(payload).map(WireMessage::TickWatermark),
+        MessageKind::Heartbeat => from_bytes(payload).map(WireMessage::Heartbeat),
+        MessageKind::BazaarBuy => from_bytes(payload).map(WireMessage::BazaarBuy),
+        MessageKind::BazaarRemove => from_bytes(payload).map(WireMessage::BazaarRemove),
+        MessageKind::HostedJoinRequest => from_bytes(payload).map(WireMessage::HostedJoinRequest),
+        MessageKind::HostedSessionStatusRequest => {
+            from_bytes(payload).map(WireMessage::HostedSessionStatusRequest)
+        }
+        MessageKind::HostedSessionStatus => {
+            from_bytes(payload).map(WireMessage::HostedSessionStatus)
+        }
+        MessageKind::RankedResultPending => {
+            from_bytes(payload).map(WireMessage::RankedResultPending)
+        }
+        MessageKind::GameChecksum => from_bytes(payload).map(WireMessage::GameChecksum),
+        MessageKind::RankedRecordsRequest => {
+            from_bytes(payload).map(WireMessage::RankedRecordsRequest)
+        }
+        MessageKind::RankedRecords => from_bytes(payload).map(WireMessage::RankedRecords),
     }
 }
 
@@ -1112,6 +1440,8 @@ mod tests {
             WireMessage::Challenge(Challenge {
                 challenger: identity("Ada"),
                 message: "battle?".to_string(),
+                hosted_session_id: None,
+                hosted_player_id: None,
             }),
             WireMessage::ChallengeAccepted(ChallengeAccepted {
                 accepter: identity("Ben"),
@@ -1128,6 +1458,15 @@ mod tests {
                 player: PlayerSlot::One,
                 tick: 42,
                 command: InputCommand::LaunchWeapon { slot_index: 9 },
+            }),
+            WireMessage::TickWatermark(TickWatermark {
+                player: PlayerSlot::One,
+                through_tick: 48,
+            }),
+            WireMessage::Heartbeat(Heartbeat {
+                player: PlayerSlot::Two,
+                current_tick: 52,
+                watermark_tick: 48,
             }),
             WireMessage::ScoreSnapshot(ScoreSnapshot {
                 player: PlayerSlot::Two,
@@ -1187,6 +1526,16 @@ mod tests {
             WireMessage::BazaarDone(BazaarDone {
                 player: PlayerSlot::One,
             }),
+            WireMessage::BazaarBuy(BazaarBuy {
+                player: PlayerSlot::One,
+                weapon: 5,
+                sequence: 1,
+            }),
+            WireMessage::BazaarRemove(BazaarRemove {
+                player: PlayerSlot::One,
+                slot_index: 0,
+                sequence: 2,
+            }),
             WireMessage::BazaarState(BazaarState {
                 player_one_done: true,
                 player_two_done: false,
@@ -1224,6 +1573,18 @@ mod tests {
                 ranked: true,
                 community_label: "main-server".to_string(),
             }),
+            WireMessage::HostedJoinRequest(HostedJoinRequest {
+                session_id: HostedSessionId("session-1".to_string()),
+                joiner: hosted_player("ben", "Ben"),
+            }),
+            WireMessage::HostedSessionStatusRequest(HostedSessionStatusRequest {
+                session_id: HostedSessionId("session-1".to_string()),
+                requester_player_id: "ada".to_string(),
+            }),
+            WireMessage::HostedSessionStatus(HostedSessionStatus {
+                session_id: HostedSessionId("session-1".to_string()),
+                status: HostedSessionStatusKind::WaitingForPeer,
+            }),
             WireMessage::RankedResultClaim(RankedResultClaim {
                 session_id: HostedSessionId("session-1".to_string()),
                 reporter_player_id: "ada".to_string(),
@@ -1236,14 +1597,40 @@ mod tests {
                 loser_lines: 14,
                 loser_funds: 200,
                 duration_secs: 180,
+                duration_ticks: 18_000,
                 event_count: 44,
+                final_checksum: 0xABCD,
             }),
             WireMessage::RankedResultAccepted(RankedResultAccepted {
                 session_id: HostedSessionId("session-1".to_string()),
             }),
+            WireMessage::RankedResultPending(RankedResultPending {
+                session_id: HostedSessionId("session-1".to_string()),
+                reason: "awaiting matching peer result claim".to_string(),
+            }),
             WireMessage::RankedResultRejected(RankedResultRejected {
                 session_id: Some(HostedSessionId("session-1".to_string())),
                 reason: "mismatched claims".to_string(),
+            }),
+            WireMessage::RankedRecordsRequest(RankedRecordsRequest { limit: 50 }),
+            WireMessage::RankedRecords(RankedRecords {
+                community_label: "garage".to_string(),
+                records: vec![RankedPlayerRecord {
+                    player_id: "ada".to_string(),
+                    display_name: "Ada".to_string(),
+                    rank: 1205,
+                    wins: 1,
+                    losses: 0,
+                    high_score: 1200,
+                    high_lines: 20,
+                    high_funds: 300,
+                }],
+            }),
+            WireMessage::GameChecksum(GameChecksum {
+                reporter: PlayerSlot::One,
+                tick: 60,
+                checksum: 0xCAFE_BABE,
+                event_count: 44,
             }),
         ]
     }
@@ -1260,6 +1647,88 @@ mod tests {
             assert_eq!(raw.header.payload_len as usize, raw.payload.len());
             assert_eq!(decode_message(&encoded).expect("message decodes"), message);
         }
+    }
+
+    #[test]
+    fn new_phase_one_messages_have_golden_byte_fixtures() {
+        let fixtures = [
+            WireMessage::TickWatermark(TickWatermark {
+                player: PlayerSlot::One,
+                through_tick: 48,
+            }),
+            WireMessage::Heartbeat(Heartbeat {
+                player: PlayerSlot::Two,
+                current_tick: 52,
+                watermark_tick: 48,
+            }),
+            WireMessage::BazaarBuy(BazaarBuy {
+                player: PlayerSlot::One,
+                weapon: 5,
+                sequence: 1,
+            }),
+            WireMessage::BazaarRemove(BazaarRemove {
+                player: PlayerSlot::One,
+                slot_index: 0,
+                sequence: 2,
+            }),
+            WireMessage::HostedJoinRequest(HostedJoinRequest {
+                session_id: HostedSessionId("session-1".to_string()),
+                joiner: hosted_player("ben", "Ben"),
+            }),
+            WireMessage::HostedSessionStatusRequest(HostedSessionStatusRequest {
+                session_id: HostedSessionId("session-1".to_string()),
+                requester_player_id: "ada".to_string(),
+            }),
+            WireMessage::HostedSessionStatus(HostedSessionStatus {
+                session_id: HostedSessionId("session-1".to_string()),
+                status: HostedSessionStatusKind::WaitingForPeer,
+            }),
+            WireMessage::RankedResultPending(RankedResultPending {
+                session_id: HostedSessionId("session-1".to_string()),
+                reason: "awaiting matching peer result claim".to_string(),
+            }),
+            WireMessage::GameChecksum(GameChecksum {
+                reporter: PlayerSlot::One,
+                tick: 60,
+                checksum: 0xCAFE_BABE,
+                event_count: 44,
+            }),
+        ];
+        let encoded = fixtures
+            .iter()
+            .map(|message| encode_message(message).expect("message encodes"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            encoded,
+            vec![
+                vec![66, 84, 82, 83, 0, 1, 0, 0, 0, 25, 0, 0, 0, 0, 0, 2, 0, 48],
+                vec![66, 84, 82, 83, 0, 1, 0, 0, 0, 26, 0, 0, 0, 0, 0, 3, 1, 52, 48],
+                vec![66, 84, 82, 83, 0, 1, 0, 0, 0, 27, 0, 0, 0, 0, 0, 3, 0, 5, 1],
+                vec![66, 84, 82, 83, 0, 1, 0, 0, 0, 28, 0, 0, 0, 0, 0, 3, 0, 0, 2],
+                vec![
+                    66, 84, 82, 83, 0, 1, 0, 0, 0, 29, 0, 0, 0, 0, 0, 18, 9, 115, 101, 115, 115,
+                    105, 111, 110, 45, 49, 3, 98, 101, 110, 3, 66, 101, 110,
+                ],
+                vec![
+                    66, 84, 82, 83, 0, 1, 0, 0, 0, 30, 0, 0, 0, 0, 0, 14, 9, 115, 101, 115, 115,
+                    105, 111, 110, 45, 49, 3, 97, 100, 97,
+                ],
+                vec![
+                    66, 84, 82, 83, 0, 1, 0, 0, 0, 31, 0, 0, 0, 0, 0, 11, 9, 115, 101, 115, 115,
+                    105, 111, 110, 45, 49, 0,
+                ],
+                vec![
+                    66, 84, 82, 83, 0, 1, 0, 0, 0, 32, 0, 0, 0, 0, 0, 46, 9, 115, 101, 115, 115,
+                    105, 111, 110, 45, 49, 35, 97, 119, 97, 105, 116, 105, 110, 103, 32, 109, 97,
+                    116, 99, 104, 105, 110, 103, 32, 112, 101, 101, 114, 32, 114, 101, 115, 117,
+                    108, 116, 32, 99, 108, 97, 105, 109,
+                ],
+                vec![
+                    66, 84, 82, 83, 0, 1, 0, 0, 0, 33, 0, 0, 0, 0, 0, 8, 0, 60, 190, 245, 250, 215,
+                    12, 44,
+                ],
+            ]
+        );
     }
 
     #[test]
@@ -1354,6 +1823,8 @@ mod tests {
             WireMessage::Challenge(Challenge {
                 challenger: identity("Ada"),
                 message: String::new(),
+                hosted_session_id: None,
+                hosted_player_id: None,
             }),
             WireMessage::ChallengeAccepted(ChallengeAccepted {
                 accepter: identity("Ben"),
@@ -1368,6 +1839,10 @@ mod tests {
                 tick: 12,
                 command: InputCommand::MoveLeft,
             }),
+            WireMessage::TickWatermark(TickWatermark {
+                player: PlayerSlot::One,
+                through_tick: 12,
+            }),
             WireMessage::ScoreSnapshot(ScoreSnapshot {
                 player: PlayerSlot::One,
                 score: 28,
@@ -1377,6 +1852,16 @@ mod tests {
             WireMessage::BazaarState(BazaarState {
                 player_one_done: false,
                 player_two_done: false,
+            }),
+            WireMessage::BazaarBuy(BazaarBuy {
+                player: PlayerSlot::One,
+                weapon: 5,
+                sequence: 1,
+            }),
+            WireMessage::BazaarRemove(BazaarRemove {
+                player: PlayerSlot::One,
+                slot_index: 0,
+                sequence: 2,
             }),
             WireMessage::BazaarDone(BazaarDone {
                 player: PlayerSlot::One,
@@ -1445,7 +1930,13 @@ mod tests {
                 loser_lines: 18,
                 loser_funds: -250,
                 duration_secs: 300,
+                duration_ticks: 30_000,
                 event_count: 75,
+                final_checksum: 0x1234,
+            }),
+            WireMessage::RankedResultPending(RankedResultPending {
+                session_id: session_id.clone(),
+                reason: "awaiting matching peer result claim".to_string(),
             }),
             WireMessage::RankedResultAccepted(RankedResultAccepted { session_id }),
         ];

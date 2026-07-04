@@ -10,7 +10,8 @@ use std::fmt;
 
 use battletris_db::{CommunityLabel, GameResult, OpponentKind, PlayerId, PlayerStore};
 use battletris_protocol::{
-    HostedGameStart, HostedPlayer, HostedSessionId, LobbyEntry, LobbyRegister, RankedResultClaim,
+    HostedGameStart, HostedPlayer, HostedSessionId, HostedSessionStatus, HostedSessionStatusKind,
+    LobbyEntry, LobbyRegister, RankedPlayerRecord, RankedRecords, RankedResultClaim,
     PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 
@@ -162,6 +163,30 @@ impl HostedLobbyServer {
             .collect()
     }
 
+    /// Returns server-owned ranked records for this community.
+    pub fn ranked_records(&self, store: &PlayerStore, limit: u16) -> Result<RankedRecords> {
+        let limit = usize::from(limit.clamp(1, 200));
+        let records = store
+            .roster_by_rank(&self.community_label)?
+            .into_iter()
+            .take(limit)
+            .map(|profile| RankedPlayerRecord {
+                player_id: profile.player_id.as_str().to_string(),
+                display_name: profile.display_name,
+                rank: profile.rank,
+                wins: profile.wins,
+                losses: profile.losses,
+                high_score: profile.high_score,
+                high_lines: profile.high_lines,
+                high_funds: profile.high_funds,
+            })
+            .collect();
+        Ok(RankedRecords {
+            community_label: self.community_label.as_str().to_string(),
+            records,
+        })
+    }
+
     /// Starts a hosted game for a lobby session and creates participant records.
     pub fn start_game(
         &mut self,
@@ -192,18 +217,64 @@ impl HostedLobbyServer {
         create_player(store, &session.host, &self.community_label)?;
         create_player(store, &joiner, &self.community_label)?;
 
-        session.state = SessionState::InProgress {
-            joiner: joiner.clone(),
-        };
-
-        Ok(HostedGameStart {
+        let start = HostedGameStart {
             session_id: session_id.clone(),
             player_one: session.host.clone(),
             player_two: joiner,
             seed,
             ranked: session.ranked,
             community_label: self.community_label.as_str().to_string(),
-        })
+        };
+        session.state = SessionState::InProgress {
+            joiner: start.player_two.clone(),
+            start: Box::new(start.clone()),
+        };
+
+        Ok(start)
+    }
+
+    /// Returns server-owned status for a hosted lobby session participant.
+    pub fn session_status(
+        &self,
+        session_id: &HostedSessionId,
+        requester_player_id: &str,
+    ) -> Result<HostedSessionStatus> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| self.missing_session_error(session_id))?;
+        match &session.state {
+            SessionState::Available => {
+                if requester_player_id != session.host.player_id {
+                    return Err(ServerError::WrongParticipant(
+                        requester_player_id.to_string(),
+                    ));
+                }
+                Ok(HostedSessionStatus {
+                    session_id: session_id.clone(),
+                    status: HostedSessionStatusKind::WaitingForPeer,
+                })
+            }
+            SessionState::InProgress { joiner, start } => {
+                if requester_player_id != session.host.player_id
+                    && requester_player_id != joiner.player_id
+                {
+                    return Err(ServerError::WrongParticipant(
+                        requester_player_id.to_string(),
+                    ));
+                }
+                Ok(HostedSessionStatus {
+                    session_id: session_id.clone(),
+                    status: HostedSessionStatusKind::Started((**start).clone()),
+                })
+            }
+            SessionState::Completed => Ok(HostedSessionStatus {
+                session_id: session_id.clone(),
+                status: HostedSessionStatusKind::Unavailable {
+                    reason: "session completed".to_string(),
+                },
+            }),
+        }
     }
 
     /// Marks a session stale after a disconnect, timeout, or operator action.
@@ -228,7 +299,7 @@ impl HostedLobbyServer {
             .sessions
             .get_mut(&claim.session_id)
             .expect("session existence checked");
-        let SessionState::InProgress { joiner } = &session.state else {
+        let SessionState::InProgress { joiner, .. } = &session.state else {
             return Err(ServerError::SessionUnavailable(claim.session_id.clone()));
         };
         if !session.ranked {
@@ -286,7 +357,10 @@ struct Session {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SessionState {
     Available,
-    InProgress { joiner: HostedPlayer },
+    InProgress {
+        joiner: HostedPlayer,
+        start: Box<HostedGameStart>,
+    },
     Completed,
 }
 
@@ -363,7 +437,9 @@ fn claims_match(left: &RankedResultClaim, right: &RankedResultClaim) -> bool {
         && left.loser_lines == right.loser_lines
         && left.loser_funds == right.loser_funds
         && left.duration_secs == right.duration_secs
+        && left.duration_ticks == right.duration_ticks
         && left.event_count == right.event_count
+        && left.final_checksum == right.final_checksum
 }
 
 fn game_result_from_claim(
@@ -425,7 +501,9 @@ mod tests {
             loser_lines: 24,
             loser_funds: -500,
             duration_secs: 180,
+            duration_ticks: 18_000,
             event_count: 88,
+            final_checksum: 0x88,
         }
     }
 
@@ -496,6 +574,52 @@ mod tests {
     }
 
     #[test]
+    fn hosted_session_status_reports_waiting_and_started_metadata() {
+        let store = PlayerStore::open_in_memory().unwrap();
+        let community = CommunityLabel::new("garage").unwrap();
+        let mut server = HostedLobbyServer::new(community, 100);
+        let entry = server
+            .register_host(register(player("ada", "Ada"), true), PROTOCOL_MAJOR, 0)
+            .unwrap();
+
+        assert_eq!(
+            server
+                .session_status(&entry.session_id, "ada")
+                .unwrap()
+                .status,
+            HostedSessionStatusKind::WaitingForPeer
+        );
+
+        let start = server
+            .start_game(
+                &entry.session_id,
+                player("ben", "Ben"),
+                PROTOCOL_MAJOR,
+                &store,
+            )
+            .unwrap();
+
+        assert_eq!(
+            server
+                .session_status(&entry.session_id, "ada")
+                .unwrap()
+                .status,
+            HostedSessionStatusKind::Started(start.clone())
+        );
+        assert_eq!(
+            server
+                .session_status(&entry.session_id, "ben")
+                .unwrap()
+                .status,
+            HostedSessionStatusKind::Started(start)
+        );
+        assert!(matches!(
+            server.session_status(&entry.session_id, "mallory"),
+            Err(ServerError::WrongParticipant(_))
+        ));
+    }
+
+    #[test]
     fn matching_ranked_result_claims_record_once() {
         let mut store = PlayerStore::open_in_memory().unwrap();
         let community = CommunityLabel::new("garage").unwrap();
@@ -545,6 +669,12 @@ mod tests {
             .head_to_head(&ada.player_id, &ben.player_id, &community)
             .unwrap()
             .is_some());
+
+        let records = server.ranked_records(&store, 10).unwrap();
+        assert_eq!(records.community_label, "garage");
+        assert_eq!(records.records.len(), 2);
+        assert_eq!(records.records[0].player_id, "ada");
+        assert_eq!(records.records[0].wins, 1);
     }
 
     #[test]

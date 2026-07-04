@@ -5,9 +5,11 @@ use battletris_core::{
     rng::GameSeed,
 };
 use battletris_protocol::{
-    accept_direct_game, join_direct_game, read_message, write_message, BazaarDone, BazaarState,
-    DirectConnection, Disconnect, GameOver, InputCommand, LanAdvertisement, PlayerIdentity,
-    PlayerInput, PlayerSlot, ProtocolError, ScoreSnapshot, WireMessage, PROTOCOL_MAJOR,
+    accept_direct_game, accept_pending_direct_challenge, derive_player_seeds, join_direct_game,
+    join_direct_game_with_challenge, read_message, write_message, BazaarDone, BazaarState,
+    Challenge, DirectConnection, Disconnect, GameOver, HostedSessionId, InputCommand,
+    LanAdvertisement, PlayerIdentity, PlayerInput, PlayerSlot, ProtocolError, ScoreSnapshot,
+    WireMessage, PROTOCOL_MAJOR,
 };
 use tokio::{net::TcpListener, time::Duration};
 
@@ -17,10 +19,79 @@ fn identity(name: &str) -> PlayerIdentity {
     }
 }
 
+#[tokio::test]
+async fn direct_host_can_deny_pending_challenge_with_reason() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("listener address");
+
+    let host = tokio::spawn(async move {
+        let pending = accept_pending_direct_challenge(&listener, identity("Ada"))
+            .await
+            .expect("pending challenge");
+        assert_eq!(pending.challenge.message, "battle?");
+        pending
+            .deny("busy".to_string())
+            .await
+            .expect("deny challenge");
+    });
+
+    let join = tokio::spawn(async move {
+        join_direct_game(addr, identity("Ben"), "battle?".to_string()).await
+    });
+
+    host.await.expect("host task");
+    assert!(matches!(
+        join.await.expect("join task"),
+        Err(ProtocolError::ChallengeDenied { reason }) if reason == "busy"
+    ));
+}
+
+#[tokio::test]
+async fn hosted_direct_challenge_carries_server_session_metadata() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("listener address");
+
+    let host = tokio::spawn(async move {
+        let pending = accept_pending_direct_challenge(&listener, identity("Ada"))
+            .await
+            .expect("pending hosted challenge");
+        assert_eq!(
+            pending.challenge.hosted_session_id,
+            Some(HostedSessionId("session-1".to_string()))
+        );
+        assert_eq!(pending.challenge.hosted_player_id.as_deref(), Some("ben"));
+        pending.deny("verified metadata".to_string()).await.unwrap();
+    });
+
+    let join = tokio::spawn(async move {
+        join_direct_game_with_challenge(
+            addr,
+            Challenge {
+                challenger: identity("Ben"),
+                message: "hosted battle".to_string(),
+                hosted_session_id: Some(HostedSessionId("session-1".to_string())),
+                hosted_player_id: Some("ben".to_string()),
+            },
+        )
+        .await
+    });
+
+    host.await.expect("host task");
+    assert!(matches!(
+        join.await.expect("join task"),
+        Err(ProtocolError::ChallengeDenied { reason }) if reason == "verified metadata"
+    ));
+}
+
 fn game_from_seed(seed: u64) -> TwoPlayerGame {
+    let (player_one_seed, player_two_seed) = derive_player_seeds(seed);
     TwoPlayerGame::new(
-        GameSeed::from_u64(seed),
-        GameSeed::from_u64(seed.wrapping_add(1)),
+        GameSeed::from_u64(player_one_seed),
+        GameSeed::from_u64(player_two_seed),
     )
 }
 

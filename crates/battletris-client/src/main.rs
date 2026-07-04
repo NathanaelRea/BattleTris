@@ -34,6 +34,7 @@ use std::{
     ffi::{OsStr, OsString},
     fmt::Write as _,
     fs,
+    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
 };
 
@@ -127,6 +128,7 @@ fn run_client(run_config: ClientRunConfig) {
         .insert_resource(themes)
         .insert_resource(sound_packs)
         .insert_resource(settings)
+        .insert_resource(SettingsEditState::default())
         .insert_resource(SoundEventState::default())
         .insert_resource(roster_records)
         .add_plugins(
@@ -210,6 +212,72 @@ enum SoundPackChoice {
 enum ContentMode {
     Normal,
     Rated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChallengeMode {
+    ComputerOpponent,
+    HostDirect,
+    JoinDirect,
+    HostViaLobby,
+    BrowseLobby,
+}
+
+impl ChallengeMode {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::ComputerOpponent => "Computer Opponent",
+            Self::HostDirect => "Host Direct",
+            Self::JoinDirect => "Join Direct",
+            Self::HostViaLobby => "Host Via Lobby",
+            Self::BrowseLobby => "Browse Lobby",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsField {
+    DisplayName,
+    CommunityLabel,
+    HostBindAddress,
+    ShareAddress,
+    JoinAddress,
+    LobbyAddress,
+}
+
+impl SettingsField {
+    const ALL: [Self; 6] = [
+        Self::DisplayName,
+        Self::CommunityLabel,
+        Self::HostBindAddress,
+        Self::ShareAddress,
+        Self::JoinAddress,
+        Self::LobbyAddress,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::DisplayName => "display name",
+            Self::CommunityLabel => "community",
+            Self::HostBindAddress => "host bind",
+            Self::ShareAddress => "share address",
+            Self::JoinAddress => "join address",
+            Self::LobbyAddress => "lobby address",
+        }
+    }
+}
+
+#[derive(Resource, Debug, Clone)]
+struct SettingsEditState {
+    field: SettingsField,
+}
+
+impl Default for SettingsEditState {
+    fn default() -> Self {
+        Self {
+            field: SettingsField::DisplayName,
+        }
+    }
 }
 
 impl ContentMode {
@@ -1720,10 +1788,14 @@ struct ClientSettings {
     controls: ControlScheme,
     pixel_scale: f32,
     ernie_level: usize,
+    challenge_mode: ChallengeMode,
     display_name: String,
     community_label: String,
     direct_listen_addr: String,
+    direct_share_addr: String,
+    direct_join_addr: String,
     lobby_addr: String,
+    hosted_ranked: bool,
     settings_path: Option<PathBuf>,
     assets_dir: PathBuf,
 }
@@ -1738,10 +1810,14 @@ impl Default for ClientSettings {
             controls: ControlScheme::ModernSplit,
             pixel_scale: 1.0,
             ernie_level: DEFAULT_ERNIE_LEVEL,
+            challenge_mode: ChallengeMode::ComputerOpponent,
             display_name: default_display_name(),
             community_label: CommunityLabel::local().as_str().to_string(),
-            direct_listen_addr: "127.0.0.1:4405".to_string(),
+            direct_listen_addr: "0.0.0.0:4405".to_string(),
+            direct_share_addr: suggested_share_addr_for("0.0.0.0:4405"),
+            direct_join_addr: "127.0.0.1:4405".to_string(),
             lobby_addr: "127.0.0.1:4404".to_string(),
+            hosted_ranked: true,
             settings_path: settings_path(),
             assets_dir: assets_dir(),
         }
@@ -1807,7 +1883,10 @@ impl ClientSettings {
             display_name: self.display_name.clone(),
             community_label: self.community_label.clone(),
             direct_listen_addr: self.direct_listen_addr.clone(),
+            direct_share_addr: self.direct_share_addr.clone(),
+            direct_join_addr: self.direct_join_addr.clone(),
             lobby_addr: self.lobby_addr.clone(),
+            hosted_ranked: self.hosted_ranked,
         }
     }
 
@@ -1822,9 +1901,13 @@ impl ClientSettings {
         self.community_label =
             sanitize_nonempty_setting(persisted.community_label, "local".to_string());
         self.direct_listen_addr =
-            sanitize_nonempty_setting(persisted.direct_listen_addr, "127.0.0.1:4405".to_string());
-        self.lobby_addr =
-            sanitize_nonempty_setting(persisted.lobby_addr, "127.0.0.1:4404".to_string());
+            sanitize_socket_setting(persisted.direct_listen_addr, "0.0.0.0:4405");
+        self.direct_share_addr =
+            sanitize_share_addr_setting(persisted.direct_share_addr, &self.direct_listen_addr);
+        self.direct_join_addr =
+            sanitize_socket_setting(persisted.direct_join_addr, "127.0.0.1:4405");
+        self.lobby_addr = sanitize_socket_setting(persisted.lobby_addr, "127.0.0.1:4404");
+        self.hosted_ranked = persisted.hosted_ranked;
     }
 }
 
@@ -1839,7 +1922,10 @@ struct PersistedClientSettings {
     display_name: String,
     community_label: String,
     direct_listen_addr: String,
+    direct_share_addr: String,
+    direct_join_addr: String,
     lobby_addr: String,
+    hosted_ranked: bool,
 }
 
 impl Default for PersistedClientSettings {
@@ -1852,8 +1938,11 @@ impl Default for PersistedClientSettings {
             ernie_level: DEFAULT_ERNIE_LEVEL,
             display_name: default_display_name(),
             community_label: "local".to_string(),
-            direct_listen_addr: "127.0.0.1:4405".to_string(),
+            direct_listen_addr: "0.0.0.0:4405".to_string(),
+            direct_share_addr: suggested_share_addr_for("0.0.0.0:4405"),
+            direct_join_addr: "127.0.0.1:4405".to_string(),
             lobby_addr: "127.0.0.1:4404".to_string(),
+            hosted_ranked: true,
         }
     }
 }
@@ -5191,6 +5280,7 @@ struct KeyboardInputParams<'w> {
     keys: Res<'w, ButtonInput<KeyCode>>,
     local: ResMut<'w, LocalGame>,
     settings: ResMut<'w, ClientSettings>,
+    settings_edit: ResMut<'w, SettingsEditState>,
     sound: ResMut<'w, SoundEventState>,
     repeat: ResMut<'w, InputRepeatState>,
     recon: ResMut<'w, ReconPanel>,
@@ -5219,7 +5309,12 @@ fn handle_keyboard_input(mut input: KeyboardInputParams) {
             &mut input.sound,
         ),
         ClientScreen::Settings => {
-            handle_settings_input(&input.keys, &mut input.settings, &mut input.sound);
+            handle_settings_input(
+                &input.keys,
+                &mut input.settings,
+                &mut input.settings_edit,
+                &mut input.sound,
+            );
         }
         ClientScreen::Game => handle_game_input(
             &input.keys,
@@ -5377,6 +5472,26 @@ fn handle_challenge_input(
     settings: &mut ClientSettings,
     sound: &mut SoundEventState,
 ) {
+    if keys.just_pressed(KeyCode::Digit1) {
+        settings.challenge_mode = ChallengeMode::ComputerOpponent;
+        queue_sound(sound, SoundEvent::MenuAction);
+    }
+    if keys.just_pressed(KeyCode::Digit2) {
+        settings.challenge_mode = ChallengeMode::HostDirect;
+        queue_sound(sound, SoundEvent::MenuAction);
+    }
+    if keys.just_pressed(KeyCode::Digit3) {
+        settings.challenge_mode = ChallengeMode::JoinDirect;
+        queue_sound(sound, SoundEvent::MenuAction);
+    }
+    if keys.just_pressed(KeyCode::Digit4) {
+        settings.challenge_mode = ChallengeMode::HostViaLobby;
+        queue_sound(sound, SoundEvent::MenuAction);
+    }
+    if keys.just_pressed(KeyCode::Digit5) {
+        settings.challenge_mode = ChallengeMode::BrowseLobby;
+        queue_sound(sound, SoundEvent::MenuAction);
+    }
     if keys.just_pressed(KeyCode::ArrowLeft) || keys.just_pressed(KeyCode::KeyJ) {
         adjust_ernie_level(settings, -1);
         queue_sound(sound, SoundEvent::MenuAction);
@@ -5385,7 +5500,9 @@ fn handle_challenge_input(
         adjust_ernie_level(settings, 1);
         queue_sound(sound, SoundEvent::MenuAction);
     }
-    if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::KeyC) {
+    if (keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::KeyC))
+        && settings.challenge_mode == ChallengeMode::ComputerOpponent
+    {
         *local = LocalGame::new_human_vs_computer(settings.ernie_level);
         settings.screen = ClientScreen::Game;
         sound.next_log_index = 0;
@@ -5396,22 +5513,49 @@ fn handle_challenge_input(
 fn handle_settings_input(
     keys: &ButtonInput<KeyCode>,
     settings: &mut ClientSettings,
+    edit: &mut SettingsEditState,
     sound: &mut SoundEventState,
 ) {
     let previous = settings.persisted();
 
-    if keys.just_pressed(KeyCode::KeyT) {
+    if keys.just_pressed(KeyCode::Tab) {
+        edit.field = next_settings_field(edit.field);
+        queue_sound(sound, SoundEvent::MenuAction);
+    }
+    let selected_field = selected_settings_field_key(keys);
+    if let Some(field) = selected_field {
+        edit.field = field;
+        queue_sound(sound, SoundEvent::MenuAction);
+    }
+    if keys.just_pressed(KeyCode::Backspace) || keys.just_pressed(KeyCode::Delete) {
+        settings_field_value_mut(settings, edit.field).pop();
+        queue_sound(sound, SoundEvent::MenuAction);
+    }
+    if keys.just_pressed(KeyCode::Enter) {
+        sanitize_settings_after_edit(settings, edit.field);
+        queue_sound(sound, SoundEvent::MenuAction);
+    }
+    let typed_character = selected_field
+        .is_none()
+        .then(|| text_entry_character(keys))
+        .flatten();
+    if let Some(ch) = typed_character {
+        settings_field_value_mut(settings, edit.field).push(ch);
+        queue_sound(sound, SoundEvent::MenuAction);
+    }
+
+    if typed_character.is_none() && keys.just_pressed(KeyCode::KeyT) {
         toggle_theme(settings);
         queue_sound(sound, SoundEvent::MenuAction);
     }
-    if keys.just_pressed(KeyCode::KeyO) {
+    if typed_character.is_none() && keys.just_pressed(KeyCode::KeyO) {
         settings.sound_pack = match settings.sound_pack {
             SoundPackChoice::GeneratedDefault => SoundPackChoice::Muted,
             SoundPackChoice::Muted => SoundPackChoice::GeneratedDefault,
         };
         queue_sound(sound, SoundEvent::MenuAction);
     }
-    if keys.just_pressed(KeyCode::KeyM) {
+    if typed_character.is_none() && keys.just_pressed(KeyCode::KeyM) {
         settings.controls = match settings.controls {
             ControlScheme::ModernSplit => ControlScheme::LegacyInspired,
             ControlScheme::LegacyInspired => ControlScheme::ModernSplit,
@@ -5426,10 +5570,94 @@ fn handle_settings_input(
         settings.pixel_scale = sanitize_pixel_scale(settings.pixel_scale - 0.25).max(0.75);
         queue_sound(sound, SoundEvent::MenuAction);
     }
+    if typed_character.is_none() && keys.just_pressed(KeyCode::KeyR) {
+        settings.hosted_ranked = !settings.hosted_ranked;
+        queue_sound(sound, SoundEvent::MenuAction);
+    }
 
     if settings.persisted() != previous {
         settings.save();
     }
+}
+
+fn next_settings_field(field: SettingsField) -> SettingsField {
+    let index = SettingsField::ALL
+        .iter()
+        .position(|candidate| *candidate == field)
+        .unwrap_or_default();
+    SettingsField::ALL[(index + 1) % SettingsField::ALL.len()]
+}
+
+fn selected_settings_field_key(keys: &ButtonInput<KeyCode>) -> Option<SettingsField> {
+    [
+        (KeyCode::Digit1, SettingsField::DisplayName),
+        (KeyCode::Digit2, SettingsField::CommunityLabel),
+        (KeyCode::Digit3, SettingsField::HostBindAddress),
+        (KeyCode::Digit4, SettingsField::ShareAddress),
+        (KeyCode::Digit5, SettingsField::JoinAddress),
+        (KeyCode::Digit6, SettingsField::LobbyAddress),
+    ]
+    .into_iter()
+    .find_map(|(key, field)| keys.just_pressed(key).then_some(field))
+}
+
+fn text_entry_character(keys: &ButtonInput<KeyCode>) -> Option<char> {
+    let shifted = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    for (key, ch) in text_entry_keys(shifted) {
+        if keys.just_pressed(key) {
+            return Some(ch);
+        }
+    }
+    None
+}
+
+fn text_entry_keys(shifted: bool) -> [(KeyCode, char); 44] {
+    [
+        (KeyCode::KeyA, if shifted { 'A' } else { 'a' }),
+        (KeyCode::KeyB, if shifted { 'B' } else { 'b' }),
+        (KeyCode::KeyC, if shifted { 'C' } else { 'c' }),
+        (KeyCode::KeyD, if shifted { 'D' } else { 'd' }),
+        (KeyCode::KeyE, if shifted { 'E' } else { 'e' }),
+        (KeyCode::KeyF, if shifted { 'F' } else { 'f' }),
+        (KeyCode::KeyG, if shifted { 'G' } else { 'g' }),
+        (KeyCode::KeyH, if shifted { 'H' } else { 'h' }),
+        (KeyCode::KeyI, if shifted { 'I' } else { 'i' }),
+        (KeyCode::KeyJ, if shifted { 'J' } else { 'j' }),
+        (KeyCode::KeyK, if shifted { 'K' } else { 'k' }),
+        (KeyCode::KeyL, if shifted { 'L' } else { 'l' }),
+        (KeyCode::KeyM, if shifted { 'M' } else { 'm' }),
+        (KeyCode::KeyN, if shifted { 'N' } else { 'n' }),
+        (KeyCode::KeyO, if shifted { 'O' } else { 'o' }),
+        (KeyCode::KeyP, if shifted { 'P' } else { 'p' }),
+        (KeyCode::KeyQ, if shifted { 'Q' } else { 'q' }),
+        (KeyCode::KeyR, if shifted { 'R' } else { 'r' }),
+        (KeyCode::KeyS, if shifted { 'S' } else { 's' }),
+        (KeyCode::KeyT, if shifted { 'T' } else { 't' }),
+        (KeyCode::KeyU, if shifted { 'U' } else { 'u' }),
+        (KeyCode::KeyV, if shifted { 'V' } else { 'v' }),
+        (KeyCode::KeyW, if shifted { 'W' } else { 'w' }),
+        (KeyCode::KeyX, if shifted { 'X' } else { 'x' }),
+        (KeyCode::KeyY, if shifted { 'Y' } else { 'y' }),
+        (KeyCode::KeyZ, if shifted { 'Z' } else { 'z' }),
+        (KeyCode::Digit0, '0'),
+        (KeyCode::Digit1, '1'),
+        (KeyCode::Digit2, '2'),
+        (KeyCode::Digit3, '3'),
+        (KeyCode::Digit4, '4'),
+        (KeyCode::Digit5, '5'),
+        (KeyCode::Digit6, '6'),
+        (KeyCode::Digit7, '7'),
+        (KeyCode::Digit8, '8'),
+        (KeyCode::Digit9, '9'),
+        (KeyCode::Period, '.'),
+        (KeyCode::Comma, ','),
+        (KeyCode::Minus, '-'),
+        (KeyCode::Equal, '='),
+        (KeyCode::Slash, '/'),
+        (KeyCode::Semicolon, if shifted { ':' } else { ';' }),
+        (KeyCode::Space, ' '),
+        (KeyCode::Backslash, '\\'),
+    ]
 }
 
 fn handle_game_input(
@@ -6052,6 +6280,7 @@ type GameVisibilityQuery<'w, 's> = Query<
 struct RenderGameParams<'w, 's> {
     local: Res<'w, LocalGame>,
     settings: Res<'w, ClientSettings>,
+    settings_edit: Res<'w, SettingsEditState>,
     roster: Res<'w, RosterRecords>,
     themes: Res<'w, ThemePacks>,
     atlases: Res<'w, ThemeAtlasHandles>,
@@ -6112,8 +6341,13 @@ fn render_game(mut render: RenderGameParams) {
     }
 
     render.phase_text.0 = phase_label(&render.local, &render.settings, &render.sound);
-    render.menu_text.0 = menu_label(&render.local.game, &render.settings);
-    render.screen_text.0 = screen_body_label(&render.local.game, &render.settings, &render.roster);
+    render.menu_text.0 = menu_label(&render.local.game, &render.settings, &render.settings_edit);
+    render.screen_text.0 = screen_body_label(
+        &render.local.game,
+        &render.settings,
+        &render.settings_edit,
+        &render.roster,
+    );
     for (bazaar_text, mut text) in &mut render.bazaar_text {
         text.0 = bazaar_text_label(
             bazaar_text.role,
@@ -6974,7 +7208,11 @@ fn legacy_game_message_label(local: &LocalGame, content_mode: ContentMode) -> St
     }
 }
 
-fn menu_label(_game: &TwoPlayerGame, settings: &ClientSettings) -> String {
+fn menu_label(
+    _game: &TwoPlayerGame,
+    settings: &ClientSettings,
+    settings_edit: &SettingsEditState,
+) -> String {
     match settings.screen {
         ClientScreen::Startup => String::new(),
         ClientScreen::Game => String::new(),
@@ -6983,8 +7221,9 @@ fn menu_label(_game: &TwoPlayerGame, settings: &ClientSettings) -> String {
         ClientScreen::About => "About BattleTris".to_string(),
         ClientScreen::Roster => String::new(),
         ClientScreen::Settings => format!(
-            "Settings\nT theme: {:?}  O sound: {:?}  M controls\n-/= scale: {:.2}x",
-            settings.theme, settings.sound_pack, settings.pixel_scale,
+            "Settings\nEditing {}: {}\nTab/1-6 choose  Backspace edit  Enter sanitize",
+            settings_edit.field.label(),
+            settings_field_value(settings, settings_edit.field),
         ),
     }
 }
@@ -6992,6 +7231,7 @@ fn menu_label(_game: &TwoPlayerGame, settings: &ClientSettings) -> String {
 fn screen_body_label(
     _game: &TwoPlayerGame,
     settings: &ClientSettings,
+    settings_edit: &SettingsEditState,
     _roster: &RosterRecords,
 ) -> String {
     match settings.screen {
@@ -7000,22 +7240,24 @@ fn screen_body_label(
             let difficulty = selected_ernie_difficulty(settings);
             let lobby_preview = lobby_registration_preview(settings);
             format!(
-                "Challenge\nIdentity: {} ({}) on community {}\nDirect TCP protocol v{}.{} ({}, {})\nAdvertised direct address: {}  Lobby: {}  Ranked: {}\nErnie difficulty: level {} of {}  {}  {}ms action delay\nUse J/Left and L/Right or Level -/+ as the slider.\nClick Play {} Ernie or press Enter/C for unranked computer play.",
+                "Challenge\nMode: {}\n1 Computer Opponent  2 Host Direct  3 Join Direct\n4 Host Via Lobby  5 Browse Lobby\n\nIdentity: {} ({}) on community {}\nHost bind: {}\nShare address: {}\nJoin address: {}\nLobby: {}  Hosted ranked: {}\nProtocol v{}.{} ({}, {})\n\nDirect IP needs inbound TCP allowed on the host port.\nPeers must reach each other directly; there is no NAT traversal or relay.\n\nErnie level {} of {}  {}  {}ms delay\nUse J/Left and L/Right or Level -/+ as the slider.\nPress Enter/C only in Computer mode for unranked computer play.",
+                settings.challenge_mode.label(),
                 lobby_preview.player.display_name,
                 lobby_preview.player.player_id,
                 settings.community_label,
+                settings.direct_listen_addr,
+                settings.direct_share_addr,
+                settings.direct_join_addr,
+                settings.lobby_addr,
+                settings.hosted_ranked,
                 PROTOCOL_MAJOR,
                 PROTOCOL_MINOR,
                 CAPABILITY_DIRECT_TCP,
                 CAPABILITY_SELF_HOSTED_LOBBY,
-                lobby_preview.direct_addr,
-                settings.lobby_addr,
-                lobby_preview.ranked,
                 difficulty.level,
                 COMPUTER_DIFFICULTIES.len() - 1,
                 difficulty.name,
                 difficulty.delay_ms,
-                difficulty.name,
             )
         }
         ClientScreen::Sleep => {
@@ -7033,15 +7275,25 @@ fn screen_body_label(
         }
         ClientScreen::Roster => " ".to_string(),
         ClientScreen::Settings => format!(
-            "Theme: {:?}\nSound pack: {:?}\nControls: {}\nScale: {:.2}x\nDisplay name: {}\nCommunity: {}\nDirect listen: {}\nLobby: {}\nProtocol: v{}.{}\nAssets: {}\nSettings: {}",
+            "Theme: {:?}  Sound: {:?}  Controls: {}  Scale: {:.2}x\nHosted ranked preference: {}\n\n{}1 display name: {}\n{}2 community: {}\n{}3 host bind: {}\n{}4 share address: {}\n{}5 join address: {}\n{}6 lobby address: {}\n\nBind controls where hosting listens. Share is what another player types or what a lobby advertises.\n0.0.0.0 is allowed for bind but never kept as a share address.\nSuggested share address: {}\nHost must allow inbound TCP on the direct port. No NAT traversal or gameplay relay exists.\n\nT theme  O sound  M controls  R hosted ranked  -/= scale\nProtocol: v{}.{}\nAssets: {}\nSettings: {}",
             settings.theme,
             settings.sound_pack,
             controls_label(settings.controls),
             settings.pixel_scale,
+            settings.hosted_ranked,
+            selected_settings_marker(settings_edit, SettingsField::DisplayName),
             settings.display_name,
+            selected_settings_marker(settings_edit, SettingsField::CommunityLabel),
             settings.community_label,
+            selected_settings_marker(settings_edit, SettingsField::HostBindAddress),
             settings.direct_listen_addr,
+            selected_settings_marker(settings_edit, SettingsField::ShareAddress),
+            settings.direct_share_addr,
+            selected_settings_marker(settings_edit, SettingsField::JoinAddress),
+            settings.direct_join_addr,
+            selected_settings_marker(settings_edit, SettingsField::LobbyAddress),
             settings.lobby_addr,
+            suggested_share_addr_for(&settings.direct_listen_addr),
             PROTOCOL_MAJOR,
             PROTOCOL_MINOR,
             settings.assets_dir.display(),
@@ -7052,6 +7304,14 @@ fn screen_body_label(
                 .unwrap_or_else(|| "unavailable".to_string()),
         ),
         ClientScreen::Game => String::new(),
+    }
+}
+
+fn selected_settings_marker(edit: &SettingsEditState, field: SettingsField) -> &'static str {
+    if edit.field == field {
+        "> "
+    } else {
+        "  "
     }
 }
 
@@ -7100,6 +7360,118 @@ fn sanitize_nonempty_setting(value: String, fallback: String) -> String {
     }
 }
 
+fn sanitize_socket_setting(value: String, fallback: &str) -> String {
+    let trimmed = sanitize_nonempty_setting(value, fallback.to_string());
+    if trimmed.parse::<SocketAddr>().is_ok() {
+        trimmed
+    } else {
+        fallback.to_string()
+    }
+}
+
+fn sanitize_share_addr_setting(value: String, bind_addr: &str) -> String {
+    let fallback = suggested_share_addr_for(bind_addr);
+    let sanitized = sanitize_socket_setting(value, &fallback);
+    if socket_addr_is_unspecified(&sanitized) {
+        fallback
+    } else {
+        sanitized
+    }
+}
+
+fn socket_addr_is_unspecified(value: &str) -> bool {
+    value
+        .parse::<SocketAddr>()
+        .map(|addr| addr.ip().is_unspecified())
+        .unwrap_or(false)
+}
+
+fn suggested_share_addr_for(bind_addr: &str) -> String {
+    let bind = bind_addr
+        .parse::<SocketAddr>()
+        .unwrap_or_else(|_| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4405));
+    if !bind.ip().is_unspecified() {
+        return bind.to_string();
+    }
+    SocketAddr::new(suggest_lan_ip(), bind.port()).to_string()
+}
+
+fn suggest_lan_ip() -> IpAddr {
+    UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+        .and_then(|socket| {
+            let _ = socket.connect(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 80));
+            socket.local_addr()
+        })
+        .map(|addr| addr.ip())
+        .ok()
+        .filter(|ip| !ip.is_unspecified())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+}
+
+fn settings_field_value(settings: &ClientSettings, field: SettingsField) -> &str {
+    match field {
+        SettingsField::DisplayName => &settings.display_name,
+        SettingsField::CommunityLabel => &settings.community_label,
+        SettingsField::HostBindAddress => &settings.direct_listen_addr,
+        SettingsField::ShareAddress => &settings.direct_share_addr,
+        SettingsField::JoinAddress => &settings.direct_join_addr,
+        SettingsField::LobbyAddress => &settings.lobby_addr,
+    }
+}
+
+fn settings_field_value_mut(settings: &mut ClientSettings, field: SettingsField) -> &mut String {
+    match field {
+        SettingsField::DisplayName => &mut settings.display_name,
+        SettingsField::CommunityLabel => &mut settings.community_label,
+        SettingsField::HostBindAddress => &mut settings.direct_listen_addr,
+        SettingsField::ShareAddress => &mut settings.direct_share_addr,
+        SettingsField::JoinAddress => &mut settings.direct_join_addr,
+        SettingsField::LobbyAddress => &mut settings.lobby_addr,
+    }
+}
+
+fn sanitize_settings_after_edit(settings: &mut ClientSettings, field: SettingsField) {
+    match field {
+        SettingsField::DisplayName => {
+            settings.display_name = sanitize_nonempty_setting(
+                std::mem::take(&mut settings.display_name),
+                default_display_name(),
+            );
+        }
+        SettingsField::CommunityLabel => {
+            settings.community_label = sanitize_nonempty_setting(
+                std::mem::take(&mut settings.community_label),
+                "local".to_string(),
+            );
+        }
+        SettingsField::HostBindAddress => {
+            settings.direct_listen_addr = sanitize_socket_setting(
+                std::mem::take(&mut settings.direct_listen_addr),
+                "0.0.0.0:4405",
+            );
+            if socket_addr_is_unspecified(&settings.direct_share_addr) {
+                settings.direct_share_addr = suggested_share_addr_for(&settings.direct_listen_addr);
+            }
+        }
+        SettingsField::ShareAddress => {
+            settings.direct_share_addr = sanitize_share_addr_setting(
+                std::mem::take(&mut settings.direct_share_addr),
+                &settings.direct_listen_addr,
+            );
+        }
+        SettingsField::JoinAddress => {
+            settings.direct_join_addr = sanitize_socket_setting(
+                std::mem::take(&mut settings.direct_join_addr),
+                "127.0.0.1:4405",
+            );
+        }
+        SettingsField::LobbyAddress => {
+            settings.lobby_addr =
+                sanitize_socket_setting(std::mem::take(&mut settings.lobby_addr), "127.0.0.1:4404");
+        }
+    }
+}
+
 fn sanitize_ernie_level(level: usize) -> usize {
     level.min(COMPUTER_DIFFICULTIES.len() - 1)
 }
@@ -7136,8 +7508,8 @@ fn lobby_registration_preview(settings: &ClientSettings) -> LobbyRegister {
             player_id: player_id_from_display_name(&settings.display_name),
             display_name: settings.display_name.clone(),
         },
-        direct_addr: settings.direct_listen_addr.clone(),
-        ranked: true,
+        direct_addr: settings.direct_share_addr.clone(),
+        ranked: settings.hosted_ranked,
     }
 }
 
@@ -8423,8 +8795,11 @@ mod tests {
             ernie_level: 12,
             display_name: "Ada".to_string(),
             community_label: "garage".to_string(),
-            direct_listen_addr: "127.0.0.1:4405".to_string(),
+            direct_listen_addr: "0.0.0.0:4405".to_string(),
+            direct_share_addr: "192.168.1.10:4405".to_string(),
+            direct_join_addr: "192.168.1.10:4405".to_string(),
             lobby_addr: "127.0.0.1:4404".to_string(),
+            hosted_ranked: false,
         };
 
         let encoded = toml::to_string_pretty(&settings).expect("settings encode");
@@ -8479,7 +8854,9 @@ mod tests {
     fn lobby_registration_preview_uses_protocol_identity() {
         let settings = ClientSettings {
             display_name: "Ada Lovelace".to_string(),
-            direct_listen_addr: "127.0.0.1:4405".to_string(),
+            direct_listen_addr: "0.0.0.0:4405".to_string(),
+            direct_share_addr: "192.168.1.10:4405".to_string(),
+            hosted_ranked: false,
             ..Default::default()
         };
 
@@ -8487,8 +8864,39 @@ mod tests {
 
         assert_eq!(preview.player.player_id, "ada-lovelace");
         assert_eq!(preview.player.display_name, "Ada Lovelace");
-        assert_eq!(preview.direct_addr, "127.0.0.1:4405");
-        assert!(preview.ranked);
+        assert_eq!(preview.direct_addr, "192.168.1.10:4405");
+        assert!(!preview.ranked);
+    }
+
+    #[test]
+    fn share_address_never_persists_unspecified_bind_address() {
+        let mut settings = ClientSettings::default();
+        settings.apply_persisted(PersistedClientSettings {
+            direct_listen_addr: "0.0.0.0:4405".to_string(),
+            direct_share_addr: "0.0.0.0:4405".to_string(),
+            ..Default::default()
+        });
+
+        assert_eq!(settings.direct_listen_addr, "0.0.0.0:4405");
+        assert!(!socket_addr_is_unspecified(&settings.direct_share_addr));
+        assert!(settings.direct_share_addr.ends_with(":4405"));
+    }
+
+    #[test]
+    fn invalid_network_settings_fall_back_to_safe_defaults() {
+        let mut settings = ClientSettings::default();
+        settings.apply_persisted(PersistedClientSettings {
+            direct_listen_addr: "".to_string(),
+            direct_share_addr: "not an address".to_string(),
+            direct_join_addr: "also bad".to_string(),
+            lobby_addr: "".to_string(),
+            ..Default::default()
+        });
+
+        assert_eq!(settings.direct_listen_addr, "0.0.0.0:4405");
+        assert!(!socket_addr_is_unspecified(&settings.direct_share_addr));
+        assert_eq!(settings.direct_join_addr, "127.0.0.1:4405");
+        assert_eq!(settings.lobby_addr, "127.0.0.1:4404");
     }
 
     #[test]

@@ -4,8 +4,8 @@ use std::{env, net::SocketAddr, process, sync::Arc};
 
 use battletris_db::{CommunityLabel, PersistencePaths, PlayerStore};
 use battletris_protocol::{
-    read_message, write_message, LobbyList, RankedResultAccepted, RankedResultRejected,
-    WireMessage, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    read_message_with_header, write_message, LobbyList, RankedResultAccepted, RankedResultPending,
+    RankedResultRejected, WireMessage,
 };
 use battletris_server::{HostedLobbyServer, VerificationOutcome};
 use tokio::{net::TcpListener, sync::Mutex};
@@ -51,13 +51,13 @@ async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     state: Arc<ServerState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let message = read_message(&mut stream)
+    let (header, message) = read_message_with_header(&mut stream)
         .await
         .map_err(|error| format!("protocol read failed: {error:?}"))?;
     let reply = match message {
         WireMessage::LobbyRegister(request) => {
             let mut lobby = state.lobby.lock().await;
-            match lobby.register_host(request, PROTOCOL_MAJOR, PROTOCOL_MINOR) {
+            match lobby.register_host(request, header.major, header.minor) {
                 Ok(entry) => WireMessage::LobbyList(LobbyList {
                     entries: vec![entry],
                 }),
@@ -73,6 +73,38 @@ async fn handle_connection(
                 entries: lobby.lobby_entries(request.ranked_only),
             })
         }
+        WireMessage::RankedRecordsRequest(request) => {
+            let lobby = state.lobby.lock().await;
+            let store = state.store.lock().await;
+            match lobby.ranked_records(&store, request.limit) {
+                Ok(records) => WireMessage::RankedRecords(records),
+                Err(error) => WireMessage::RankedResultRejected(RankedResultRejected {
+                    session_id: None,
+                    reason: error.to_string(),
+                }),
+            }
+        }
+        WireMessage::HostedJoinRequest(request) => {
+            let mut lobby = state.lobby.lock().await;
+            let store = state.store.lock().await;
+            match lobby.start_game(&request.session_id, request.joiner, header.major, &store) {
+                Ok(start) => WireMessage::HostedGameStart(start),
+                Err(error) => WireMessage::RankedResultRejected(RankedResultRejected {
+                    session_id: Some(request.session_id),
+                    reason: error.to_string(),
+                }),
+            }
+        }
+        WireMessage::HostedSessionStatusRequest(request) => {
+            let lobby = state.lobby.lock().await;
+            match lobby.session_status(&request.session_id, &request.requester_player_id) {
+                Ok(status) => WireMessage::HostedSessionStatus(status),
+                Err(error) => WireMessage::RankedResultRejected(RankedResultRejected {
+                    session_id: Some(request.session_id),
+                    reason: error.to_string(),
+                }),
+            }
+        }
         WireMessage::RankedResultClaim(claim) => {
             let session_id = claim.session_id.clone();
             let mut lobby = state.lobby.lock().await;
@@ -82,8 +114,8 @@ async fn handle_connection(
                     WireMessage::RankedResultAccepted(RankedResultAccepted { session_id })
                 }
                 Ok(VerificationOutcome::AwaitingPeer) => {
-                    WireMessage::RankedResultRejected(RankedResultRejected {
-                        session_id: Some(session_id),
+                    WireMessage::RankedResultPending(RankedResultPending {
+                        session_id,
                         reason: "awaiting matching peer result claim".to_string(),
                     })
                 }
