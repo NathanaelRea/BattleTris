@@ -36,6 +36,7 @@ pub const DEFAULT_CHANNEL_CAPACITY: usize = 128;
 pub const NETWORK_TICK_MS: u64 = 10;
 /// Initial LAN-safe delay for local inputs in deterministic lockstep ticks.
 pub const DEFAULT_INPUT_DELAY_TICKS: u64 = 6;
+const CHECKSUM_HISTORY_TICKS: usize = 2_048;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 const CHALLENGE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -826,9 +827,7 @@ async fn handle_lifecycle_command(
         | NetworkCommand::SendGameOver(_)
         | NetworkCommand::SendBazaarBuy(_)
         | NetworkCommand::SendBazaarRemove(_)
-        | NetworkCommand::SendBazaarDone { .. } => {
-            emit_error(io, "not connected to a direct peer".to_string()).await;
-        }
+        | NetworkCommand::SendBazaarDone { .. } => {}
     }
 }
 
@@ -1875,6 +1874,8 @@ pub struct NetworkLockstep {
     latest_local_input: Option<PlayerInput>,
     latest_remote_input: Option<PlayerInput>,
     inputs: BTreeMap<u64, ScheduledInputs>,
+    pending_checksums: Vec<GameChecksum>,
+    checksum_history: BTreeMap<u64, ChecksumState>,
 }
 
 impl NetworkLockstep {
@@ -1897,6 +1898,8 @@ impl NetworkLockstep {
             latest_local_input: None,
             latest_remote_input: None,
             inputs: BTreeMap::new(),
+            pending_checksums: Vec::new(),
+            checksum_history: BTreeMap::new(),
         }
     }
 
@@ -2049,6 +2052,35 @@ impl NetworkLockstep {
         }
     }
 
+    /// Receives a peer checksum, deferring it until the covered tick has completed locally.
+    pub fn receive_checksum(
+        &mut self,
+        game: &TwoPlayerGame,
+        checksum: GameChecksum,
+    ) -> Option<DesyncReport> {
+        if checksum.tick >= self.current_tick {
+            self.pending_checksums.push(checksum);
+            return None;
+        }
+        self.desync_report(game, &checksum)
+    }
+
+    /// Compares any deferred peer checksums whose covered ticks are now available locally.
+    pub fn drain_pending_desync_reports(&mut self, game: &TwoPlayerGame) -> Vec<DesyncReport> {
+        let mut pending = std::mem::take(&mut self.pending_checksums);
+        let mut reports = Vec::new();
+        for checksum in pending.drain(..) {
+            if checksum.tick >= self.current_tick {
+                self.pending_checksums.push(checksum);
+                continue;
+            }
+            if let Some(report) = self.desync_report(game, &checksum) {
+                reports.push(report);
+            }
+        }
+        reports
+    }
+
     /// Compares a peer checksum with local state and returns a full desync report on mismatch.
     #[must_use]
     pub fn desync_report(
@@ -2056,8 +2088,9 @@ impl NetworkLockstep {
         game: &TwoPlayerGame,
         remote: &GameChecksum,
     ) -> Option<DesyncReport> {
-        let local_checksum = game.deterministic_checksum();
-        let local_event_count = game.event_log().len() as u64;
+        let local = self.checksum_state_for(remote.tick, game)?;
+        let local_checksum = local.checksum;
+        let local_event_count = local.event_count;
         if remote.checksum == local_checksum && remote.event_count == local_event_count {
             return None;
         }
@@ -2096,7 +2129,28 @@ impl NetworkLockstep {
         }
     }
 
+    fn checksum_state_for(&self, tick: u64, game: &TwoPlayerGame) -> Option<ChecksumState> {
+        if tick >= self.current_tick {
+            return None;
+        }
+        self.checksum_history.get(&tick).copied().or_else(|| {
+            (tick == self.current_tick.saturating_sub(1)).then(|| ChecksumState::from(game))
+        })
+    }
+
+    fn record_checksum_state(&mut self, tick: u64, game: &TwoPlayerGame) {
+        self.checksum_history
+            .insert(tick, ChecksumState::from(game));
+        while self.checksum_history.len() > CHECKSUM_HISTORY_TICKS {
+            let Some(oldest) = self.checksum_history.keys().next().copied() else {
+                break;
+            };
+            self.checksum_history.remove(&oldest);
+        }
+    }
+
     fn advance_one(&mut self, game: &mut TwoPlayerGame) -> Result<(), LockstepError> {
+        let completed_tick = self.current_tick;
         let inputs = self.inputs.remove(&self.current_tick).unwrap_or_default();
         for command in inputs.player_one {
             apply_input_command(game, PlayerSlot::One, command)?;
@@ -2106,8 +2160,24 @@ impl NetworkLockstep {
         }
         let _ = game.tick_player(PlayerId::One, NETWORK_TICK_MS);
         let _ = game.tick_player(PlayerId::Two, NETWORK_TICK_MS);
+        self.record_checksum_state(completed_tick, game);
         self.current_tick += 1;
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChecksumState {
+    checksum: u64,
+    event_count: u64,
+}
+
+impl ChecksumState {
+    fn from(game: &TwoPlayerGame) -> Self {
+        Self {
+            checksum: game.deterministic_checksum(),
+            event_count: game.event_log().len() as u64,
+        }
     }
 }
 
@@ -2227,6 +2297,7 @@ const fn opposite_slot(player: PlayerSlot) -> PlayerSlot {
 mod tests {
     use super::*;
     use battletris_core::rng::GameSeed;
+    use battletris_protocol::derive_player_seeds;
     use std::time::{Duration, Instant};
 
     fn identity(name: &str) -> PlayerIdentity {
@@ -2441,6 +2512,43 @@ mod tests {
     }
 
     #[test]
+    fn runtime_lockstep_peers_play_past_checksum_tick_without_desync() {
+        let (mut host, mut joiner) = connected_lockstep_peers(123);
+
+        for frame in 0..130 {
+            if frame == 7 {
+                send_scheduled_input(&mut host, InputCommand::MoveLeft);
+            }
+            if frame == 11 {
+                send_scheduled_input(&mut joiner, InputCommand::RotateClockwise);
+            }
+            send_tick_watermark(&mut host);
+            send_tick_watermark(&mut joiner);
+            drain_runtime_pair(&mut host, &mut joiner);
+
+            if frame % 13 == 0 {
+                send_checksum(&mut host);
+                send_checksum(&mut joiner);
+                drain_runtime_pair(&mut host, &mut joiner);
+            }
+        }
+
+        send_checksum(&mut host);
+        send_checksum(&mut joiner);
+        drain_runtime_pair(&mut host, &mut joiner);
+
+        assert!(host.lockstep.current_tick() > 100);
+        assert_eq!(host.lockstep.current_tick(), joiner.lockstep.current_tick());
+        assert_eq!(
+            host.game.deterministic_checksum(),
+            joiner.game.deterministic_checksum()
+        );
+
+        host.runtime.shutdown();
+        joiner.runtime.shutdown();
+    }
+
+    #[test]
     fn runtime_cancel_releases_direct_listener_port() {
         let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = reserved.local_addr().unwrap();
@@ -2472,6 +2580,61 @@ mod tests {
 
         host.shutdown();
         std::net::TcpListener::bind(addr).expect("canceled host releases listener port");
+    }
+
+    #[test]
+    fn future_checksum_waits_until_local_tick_is_available() {
+        let mut lockstep = NetworkLockstep::with_input_delay(PlayerSlot::One, 0);
+        let mut game = TwoPlayerGame::new(GameSeed::from_u64(1), GameSeed::from_u64(2));
+        let remote = GameChecksum {
+            reporter: PlayerSlot::Two,
+            tick: 1,
+            checksum: 0,
+            event_count: 0,
+        };
+
+        assert!(lockstep.receive_checksum(&game, remote).is_none());
+        assert!(lockstep.drain_pending_desync_reports(&game).is_empty());
+
+        lockstep.mark_local_watermark(1);
+        lockstep
+            .receive_peer_watermark(TickWatermark {
+                player: PlayerSlot::Two,
+                through_tick: 1,
+            })
+            .unwrap();
+        lockstep.advance_ready(&mut game).unwrap();
+
+        let reports = lockstep.drain_pending_desync_reports(&game);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].tick, 1);
+    }
+
+    #[test]
+    fn late_checksum_uses_retained_tick_history() {
+        let mut lockstep = NetworkLockstep::with_input_delay(PlayerSlot::One, 0);
+        let mut game = TwoPlayerGame::new(GameSeed::from_u64(1), GameSeed::from_u64(2));
+        lockstep.mark_local_watermark(1);
+        lockstep
+            .receive_peer_watermark(TickWatermark {
+                player: PlayerSlot::Two,
+                through_tick: 1,
+            })
+            .unwrap();
+        lockstep.advance_ready(&mut game).unwrap();
+        let old = lockstep.checksum_message(&game);
+
+        let _ = lockstep.schedule_local_input(InputCommand::MoveLeft);
+        lockstep
+            .receive_peer_watermark(TickWatermark {
+                player: PlayerSlot::Two,
+                through_tick: lockstep.current_tick(),
+            })
+            .unwrap();
+        lockstep.advance_ready(&mut game).unwrap();
+
+        assert_ne!(old.checksum, game.deterministic_checksum());
+        assert!(lockstep.receive_checksum(&game, old).is_none());
     }
 
     #[test]
@@ -2512,6 +2675,177 @@ mod tests {
         assert_eq!(report.score_snapshots[0].player, PlayerSlot::One);
         assert_eq!(report.board_snapshots[0].player, PlayerSlot::One);
         assert_eq!(report.arsenal_snapshots[1].player, PlayerSlot::Two);
+    }
+
+    struct LockstepPeer {
+        runtime: NetworkRuntime,
+        lockstep: NetworkLockstep,
+        game: TwoPlayerGame,
+    }
+
+    fn connected_lockstep_peers(seed: u64) -> (LockstepPeer, LockstepPeer) {
+        let mut host = NetworkRuntime::start();
+        let mut joiner = NetworkRuntime::start();
+
+        send_runtime_command(
+            &mut host,
+            NetworkCommand::Host {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                identity: identity("Ada"),
+            },
+        );
+        let listen = wait_for_event(host.channels_mut(), |event| match event {
+            NetworkEvent::Listening { share_addr, .. } => Some(share_addr),
+            _ => None,
+        });
+
+        send_runtime_command(
+            &mut joiner,
+            NetworkCommand::Join {
+                peer_addr: listen,
+                identity: identity("Ben"),
+                challenge_text: "battle?".to_string(),
+            },
+        );
+        let _challenge = wait_for_event(host.channels_mut(), |event| match event {
+            NetworkEvent::IncomingChallenge { challenge } => Some(challenge),
+            _ => None,
+        });
+        send_runtime_command(
+            &mut host,
+            NetworkCommand::Accept {
+                seed,
+                ranked: false,
+            },
+        );
+
+        let host_session = wait_for_connected(host.channels_mut());
+        let join_session = wait_for_connected(joiner.channels_mut());
+        let (player_one_seed, player_two_seed) = derive_player_seeds(seed);
+
+        (
+            LockstepPeer {
+                runtime: host,
+                lockstep: NetworkLockstep::new(host_session.local_slot),
+                game: TwoPlayerGame::new(
+                    GameSeed::from_u64(player_one_seed),
+                    GameSeed::from_u64(player_two_seed),
+                ),
+            },
+            LockstepPeer {
+                runtime: joiner,
+                lockstep: NetworkLockstep::new(join_session.local_slot),
+                game: TwoPlayerGame::new(
+                    GameSeed::from_u64(player_one_seed),
+                    GameSeed::from_u64(player_two_seed),
+                ),
+            },
+        )
+    }
+
+    fn send_scheduled_input(peer: &mut LockstepPeer, command: InputCommand) {
+        let input = peer.lockstep.schedule_local_input(command);
+        send_runtime_command(&mut peer.runtime, NetworkCommand::SendScheduledInput(input));
+    }
+
+    fn send_tick_watermark(peer: &mut LockstepPeer) {
+        let watermark = peer
+            .lockstep
+            .mark_local_watermark(peer.lockstep.current_tick());
+        send_runtime_command(
+            &mut peer.runtime,
+            NetworkCommand::SendTickWatermark(watermark),
+        );
+    }
+
+    fn send_checksum(peer: &mut LockstepPeer) {
+        send_runtime_command(
+            &mut peer.runtime,
+            NetworkCommand::SendChecksum(peer.lockstep.checksum_message(&peer.game)),
+        );
+    }
+
+    fn send_runtime_command(runtime: &mut NetworkRuntime, command: NetworkCommand) {
+        runtime
+            .channels_mut()
+            .command_sender()
+            .try_send(command)
+            .expect("runtime command is queued");
+    }
+
+    fn drain_runtime_pair(host: &mut LockstepPeer, joiner: &mut LockstepPeer) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut idle_polls = 0;
+        while idle_polls < 4 {
+            assert!(Instant::now() < deadline, "timed out draining runtime pair");
+            let mut progressed = false;
+            progressed |= pump_peer_events(host);
+            progressed |= pump_peer_events(joiner);
+            progressed |= advance_peer(host);
+            progressed |= advance_peer(joiner);
+
+            if progressed {
+                idle_polls = 0;
+            } else {
+                idle_polls += 1;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    fn pump_peer_events(peer: &mut LockstepPeer) -> bool {
+        let mut progressed = false;
+        loop {
+            match peer.runtime.channels_mut().try_recv_event() {
+                Ok(event) => {
+                    progressed = true;
+                    apply_peer_event(peer, event);
+                }
+                Err(mpsc::error::TryRecvError::Empty) => return progressed,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("network event channel closed")
+                }
+            }
+        }
+    }
+
+    fn apply_peer_event(peer: &mut LockstepPeer, event: NetworkEvent) {
+        match event {
+            NetworkEvent::InputReceived(input) => {
+                peer.lockstep.receive_remote_input(input).unwrap();
+            }
+            NetworkEvent::TickWatermark(watermark) => {
+                peer.lockstep.receive_peer_watermark(watermark).unwrap();
+            }
+            NetworkEvent::Heartbeat(heartbeat) => {
+                peer.lockstep
+                    .receive_peer_watermark(TickWatermark {
+                        player: heartbeat.player,
+                        through_tick: heartbeat.watermark_tick,
+                    })
+                    .unwrap();
+            }
+            NetworkEvent::Checksum(checksum) => {
+                assert!(
+                    peer.lockstep
+                        .receive_checksum(&peer.game, checksum)
+                        .is_none(),
+                    "peer checksum should not desync"
+                );
+            }
+            NetworkEvent::StateChanged(NetworkLifecycleState::Connected { .. })
+            | NetworkEvent::Connected { .. } => {}
+            NetworkEvent::StateChanged(state) => panic!("unexpected network state: {state:?}"),
+            NetworkEvent::Error { message } => panic!("network error: {message}"),
+            other => panic!("unexpected network event: {other:?}"),
+        }
+    }
+
+    fn advance_peer(peer: &mut LockstepPeer) -> bool {
+        let advanced = peer.lockstep.advance_ready(&mut peer.game).unwrap() > 0;
+        let reports = peer.lockstep.drain_pending_desync_reports(&peer.game);
+        assert!(reports.is_empty(), "unexpected desync reports: {reports:?}");
+        advanced
     }
 
     fn wait_for_connected(channels: &mut NetworkChannels) -> NetworkSession {

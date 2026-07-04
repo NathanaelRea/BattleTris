@@ -117,6 +117,10 @@ Current release expectations:
 The client follows ADR 0005 and uses
 `directories::ProjectDirs::from("org", "BattleTris", "BattleTris")`:
 
+Source checkouts may use an existing `settings.toml` in the current working
+directory, client crate directory, or workspace root. Otherwise settings use the
+platform `config_dir()/settings.toml` path shown on the Settings screen.
+
 | Data | Location |
 | --- | --- |
 | Settings | `config_dir()/settings.toml` |

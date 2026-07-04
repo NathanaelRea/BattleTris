@@ -71,7 +71,8 @@ documentation snapshots.
 - Tools: \`bin/battletris-tools${exe_suffix}\`
 
 Packaged assets live in \`assets/\` next to this README. User settings and save
-data use the platform project directories selected in ADR 0005.
+data use the platform project directories selected in ADR 0005. The Settings
+screen shows the active settings path.
 
 ## Direct IP Multiplayer
 

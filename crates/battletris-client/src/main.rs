@@ -31,7 +31,7 @@ use battletris_protocol::{
 };
 use bevy::ecs::system::SystemParam;
 use bevy::image::ImageSampler;
-use bevy::log::{error, info, warn};
+use bevy::log::{debug, error, info, warn};
 use bevy::prelude::*;
 use bevy::render::render_resource::TextureFormat;
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured};
@@ -533,7 +533,7 @@ fn apply_network_game_event(
             Ok(())
         }
         NetworkEvent::Checksum(checksum) => {
-            if let Some(report) = lockstep.desync_report(&local.game, checksum) {
+            if let Some(report) = lockstep.receive_checksum(&local.game, checksum.clone()) {
                 fail_closed_on_desync(local, runtime, state, report);
             }
             return;
@@ -759,7 +759,7 @@ fn reduce_client_network_event(
         }
         NetworkEvent::InputReceived(input) => {
             state.last_input = Some(input.clone());
-            info!(
+            debug!(
                 "network input received player={:?} tick={} commands={}",
                 input.player, input.tick, 1
             );
@@ -769,7 +769,7 @@ fn reduce_client_network_event(
             if let Some(session) = state.connected_session.as_mut() {
                 session.peer_watermark = Some(watermark.through_tick);
             }
-            info!(
+            debug!(
                 "network tick watermark player={:?} tick={}",
                 watermark.player, watermark.through_tick
             );
@@ -7851,6 +7851,14 @@ fn tick_network_game(
         let previous_phase = clock.network_last_phase.unwrap_or(local.game.phase());
         match lockstep.advance_ready(&mut local.game) {
             Ok(_) => {
+                for report in lockstep.drain_pending_desync_reports(&local.game) {
+                    fail_closed_on_desync(local, network_runtime, network_state, report);
+                }
+                if local.network_failed_closed {
+                    local.network_lockstep = Some(lockstep);
+                    break;
+                }
+
                 if let Some(session) = local.network_session.as_mut() {
                     session.current_tick = lockstep.current_tick();
                     session.peer_watermark = lockstep.peer_watermark();
@@ -7916,7 +7924,7 @@ fn send_network_checksum(
     network_runtime: &mut ClientNetworkRuntime,
     network_state: &mut ClientNetworkState,
 ) {
-    if local.network_failed_closed {
+    if local.network_failed_closed || lockstep.current_tick() == 0 {
         return;
     }
     try_send_network_command(
@@ -10068,6 +10076,40 @@ fn computer_bazaar_line_value(game: &TwoPlayerGame, computer: PlayerId) -> u32 {
 }
 
 fn settings_path() -> Option<PathBuf> {
+    select_settings_path(settings_file_candidates(), project_settings_path())
+}
+
+fn select_settings_path(
+    local_candidates: Vec<PathBuf>,
+    project_path: Option<PathBuf>,
+) -> Option<PathBuf> {
+    local_candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .or(project_path)
+}
+
+fn settings_file_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(current_dir) = std::env::current_dir() {
+        push_settings_candidate(&mut candidates, current_dir.join(SETTINGS_FILE_NAME));
+    }
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    push_settings_candidate(&mut candidates, crate_dir.join(SETTINGS_FILE_NAME));
+    push_settings_candidate(
+        &mut candidates,
+        crate_dir.join("../..").join(SETTINGS_FILE_NAME),
+    );
+    candidates
+}
+
+fn push_settings_candidate(candidates: &mut Vec<PathBuf>, path: PathBuf) {
+    if !candidates.iter().any(|candidate| candidate == &path) {
+        candidates.push(path);
+    }
+}
+
+fn project_settings_path() -> Option<PathBuf> {
     ProjectDirs::from("org", "BattleTris", "BattleTris")
         .map(|dirs| dirs.config_dir().join(SETTINGS_FILE_NAME))
 }
@@ -11188,6 +11230,77 @@ mod tests {
     }
 
     #[test]
+    fn client_network_tick_loop_runs_past_checksum_tick_without_desync() {
+        let mut host = TestClientPeer::new("Ada");
+        let mut joiner = TestClientPeer::new("Ben");
+        connect_test_client_peers(&mut host, &mut joiner, 123);
+
+        for frame in 0..260 {
+            pump_test_client_pair(&mut host, &mut joiner);
+            if frame == 7 {
+                schedule_network_input(
+                    &mut host.local,
+                    &mut host.runtime,
+                    &mut host.state,
+                    InputCommand::MoveLeft,
+                );
+            }
+            if frame == 11 {
+                schedule_network_input(
+                    &mut joiner.local,
+                    &mut joiner.runtime,
+                    &mut joiner.state,
+                    InputCommand::RotateClockwise,
+                );
+            }
+
+            tick_test_client_peer(&mut host);
+            tick_test_client_peer(&mut joiner);
+            pump_test_client_pair(&mut host, &mut joiner);
+
+            assert!(
+                !host.local.network_failed_closed,
+                "host failed closed at frame {frame}: status={:?} error={:?}",
+                host.local.status_message, host.state.last_error
+            );
+            assert!(
+                !joiner.local.network_failed_closed,
+                "joiner failed closed at frame {frame}: status={:?} error={:?}",
+                joiner.local.status_message, joiner.state.last_error
+            );
+            assert!(
+                host.state.last_error.is_none(),
+                "host: {:?}",
+                host.state.last_error
+            );
+            assert!(
+                joiner.state.last_error.is_none(),
+                "joiner: {:?}",
+                joiner.state.last_error
+            );
+        }
+
+        catch_up_test_client_pair(&mut host, &mut joiner);
+
+        let host_tick = host.local.network_lockstep.as_ref().unwrap().current_tick();
+        let joiner_tick = joiner
+            .local
+            .network_lockstep
+            .as_ref()
+            .unwrap()
+            .current_tick();
+        assert!(host_tick > 100, "host tick only reached {host_tick}");
+        assert_eq!(host_tick, joiner_tick);
+        assert_eq!(
+            host.local.game.deterministic_checksum(),
+            joiner.local.game.deterministic_checksum()
+        );
+
+        host.shutdown();
+        joiner.shutdown();
+    }
+
+    #[test]
     fn network_weapon_slot_labels_map_to_protocol_indices() {
         assert_eq!(slot_label_to_index(1), 0);
         assert_eq!(slot_label_to_index(9), 8);
@@ -11756,6 +11869,26 @@ mod tests {
     }
 
     #[test]
+    fn settings_path_uses_existing_source_local_file_before_project_path() {
+        let root =
+            std::env::temp_dir().join(format!("battletris-settings-path-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("temp settings path dir is created");
+        let local = root.join(SETTINGS_FILE_NAME);
+        fs::write(&local, "").expect("temp settings file is created");
+
+        assert_eq!(
+            select_settings_path(
+                vec![root.join("missing-settings.toml"), local.clone()],
+                Some(root.join("project-settings.toml")),
+            ),
+            Some(local.clone())
+        );
+
+        let _ = fs::remove_file(local);
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
     fn generated_sound_pack_maps_all_semantic_events() {
         let packs = SoundPacks::load(&assets_dir());
 
@@ -11863,5 +11996,186 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(settings.ernie_level, COMPUTER_DIFFICULTIES.len() - 1);
+    }
+
+    struct TestClientPeer {
+        runtime: ClientNetworkRuntime,
+        state: ClientNetworkState,
+        local: LocalGame,
+        clock: ClientTickClock,
+        settings: ClientSettings,
+    }
+
+    impl TestClientPeer {
+        fn new(display_name: &str) -> Self {
+            Self {
+                runtime: ClientNetworkRuntime::default(),
+                state: ClientNetworkState::default(),
+                local: LocalGame::new_human_vs_human(),
+                clock: ClientTickClock::default(),
+                settings: ClientSettings {
+                    screen: ClientScreen::Challenge,
+                    display_name: display_name.to_string(),
+                    settings_path: None,
+                    ..Default::default()
+                },
+            }
+        }
+
+        fn shutdown(self) {
+            self.runtime.runtime.shutdown();
+        }
+    }
+
+    fn connect_test_client_peers(
+        host: &mut TestClientPeer,
+        joiner: &mut TestClientPeer,
+        seed: u64,
+    ) {
+        try_send_network_command(
+            &mut host.runtime,
+            &mut host.state,
+            NetworkCommand::Host {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                identity: direct_identity(&host.settings),
+            },
+        );
+        wait_for_test_client_pair(host, joiner, |host, _| {
+            host.state.listening_share_addr.is_some()
+        });
+        let peer_addr = host.state.listening_share_addr.unwrap();
+
+        try_send_network_command(
+            &mut joiner.runtime,
+            &mut joiner.state,
+            NetworkCommand::Join {
+                peer_addr,
+                identity: direct_identity(&joiner.settings),
+                challenge_text: "battle?".to_string(),
+            },
+        );
+        wait_for_test_client_pair(host, joiner, |host, _| {
+            host.state.pending_challenge.is_some()
+        });
+
+        try_send_network_command(
+            &mut host.runtime,
+            &mut host.state,
+            NetworkCommand::Accept {
+                seed,
+                ranked: false,
+            },
+        );
+        wait_for_test_client_pair(host, joiner, |host, joiner| {
+            host.local.is_networked() && joiner.local.is_networked()
+        });
+    }
+
+    fn tick_test_client_peer(peer: &mut TestClientPeer) {
+        peer.clock.gameplay_elapsed_ms = peer
+            .clock
+            .gameplay_elapsed_ms
+            .saturating_add(CLIENT_FIXED_TICK_MS);
+        peer.clock.network_checksum_elapsed_ms =
+            NETWORK_CHECKSUM_INTERVAL_MS - CLIENT_FIXED_TICK_MS;
+        tick_network_game(
+            &mut peer.local,
+            &mut peer.clock,
+            &mut peer.runtime,
+            &mut peer.state,
+            &peer.settings,
+        );
+    }
+
+    fn wait_for_test_client_pair(
+        host: &mut TestClientPeer,
+        joiner: &mut TestClientPeer,
+        mut predicate: impl FnMut(&TestClientPeer, &TestClientPeer) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !predicate(host, joiner) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for test client pair"
+            );
+            pump_test_client_pair(host, joiner);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn pump_test_client_pair(host: &mut TestClientPeer, joiner: &mut TestClientPeer) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut idle_polls = 0;
+        while idle_polls < 4 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out pumping test client pair"
+            );
+            let host_progress = pump_test_client_peer(host);
+            let joiner_progress = pump_test_client_peer(joiner);
+            if host_progress || joiner_progress {
+                idle_polls = 0;
+            } else {
+                idle_polls += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+
+    fn pump_test_client_peer(peer: &mut TestClientPeer) -> bool {
+        let mut progressed = false;
+        loop {
+            match peer.runtime.runtime.channels_mut().try_recv_event() {
+                Ok(event) => {
+                    progressed = true;
+                    apply_network_game_event(
+                        &mut peer.local,
+                        &mut peer.runtime,
+                        &mut peer.state,
+                        &event,
+                    );
+                    let network_game_ended = matches!(
+                        &event,
+                        NetworkEvent::StateChanged(NetworkLifecycleState::Idle)
+                            | NetworkEvent::Error { .. }
+                    ) && peer.local.is_networked();
+                    if let Some(session) = reduce_client_network_event(&mut peer.state, event) {
+                        peer.local = LocalGame::new_networked(session);
+                        peer.settings.screen = ClientScreen::Game;
+                        peer.clock = ClientTickClock::default();
+                    } else if network_game_ended {
+                        peer.local.network_session = None;
+                        peer.local.network_lockstep = None;
+                        peer.local.network_failed_closed = true;
+                        peer.settings.screen = ClientScreen::Challenge;
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => return progressed,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("network event channel closed")
+                }
+            }
+        }
+    }
+
+    fn catch_up_test_client_pair(host: &mut TestClientPeer, joiner: &mut TestClientPeer) {
+        for _ in 0..20 {
+            pump_test_client_pair(host, joiner);
+            let host_tick = host.local.network_lockstep.as_ref().unwrap().current_tick();
+            let joiner_tick = joiner
+                .local
+                .network_lockstep
+                .as_ref()
+                .unwrap()
+                .current_tick();
+            if host_tick == joiner_tick {
+                return;
+            }
+            if host_tick < joiner_tick {
+                tick_test_client_peer(host);
+            } else {
+                tick_test_client_peer(joiner);
+            }
+        }
     }
 }
