@@ -3,10 +3,22 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   rust:
     name: Rust workspace
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -21,6 +33,9 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
       - name: Install Linux native dependencies
         if: runner.os == 'Linux'
         shell: bash
@@ -28,12 +43,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y pkg-config libasound2-dev
 
+      - name: Fetch locked dependencies
+        shell: bash
+        run: cargo fetch --locked
+
       - name: Run full check
         shell: bash
         run: ./scripts/full-check.sh
 
   package-smoke:
     name: Package smoke
+    timeout-minutes: 45
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -42,11 +62,18 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
       - name: Install Linux native dependencies
         shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y pkg-config libasound2-dev
+
+      - name: Fetch locked dependencies
+        shell: bash
+        run: cargo fetch --locked
 
       - name: Run package check
         shell: bash
