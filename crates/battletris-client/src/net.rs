@@ -1870,6 +1870,7 @@ pub struct NetworkLockstep {
     input_delay_ticks: u64,
     current_tick: u64,
     local_watermark: u64,
+    advertised_local_watermark: Option<u64>,
     peer_watermark: Option<u64>,
     latest_local_input: Option<PlayerInput>,
     latest_remote_input: Option<PlayerInput>,
@@ -1894,6 +1895,7 @@ impl NetworkLockstep {
             input_delay_ticks,
             current_tick: 0,
             local_watermark: 0,
+            advertised_local_watermark: None,
             peer_watermark: None,
             latest_local_input: None,
             latest_remote_input: None,
@@ -1933,22 +1935,31 @@ impl NetworkLockstep {
         self.latest_remote_input.as_ref()
     }
 
-    /// Schedules a local input at `current_tick + input_delay_ticks` and returns the wire message.
+    /// Schedules a local input after the configured delay and returns the wire message.
     pub fn schedule_local_input(&mut self, command: InputCommand) -> PlayerInput {
+        let mut tick = self.current_tick.saturating_add(self.input_delay_ticks);
+        if let Some(advertised) = self.advertised_local_watermark {
+            tick = tick.max(advertised.saturating_add(1));
+        }
         let input = PlayerInput {
             player: self.local_slot,
-            tick: self.current_tick.saturating_add(self.input_delay_ticks),
+            tick,
             command,
         };
         self.insert_input(input.clone());
         self.latest_local_input = Some(input.clone());
-        self.local_watermark = self.local_watermark.max(input.tick);
         input
     }
 
     /// Records that all local inputs through `through_tick` have been sent.
     pub fn mark_local_watermark(&mut self, through_tick: u64) -> TickWatermark {
         self.local_watermark = self.local_watermark.max(through_tick);
+        self.advertised_local_watermark = Some(
+            self.advertised_local_watermark
+                .map_or(self.local_watermark, |advertised| {
+                    advertised.max(self.local_watermark)
+                }),
+        );
         TickWatermark {
             player: self.local_slot,
             through_tick: self.local_watermark,
@@ -2583,6 +2594,25 @@ mod tests {
     }
 
     #[test]
+    fn stalled_sender_does_not_reuse_tick_after_peer_advances() {
+        let mut sender = NetworkLockstep::with_input_delay(PlayerSlot::One, 2);
+        let mut receiver = NetworkLockstep::with_input_delay(PlayerSlot::Two, 2);
+        let mut receiver_game = TwoPlayerGame::new(GameSeed::from_u64(1), GameSeed::from_u64(2));
+
+        let first = sender.schedule_local_input(InputCommand::MoveLeft);
+        let sender_watermark = sender.mark_local_watermark(sender.current_tick());
+        receiver.receive_remote_input(first).unwrap();
+        receiver.receive_peer_watermark(sender_watermark).unwrap();
+        receiver.mark_local_watermark(2);
+        receiver.advance_ready(&mut receiver_game).unwrap();
+
+        let second = sender.schedule_local_input(InputCommand::MoveRight);
+        receiver
+            .receive_remote_input(second)
+            .expect("stalled sender input should not target an already simulated tick");
+    }
+
+    #[test]
     fn future_checksum_waits_until_local_tick_is_available() {
         let mut lockstep = NetworkLockstep::with_input_delay(PlayerSlot::One, 0);
         let mut game = TwoPlayerGame::new(GameSeed::from_u64(1), GameSeed::from_u64(2));
@@ -2625,6 +2655,7 @@ mod tests {
         let old = lockstep.checksum_message(&game);
 
         let _ = lockstep.schedule_local_input(InputCommand::MoveLeft);
+        lockstep.mark_local_watermark(lockstep.current_tick());
         lockstep
             .receive_peer_watermark(TickWatermark {
                 player: PlayerSlot::Two,
@@ -2648,6 +2679,7 @@ mod tests {
             command: InputCommand::MoveRight,
         };
         lockstep.receive_remote_input(remote.clone()).unwrap();
+        lockstep.mark_local_watermark(local.tick);
         lockstep
             .receive_peer_watermark(TickWatermark {
                 player: PlayerSlot::Two,
