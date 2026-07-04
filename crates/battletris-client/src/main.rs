@@ -8867,10 +8867,8 @@ fn update_screen_visibility(
 
 fn player_view_visible(local: &LocalGame, recon: &ReconPanel, player: PlayerId) -> bool {
     player == local.local_player
-        || local.computer.is_none()
-        || (local.computer.is_some() && player == opponent_player(local.local_player))
-        || recon.manual_condor
-        || recon.snapshot.is_some()
+        || (player == opponent_player(local.local_player)
+            && (local.computer.is_some() || recon.snapshot.is_some()))
 }
 
 fn update_menu_button_visuals(
@@ -9271,8 +9269,8 @@ fn render_cell_sprite(
     y: usize,
     theme: &LoadedTheme,
 ) -> RenderedCellSprite {
-    if player != local.local_player && local.computer.is_some() {
-        if recon.manual_condor {
+    if player != local.local_player {
+        if local.computer.is_some() && recon.manual_condor {
             return local
                 .game
                 .player(player)
@@ -12125,6 +12123,40 @@ mod tests {
 
         recon.manual_condor = true;
         assert!(player_view_visible(&local, &recon, PlayerId::Two));
+    }
+
+    #[test]
+    fn human_opponent_frame_is_hidden_without_recon() {
+        let coord = Coord::new(0, BOARD_HEIGHT - 1).expect("fixture coordinate in bounds");
+        let mut opponent_board = Board::empty();
+        opponent_board.set(coord, Some(visible_cell(1)));
+        let local = LocalGame {
+            game: TwoPlayerGame::with_boards(
+                GameSeed::from_u64(1),
+                Board::empty(),
+                GameSeed::from_u64(2),
+                opponent_board,
+            ),
+            computer: None,
+            local_player: PlayerId::One,
+            mode: LocalGameMode::LocalHumanVsHuman,
+            network_session: None,
+            network_lockstep: None,
+            network_failed_closed: false,
+            network_game_over_sent: false,
+            network_result_claim_submitted: false,
+            status_message: None,
+        };
+        let recon = ReconPanel::default();
+        let themes = ThemePacks::load(&assets_dir());
+        let theme = themes.get(ThemeChoice::Original);
+
+        assert!(player_view_visible(&local, &recon, PlayerId::One));
+        assert!(!player_view_visible(&local, &recon, PlayerId::Two));
+        assert_eq!(
+            render_cell_sprite(&local, &recon, PlayerId::Two, coord.x, coord.y, theme).atlas_index,
+            theme.cell_atlas.cells.empty
+        );
     }
 
     #[test]
