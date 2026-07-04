@@ -19,7 +19,7 @@ use crate::{
 };
 use rand::Rng;
 use rand_chacha::ChaCha12Rng;
-use std::collections::VecDeque;
+use std::{collections::VecDeque, fmt::Write as _, hash::Hasher};
 
 /// Legacy default fast-drop interval in milliseconds.
 pub const DEFAULT_FAST_DROP_MS: u64 = 10;
@@ -939,6 +939,37 @@ impl TwoPlayerGame {
         &self.log
     }
 
+    /// Returns a deterministic diagnostic checksum for the whole two-player game.
+    ///
+    /// The checksum is intended for desync detection and reporting, not save-game
+    /// restoration. It covers all gameplay state that is externally observable by
+    /// the current deterministic APIs, including phase, boards, active pieces,
+    /// scores, Bazaar state, arsenals, active effects, and the event log.
+    #[must_use]
+    pub fn deterministic_checksum(&self) -> u64 {
+        let mut text = String::new();
+        let _ = write!(
+            text,
+            "phase={:?};before_pause={:?};bazaar={:?};bazaar_done={:?};incoming={:?};cached={:?};mode={:?};log={:?};p1={};p2={}",
+            self.phase,
+            self.before_pause,
+            self.bazaar,
+            self.bazaar_done,
+            self.incoming_weapons,
+            self.cached_opponent_funds,
+            self.mode,
+            self.log,
+            checksum_piece_loop_text(&self.player_one),
+            checksum_piece_loop_text(&self.player_two),
+        );
+        for (index, session) in self.bazaar_sessions.iter().enumerate() {
+            let _ = write!(text, ";bazaar_session_{index}={session:?}");
+        }
+        let mut hasher = Fnv64::default();
+        hasher.write(text.as_bytes());
+        hasher.finish()
+    }
+
     /// Returns one player's board loop.
     #[must_use]
     pub const fn player(&self, player: PlayerId) -> &PieceLoop {
@@ -1515,6 +1546,47 @@ const fn player_index(player: PlayerId) -> usize {
     match player {
         PlayerId::One => 0,
         PlayerId::Two => 1,
+    }
+}
+
+fn checksum_piece_loop_text(loop_state: &PieceLoop) -> String {
+    format!(
+        "board={:?};active={:?};next={:?};drop={};slide={:?};fast={};fast_scored={};effect_elapsed={};score={};funds={};lines={};arsenal={:?};effects={:?};over={};pending_spawn={};slick={}",
+        loop_state.board.snapshot(),
+        loop_state.active_piece(),
+        loop_state.next_piece_kind_preview(),
+        loop_state.drop_elapsed_ms,
+        loop_state.slide_elapsed_ms,
+        loop_state.fast_drop,
+        loop_state.fast_drop_scored,
+        loop_state.effect_elapsed_ms,
+        loop_state.score(),
+        loop_state.funds(),
+        loop_state.lines(),
+        loop_state.arsenal(),
+        loop_state.active_effects(),
+        loop_state.game_over,
+        loop_state.pending_spawn,
+        loop_state.slick_direction,
+    )
+}
+
+#[derive(Default)]
+struct Fnv64(u64);
+
+impl Hasher for Fnv64 {
+    fn write(&mut self, bytes: &[u8]) {
+        if self.0 == 0 {
+            self.0 = 0xcbf2_9ce4_8422_2325;
+        }
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
     }
 }
 

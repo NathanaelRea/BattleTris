@@ -83,12 +83,38 @@ tools_binary="$package_dir/bin/battletris-tools"
 if [[ ! -x "$tools_binary" && -x "$package_dir/bin/battletris-tools.exe" ]]; then
     tools_binary="$package_dir/bin/battletris-tools.exe"
 fi
+server_binary="$package_dir/bin/battletris-server"
+if [[ ! -x "$server_binary" && -x "$package_dir/bin/battletris-server.exe" ]]; then
+    server_binary="$package_dir/bin/battletris-server.exe"
+fi
 if [[ -x "$tools_binary" ]]; then
     for theme in original high-contrast; do
         "$tools_binary" validate-theme "$package_dir/assets/themes/$theme"
     done
+    "$tools_binary" net-smoke --help >/dev/null
+    "$tools_binary" net-smoke direct-loopback
 else
     printf 'packaged tools binary is not executable; skipping decoded theme validation\n' >&2
+fi
+
+if [[ -x "$server_binary" && -x "$tools_binary" ]]; then
+    "$server_binary" --help >/dev/null
+    smoke_port=$((44040 + RANDOM % 1000))
+    smoke_db="$scratch/package-smoke.db"
+    "$server_binary" --listen "127.0.0.1:$smoke_port" --db "$smoke_db" --community package-smoke --seed 900 >"$scratch/server.out" 2>"$scratch/server.err" &
+    server_pid=$!
+    cleanup_server() {
+        if kill -0 "$server_pid" 2>/dev/null; then
+            kill "$server_pid" 2>/dev/null || true
+            wait "$server_pid" 2>/dev/null || true
+        fi
+    }
+    trap 'cleanup_server; rm -rf "$scratch"' EXIT
+    sleep 1
+    "$tools_binary" net-smoke hosted-lobby --server "127.0.0.1:$smoke_port"
+    cleanup_server
+else
+    printf 'packaged server/tools binaries are not executable; skipping networking package smoke\n' >&2
 fi
 
 binary_count=0

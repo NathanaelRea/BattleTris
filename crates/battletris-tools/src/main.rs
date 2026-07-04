@@ -7,6 +7,8 @@ use image::{imageops::FilterType, Rgba, RgbaImage};
 use std::{env, fs, io::Write, path::Path};
 use toml::Value;
 
+mod net_smoke;
+
 fn main() {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
@@ -33,6 +35,7 @@ fn main() {
             let sound_dir = Path::new(&sound_dir);
             validate_sound_pack(sound_dir, !is_overlay_sound_pack(sound_dir));
         }
+        Some("net-smoke") => net_smoke::run(args.collect()),
         Some("generate-assets") => {
             let assets_dir = args.next().unwrap_or_else(|| "assets".to_string());
             let assets_dir = Path::new(&assets_dir);
@@ -41,7 +44,7 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage: tools generate-assets [assets-dir]\n       tools generate-theme-assets [assets-dir]\n       tools generate-sound-pack [assets-dir]\n       tools validate-theme <theme-dir>\n       tools validate-sound-pack <sound-pack-dir>"
+                "usage: tools generate-assets [assets-dir]\n       tools generate-theme-assets [assets-dir]\n       tools generate-sound-pack [assets-dir]\n       tools validate-theme <theme-dir>\n       tools validate-sound-pack <sound-pack-dir>\n       tools net-smoke --help"
             );
         }
     }

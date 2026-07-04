@@ -36,7 +36,10 @@ directories = "6.0.0"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.1.2"
+tokio = { version = "1.52.3", default-features = false, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+mdns-sd = { version = "0.20.1", optional = true, default-features = true }
 
 [features]
-default = []
+default = ["lan-discovery"]
+lan-discovery = ["dep:mdns-sd"]
 wayland = ["bevy/wayland"]

@@ -54,7 +54,7 @@ install_binary battletris-server battletris-server
 install_binary battletris-tools battletris-tools
 
 cp -R assets/. "$package_dir/assets/"
-cp docs/rewrite-spec.md docs/traceability-checklist.md docs/rust-workspace.md docs/distribution.md "$package_dir/docs/"
+cp docs/rewrite-spec.md docs/traceability-checklist.md docs/rust-workspace.md docs/distribution.md docs/manual-network-tests.md "$package_dir/docs/"
 cp Cargo.lock "$package_dir/"
 
 cat >"$package_dir/README.md" <<README
@@ -71,7 +71,62 @@ documentation snapshots.
 - Tools: \`bin/battletris-tools${exe_suffix}\`
 
 Packaged assets live in \`assets/\` next to this README. User settings and save
-data use the platform project directories selected in ADR 0005.
+data use the platform project directories selected in ADR 0005. The Settings
+screen shows the active settings path.
+
+## Direct IP Multiplayer
+
+Manual Direct IP is the required multiplayer path. Gameplay uses direct TCP
+between the two players.
+
+LAN example:
+
+1. Host binds a direct game to \`0.0.0.0:4405\` or another local address.
+2. Host shares a reachable address such as \`192.168.1.23:4405\`.
+3. Host allows inbound TCP on the direct gameplay port in the firewall.
+4. Joiner enters the host share address. Never use \`0.0.0.0\` as a join/share
+   address.
+
+If connecting fails, confirm both clients use the same release, the host is still
+listening, the firewall allows inbound TCP, and the joiner can route to the host
+address. NAT, guest Wi-Fi isolation, and VPN routing can block direct play.
+
+Support checklist:
+
+1. \`Host bind failed: address already in use\` means another host is using the
+   port. Cancel the old host or choose another port.
+2. \`Join timed out\` means the joiner could not complete the direct TCP path.
+   Recheck the host share address, firewall, and routing.
+3. Do not join \`0.0.0.0\` or \`127.0.0.1\` from another machine. Use the host LAN
+   IP, for example \`192.168.1.23:4405\`.
+
+## Self-Hosted Lobby
+
+An operator can run a small community lobby with:
+
+\`bin/battletris-server${exe_suffix} --listen 0.0.0.0:4404 --community garage\`
+
+Clients set Lobby Address to the server's reachable address, for example
+\`192.168.1.10:4404\`. Hosted games still require the host direct gameplay share
+address to be reachable by the joiner. The lobby issues session metadata and
+ranked-result authority; it does not relay gameplay frames.
+
+If the lobby is unavailable, Direct IP can still be used. A hosted game cannot
+start unless the lobby is reachable and the host's direct share address is also
+reachable by the joiner.
+
+Ranked hosted results require a server-issued session and matching Result Claims
+from both participants. This is not anti-cheat and does not protect against
+colluding modified clients.
+
+## Limitations
+
+There is no NAT traversal, internet relay, authoritative tick server, or
+anti-cheat. LAN discovery is best effort; manual Direct IP remains supported when
+discovery fails.
+
+More detail is in \`docs/distribution.md\`. Manual release-candidate multiplayer
+checks are in \`docs/manual-network-tests.md\`.
 README
 
 cat >"$package_dir/release-manifest.toml" <<MANIFEST
