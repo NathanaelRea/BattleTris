@@ -2755,8 +2755,7 @@ fn parse_hex_color(value: &str, manifest_path: &std::path::Path) -> Color {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum ControlScheme {
-    ModernSplit,
-    LegacyInspired,
+    Original,
 }
 
 #[derive(Resource, Debug, Clone)]
@@ -2788,7 +2787,7 @@ impl Default for ClientSettings {
             content_mode: ContentMode::Normal,
             theme: ThemeChoice::Original,
             sound_pack: SoundPackChoice::GeneratedDefault,
-            controls: ControlScheme::ModernSplit,
+            controls: ControlScheme::Original,
             pixel_scale: 1.0,
             ernie_level: DEFAULT_ERNIE_LEVEL,
             challenge_mode: ChallengeMode::ComputerOpponent,
@@ -2915,7 +2914,7 @@ impl Default for PersistedClientSettings {
         Self {
             theme: ThemeChoice::Original,
             sound_pack: SoundPackChoice::GeneratedDefault,
-            controls: ControlScheme::ModernSplit,
+            controls: ControlScheme::Original,
             pixel_scale: 1.0,
             ernie_level: DEFAULT_ERNIE_LEVEL,
             display_name: default_display_name(),
@@ -3053,9 +3052,6 @@ fn apply_visual_fixture_state(
     settings.direct_listen_addr = "127.0.0.1:4405".to_string();
     settings.lobby_addr = DEFAULT_LOBBY_ADDR.to_string();
 
-    if fixture == VisualFixture::Settings {
-        settings.controls = ControlScheme::LegacyInspired;
-    }
     if fixture == VisualFixture::Challenge {
         settings.ernie_level = 0;
     }
@@ -7374,13 +7370,6 @@ fn handle_settings_input(
         };
         queue_sound(sound, SoundEvent::MenuAction);
     }
-    if typed_character.is_none() && keys.just_pressed(KeyCode::KeyM) {
-        settings.controls = match settings.controls {
-            ControlScheme::ModernSplit => ControlScheme::LegacyInspired,
-            ControlScheme::LegacyInspired => ControlScheme::ModernSplit,
-        };
-        queue_sound(sound, SoundEvent::MenuAction);
-    }
     if keys.just_pressed(KeyCode::Equal) {
         settings.pixel_scale = sanitize_pixel_scale(settings.pixel_scale + 0.25).min(2.0);
         queue_sound(sound, SoundEvent::MenuAction);
@@ -7712,36 +7701,13 @@ struct PlayerControls {
     fast_drop: KeyCode,
 }
 
-fn controls_for(player: PlayerId, scheme: ControlScheme) -> PlayerControls {
-    match (scheme, player) {
-        (ControlScheme::ModernSplit, PlayerId::One) => PlayerControls {
-            left: KeyCode::ArrowLeft,
-            right: KeyCode::ArrowRight,
-            rotate_cw: KeyCode::ArrowUp,
-            rotate_ccw: KeyCode::Slash,
-            fast_drop: KeyCode::ArrowDown,
-        },
-        (ControlScheme::ModernSplit, PlayerId::Two) => PlayerControls {
-            left: KeyCode::KeyA,
-            right: KeyCode::KeyD,
-            rotate_cw: KeyCode::KeyW,
-            rotate_ccw: KeyCode::KeyQ,
-            fast_drop: KeyCode::KeyS,
-        },
-        (ControlScheme::LegacyInspired, PlayerId::One) => PlayerControls {
-            left: KeyCode::KeyJ,
-            right: KeyCode::KeyL,
-            rotate_cw: KeyCode::KeyK,
-            rotate_ccw: KeyCode::KeyI,
-            fast_drop: KeyCode::Space,
-        },
-        (ControlScheme::LegacyInspired, PlayerId::Two) => PlayerControls {
-            left: KeyCode::KeyA,
-            right: KeyCode::KeyD,
-            rotate_cw: KeyCode::KeyW,
-            rotate_ccw: KeyCode::KeyQ,
-            fast_drop: KeyCode::KeyS,
-        },
+fn controls_for(_player: PlayerId, _scheme: ControlScheme) -> PlayerControls {
+    PlayerControls {
+        left: KeyCode::KeyJ,
+        right: KeyCode::KeyL,
+        rotate_cw: KeyCode::KeyK,
+        rotate_ccw: KeyCode::KeyI,
+        fast_drop: KeyCode::Space,
     }
 }
 
@@ -9590,7 +9556,7 @@ fn screen_body_label(
         }
         ClientScreen::Roster => " ".to_string(),
         ClientScreen::Settings => format!(
-            "Theme: {:?}  Sound: {:?}  Controls: {}  Scale: {:.2}x\nHosted ranked preference: {}  Lobby server: {}\n\n{}1 display name: {}\n{}2 community: {}\n{}3 host bind: {}\n{}4 share address: {}\n{}5 join address: {}\n{}6 lobby address: {}\n\nAddress guide:\nHost bind is where this client listens. Use 0.0.0.0:4405 to listen on all local interfaces, or a specific local LAN IP.\nShare address is what another player types and what the lobby advertises. Do not share 0.0.0.0.\nJoin address is the host's share address for Direct IP. Do not join 0.0.0.0 or 127.0.0.1 from another machine. Use the host LAN IP.\nLobby address is the self-hosted community server for presence, hosted sessions, ranked records, and roster records; it does not relay gameplay.\n127.0.0.1 only means this same computer and is useful for local tests.\nSuggested share address: {}\nHost must allow inbound TCP on the direct port. No NAT traversal or gameplay relay exists.\n\nT theme  O sound  M controls  R hosted ranked  -/= scale\nProtocol: v{}.{}\nAssets: {}\nSettings: {}",
+            "Theme: {:?}  Sound: {:?}  Controls: {}  Scale: {:.2}x\nHosted ranked preference: {}  Lobby server: {}\n\n{}1 display name: {}\n{}2 community: {}\n{}3 host bind: {}\n{}4 share address: {}\n{}5 join address: {}\n{}6 lobby address: {}\n\nAddress guide:\nHost bind is where this client listens. Use 0.0.0.0:4405 to listen on all local interfaces, or a specific local LAN IP.\nShare address is what another player types and what the lobby advertises. Do not share 0.0.0.0.\nJoin address is the host's share address for Direct IP. Do not join 0.0.0.0 or 127.0.0.1 from another machine. Use the host LAN IP.\nLobby address is the self-hosted community server for presence, hosted sessions, ranked records, and roster records; it does not relay gameplay.\n127.0.0.1 only means this same computer and is useful for local tests.\nSuggested share address: {}\nHost must allow inbound TCP on the direct port. No NAT traversal or gameplay relay exists.\n\nT theme  O sound  R hosted ranked  -/= scale\nProtocol: v{}.{}\nAssets: {}\nSettings: {}",
             settings.theme,
             settings.sound_pack,
             controls_label(settings.controls),
@@ -10577,11 +10543,8 @@ fn truncate_label(value: &str, max_chars: usize) -> String {
     }
 }
 
-fn controls_label(scheme: ControlScheme) -> &'static str {
-    match scheme {
-        ControlScheme::ModernSplit => "modern split (P1 arrows+/; P2 WASD+Q)",
-        ControlScheme::LegacyInspired => "legacy inspired (P1 J/L/K/I+Space; P2 WASD+Q)",
-    }
+fn controls_label(_scheme: ControlScheme) -> &'static str {
+    "original (J/L/K+Space)"
 }
 
 fn active_effects_label(game: &TwoPlayerGame, player: PlayerId) -> String {
@@ -12094,17 +12057,17 @@ mod tests {
     }
 
     #[test]
-    fn controls_can_switch_between_modern_and_legacy_layouts() {
+    fn controls_use_original_layout() {
         assert_eq!(
-            controls_for(PlayerId::One, ControlScheme::ModernSplit).left,
-            KeyCode::ArrowLeft
-        );
-        assert_eq!(
-            controls_for(PlayerId::One, ControlScheme::LegacyInspired).left,
+            controls_for(PlayerId::One, ControlScheme::Original).left,
             KeyCode::KeyJ
         );
         assert_eq!(
-            controls_for(PlayerId::One, ControlScheme::LegacyInspired).fast_drop,
+            controls_for(PlayerId::Two, ControlScheme::Original).left,
+            KeyCode::KeyJ
+        );
+        assert_eq!(
+            controls_for(PlayerId::One, ControlScheme::Original).fast_drop,
             KeyCode::Space
         );
     }
@@ -12216,7 +12179,7 @@ mod tests {
         let settings = PersistedClientSettings {
             theme: ThemeChoice::HighContrast,
             sound_pack: SoundPackChoice::Muted,
-            controls: ControlScheme::LegacyInspired,
+            controls: ControlScheme::Original,
             pixel_scale: 1.5,
             ernie_level: 12,
             display_name: "Ada".to_string(),
@@ -12233,7 +12196,7 @@ mod tests {
 
         assert_eq!(decoded, settings);
         assert!(encoded.contains("high-contrast"));
-        assert!(encoded.contains("legacy-inspired"));
+        assert!(encoded.contains("original"));
         assert!(encoded.contains("Ada"));
     }
 
