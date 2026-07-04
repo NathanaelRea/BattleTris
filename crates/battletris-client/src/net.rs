@@ -37,6 +37,8 @@ pub const NETWORK_TICK_MS: u64 = 10;
 /// Initial LAN-safe delay for local inputs in deterministic lockstep ticks.
 pub const DEFAULT_INPUT_DELAY_TICKS: u64 = 6;
 const CHECKSUM_HISTORY_TICKS: usize = 2_048;
+const ROLLBACK_HISTORY_TICKS: u64 = 128;
+const ROLLBACK_SNAPSHOT_INTERVAL_TICKS: u64 = 8;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 const CHALLENGE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1874,7 +1876,8 @@ pub struct NetworkLockstep {
     peer_watermark: Option<u64>,
     latest_local_input: Option<PlayerInput>,
     latest_remote_input: Option<PlayerInput>,
-    inputs: BTreeMap<u64, ScheduledInputs>,
+    input_history: BTreeMap<u64, ScheduledInputs>,
+    game_history: BTreeMap<u64, TwoPlayerGame>,
     pending_checksums: Vec<GameChecksum>,
     checksum_history: BTreeMap<u64, ChecksumState>,
 }
@@ -1899,7 +1902,8 @@ impl NetworkLockstep {
             peer_watermark: None,
             latest_local_input: None,
             latest_remote_input: None,
-            inputs: BTreeMap::new(),
+            input_history: BTreeMap::new(),
+            game_history: BTreeMap::new(),
             pending_checksums: Vec::new(),
             checksum_history: BTreeMap::new(),
         }
@@ -1967,7 +1971,11 @@ impl NetworkLockstep {
     }
 
     /// Schedules an input received from the remote peer.
-    pub fn receive_remote_input(&mut self, input: PlayerInput) -> Result<(), LockstepError> {
+    pub fn receive_remote_input(
+        &mut self,
+        game: &mut TwoPlayerGame,
+        input: PlayerInput,
+    ) -> Result<(), LockstepError> {
         if input.player != self.peer_slot {
             return Err(LockstepError::WrongPlayer {
                 expected: self.peer_slot,
@@ -1975,13 +1983,42 @@ impl NetworkLockstep {
             });
         }
         if input.tick < self.current_tick {
-            return Err(LockstepError::LateInput {
-                tick: input.tick,
-                current_tick: self.current_tick,
-            });
+            let tick = input.tick;
+            if tick.saturating_add(ROLLBACK_HISTORY_TICKS) < self.current_tick {
+                return Err(LockstepError::LateInput {
+                    tick,
+                    current_tick: self.current_tick,
+                });
+            }
+            self.latest_remote_input = Some(input.clone());
+            self.insert_input(input);
+            self.rollback_and_replay_from(game, tick)?;
+            return Ok(());
         }
         self.latest_remote_input = Some(input.clone());
         self.insert_input(input);
+        Ok(())
+    }
+
+    fn rollback_and_replay_from(
+        &mut self,
+        game: &mut TwoPlayerGame,
+        tick: u64,
+    ) -> Result<(), LockstepError> {
+        let target_tick = self.current_tick;
+        let Some((&snapshot_tick, snapshot)) = self.game_history.range(..=tick).next_back() else {
+            return Err(LockstepError::LateInput {
+                tick,
+                current_tick: target_tick,
+            });
+        };
+
+        *game = snapshot.clone();
+        self.current_tick = snapshot_tick;
+        self.checksum_history.split_off(&snapshot_tick);
+        while self.current_tick < target_tick {
+            self.advance_one(game)?;
+        }
         Ok(())
     }
 
@@ -2133,7 +2170,7 @@ impl NetworkLockstep {
     }
 
     fn insert_input(&mut self, input: PlayerInput) {
-        let bucket = self.inputs.entry(input.tick).or_default();
+        let bucket = self.input_history.entry(input.tick).or_default();
         match input.player {
             PlayerSlot::One => bucket.player_one.push(input.command),
             PlayerSlot::Two => bucket.player_two.push(input.command),
@@ -2160,9 +2197,46 @@ impl NetworkLockstep {
         }
     }
 
+    fn record_game_state(&mut self, tick: u64, game: &TwoPlayerGame) {
+        if tick.is_multiple_of(ROLLBACK_SNAPSHOT_INTERVAL_TICKS) {
+            self.game_history.insert(tick, game.clone());
+        }
+    }
+
+    fn prune_replay_history(&mut self) {
+        let oldest = self
+            .current_tick
+            .saturating_sub(ROLLBACK_HISTORY_TICKS + ROLLBACK_SNAPSHOT_INTERVAL_TICKS);
+        while self
+            .input_history
+            .first_key_value()
+            .is_some_and(|(tick, _)| *tick < oldest)
+        {
+            let Some(tick) = self.input_history.keys().next().copied() else {
+                break;
+            };
+            self.input_history.remove(&tick);
+        }
+        while self
+            .game_history
+            .first_key_value()
+            .is_some_and(|(tick, _)| *tick < oldest)
+        {
+            let Some(tick) = self.game_history.keys().next().copied() else {
+                break;
+            };
+            self.game_history.remove(&tick);
+        }
+    }
+
     fn advance_one(&mut self, game: &mut TwoPlayerGame) -> Result<(), LockstepError> {
         let completed_tick = self.current_tick;
-        let inputs = self.inputs.remove(&self.current_tick).unwrap_or_default();
+        self.record_game_state(completed_tick, game);
+        let inputs = self
+            .input_history
+            .get(&self.current_tick)
+            .cloned()
+            .unwrap_or_default();
         for command in inputs.player_one {
             apply_input_command(game, PlayerSlot::One, command)?;
         }
@@ -2173,6 +2247,7 @@ impl NetworkLockstep {
         let _ = game.tick_player(PlayerId::Two, NETWORK_TICK_MS);
         self.record_checksum_state(completed_tick, game);
         self.current_tick += 1;
+        self.prune_replay_history();
         Ok(())
     }
 }
@@ -2601,15 +2676,96 @@ mod tests {
 
         let first = sender.schedule_local_input(InputCommand::MoveLeft);
         let sender_watermark = sender.mark_local_watermark(sender.current_tick());
-        receiver.receive_remote_input(first).unwrap();
+        receiver
+            .receive_remote_input(&mut receiver_game, first)
+            .unwrap();
         receiver.receive_peer_watermark(sender_watermark).unwrap();
         receiver.mark_local_watermark(2);
         receiver.advance_ready(&mut receiver_game).unwrap();
 
         let second = sender.schedule_local_input(InputCommand::MoveRight);
         receiver
-            .receive_remote_input(second)
+            .receive_remote_input(&mut receiver_game, second)
             .expect("stalled sender input should not target an already simulated tick");
+    }
+
+    #[test]
+    fn late_remote_input_rolls_back_and_replays_recent_ticks() {
+        let late = PlayerInput {
+            player: PlayerSlot::Two,
+            tick: 1,
+            command: InputCommand::MoveLeft,
+        };
+
+        let mut expected_lockstep = NetworkLockstep::with_input_delay(PlayerSlot::One, 0);
+        let mut expected_game = TwoPlayerGame::new(GameSeed::from_u64(1), GameSeed::from_u64(2));
+        expected_lockstep
+            .receive_remote_input(&mut expected_game, late.clone())
+            .unwrap();
+        expected_lockstep.mark_local_watermark(2);
+        expected_lockstep
+            .receive_peer_watermark(TickWatermark {
+                player: PlayerSlot::Two,
+                through_tick: 2,
+            })
+            .unwrap();
+        expected_lockstep.advance_ready(&mut expected_game).unwrap();
+
+        let mut lockstep = NetworkLockstep::with_input_delay(PlayerSlot::One, 0);
+        let mut game = TwoPlayerGame::new(GameSeed::from_u64(1), GameSeed::from_u64(2));
+        lockstep.mark_local_watermark(2);
+        lockstep
+            .receive_peer_watermark(TickWatermark {
+                player: PlayerSlot::Two,
+                through_tick: 2,
+            })
+            .unwrap();
+        lockstep.advance_ready(&mut game).unwrap();
+        let checksum_without_late_input = game.deterministic_checksum();
+
+        lockstep.receive_remote_input(&mut game, late).unwrap();
+
+        assert_eq!(lockstep.current_tick(), expected_lockstep.current_tick());
+        assert_ne!(checksum_without_late_input, game.deterministic_checksum());
+        assert_eq!(
+            game.deterministic_checksum(),
+            expected_game.deterministic_checksum()
+        );
+        assert_eq!(game.event_log().len(), expected_game.event_log().len());
+    }
+
+    #[test]
+    fn very_old_remote_input_still_fails_closed() {
+        let mut lockstep = NetworkLockstep::with_input_delay(PlayerSlot::One, 0);
+        let mut game = TwoPlayerGame::new(GameSeed::from_u64(1), GameSeed::from_u64(2));
+        let through_tick = ROLLBACK_HISTORY_TICKS + 1;
+        lockstep.mark_local_watermark(through_tick);
+        lockstep
+            .receive_peer_watermark(TickWatermark {
+                player: PlayerSlot::Two,
+                through_tick,
+            })
+            .unwrap();
+        lockstep.advance_ready(&mut game).unwrap();
+
+        let error = lockstep
+            .receive_remote_input(
+                &mut game,
+                PlayerInput {
+                    player: PlayerSlot::Two,
+                    tick: 0,
+                    command: InputCommand::MoveLeft,
+                },
+            )
+            .expect_err("inputs outside rollback history stay fatal");
+
+        assert_eq!(
+            error,
+            LockstepError::LateInput {
+                tick: 0,
+                current_tick: through_tick + 1,
+            }
+        );
     }
 
     #[test]
@@ -2678,7 +2834,9 @@ mod tests {
             tick: local.tick,
             command: InputCommand::MoveRight,
         };
-        lockstep.receive_remote_input(remote.clone()).unwrap();
+        lockstep
+            .receive_remote_input(&mut game, remote.clone())
+            .unwrap();
         lockstep.mark_local_watermark(local.tick);
         lockstep
             .receive_peer_watermark(TickWatermark {
@@ -2844,7 +3002,9 @@ mod tests {
     fn apply_peer_event(peer: &mut LockstepPeer, event: NetworkEvent) {
         match event {
             NetworkEvent::InputReceived(input) => {
-                peer.lockstep.receive_remote_input(input).unwrap();
+                peer.lockstep
+                    .receive_remote_input(&mut peer.game, input)
+                    .unwrap();
             }
             NetworkEvent::TickWatermark(watermark) => {
                 peer.lockstep.receive_peer_watermark(watermark).unwrap();

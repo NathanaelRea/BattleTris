@@ -515,7 +515,9 @@ fn apply_network_game_event(
         return;
     };
     let result = match event {
-        NetworkEvent::InputReceived(input) => lockstep.receive_remote_input(input.clone()),
+        NetworkEvent::InputReceived(input) => {
+            lockstep.receive_remote_input(&mut local.game, input.clone())
+        }
         NetworkEvent::TickWatermark(watermark) => {
             lockstep.receive_peer_watermark(watermark.clone())
         }
