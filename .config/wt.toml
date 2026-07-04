@@ -1,0 +1,2 @@
+[post-start]
+copy-target = "test ! -d {{ primary_worktree_path }}/target || cp -a --reflink=auto {{ primary_worktree_path }}/target ."
