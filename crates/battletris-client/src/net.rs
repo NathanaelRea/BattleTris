@@ -1921,6 +1921,12 @@ impl NetworkLockstep {
         self.local_watermark
     }
 
+    /// Returns the configured deterministic input delay.
+    #[must_use]
+    pub const fn input_delay_ticks(&self) -> u64 {
+        self.input_delay_ticks
+    }
+
     /// Returns the most recent peer watermark, if one has been received.
     #[must_use]
     pub const fn peer_watermark(&self) -> Option<u64> {
@@ -1968,6 +1974,11 @@ impl NetworkLockstep {
             player: self.local_slot,
             through_tick: self.local_watermark,
         }
+    }
+
+    /// Advertises the input-delay horizon as locally complete.
+    pub fn mark_input_delay_watermark(&mut self) -> TickWatermark {
+        self.mark_local_watermark(self.current_tick.saturating_add(self.input_delay_ticks))
     }
 
     /// Schedules an input received from the remote peer.
@@ -2039,11 +2050,23 @@ impl NetworkLockstep {
 
     /// Advances every tick covered by both local and peer watermarks.
     pub fn advance_ready(&mut self, game: &mut TwoPlayerGame) -> Result<u64, LockstepError> {
+        self.advance_ready_limited(game, u64::MAX)
+    }
+
+    /// Advances up to `max_ticks` covered by both local and peer watermarks.
+    pub fn advance_ready_limited(
+        &mut self,
+        game: &mut TwoPlayerGame,
+        max_ticks: u64,
+    ) -> Result<u64, LockstepError> {
         let Some(peer_watermark) = self.peer_watermark else {
             return Ok(0);
         };
         let mut advanced = 0;
-        while self.current_tick <= self.local_watermark && self.current_tick <= peer_watermark {
+        while advanced < max_ticks
+            && self.current_tick <= self.local_watermark
+            && self.current_tick <= peer_watermark
+        {
             self.advance_one(game)?;
             advanced += 1;
         }
@@ -2690,6 +2713,59 @@ mod tests {
     }
 
     #[test]
+    fn input_delay_watermark_advertises_future_safe_ticks() {
+        let mut lockstep = NetworkLockstep::with_input_delay(PlayerSlot::One, 6);
+
+        let first = lockstep.schedule_local_input(InputCommand::MoveLeft);
+        let watermark = lockstep.mark_input_delay_watermark();
+        let second = lockstep.schedule_local_input(InputCommand::MoveRight);
+
+        assert_eq!(first.tick, 6);
+        assert_eq!(watermark.through_tick, 6);
+        assert_eq!(lockstep.local_watermark(), 6);
+        assert_eq!(second.tick, 7);
+    }
+
+    #[test]
+    fn input_delay_watermarks_cover_multiple_ticks_per_exchange() {
+        let mut one = NetworkLockstep::with_input_delay(PlayerSlot::One, 6);
+        let mut two = NetworkLockstep::with_input_delay(PlayerSlot::Two, 6);
+        let mut one_game = TwoPlayerGame::new(GameSeed::from_u64(1), GameSeed::from_u64(2));
+        let mut two_game = TwoPlayerGame::new(GameSeed::from_u64(1), GameSeed::from_u64(2));
+
+        let one_watermark = one.mark_input_delay_watermark();
+        let two_watermark = two.mark_input_delay_watermark();
+        one.receive_peer_watermark(two_watermark).unwrap();
+        two.receive_peer_watermark(one_watermark).unwrap();
+
+        assert_eq!(one.advance_ready(&mut one_game).unwrap(), 7);
+        assert_eq!(two.advance_ready(&mut two_game).unwrap(), 7);
+        assert_eq!(one.current_tick(), 7);
+        assert_eq!(two.current_tick(), 7);
+        assert_eq!(
+            one_game.deterministic_checksum(),
+            two_game.deterministic_checksum()
+        );
+    }
+
+    #[test]
+    fn limited_advance_preserves_wall_clock_pacing() {
+        let mut lockstep = NetworkLockstep::with_input_delay(PlayerSlot::One, 6);
+        let mut game = TwoPlayerGame::new(GameSeed::from_u64(1), GameSeed::from_u64(2));
+
+        lockstep.mark_input_delay_watermark();
+        lockstep
+            .receive_peer_watermark(TickWatermark {
+                player: PlayerSlot::Two,
+                through_tick: 6,
+            })
+            .unwrap();
+
+        assert_eq!(lockstep.advance_ready_limited(&mut game, 1).unwrap(), 1);
+        assert_eq!(lockstep.current_tick(), 1);
+    }
+
+    #[test]
     fn late_remote_input_rolls_back_and_replays_recent_ticks() {
         let late = PlayerInput {
             player: PlayerSlot::Two,
@@ -2939,9 +3015,7 @@ mod tests {
     }
 
     fn send_tick_watermark(peer: &mut LockstepPeer) {
-        let watermark = peer
-            .lockstep
-            .mark_local_watermark(peer.lockstep.current_tick());
+        let watermark = peer.lockstep.mark_input_delay_watermark();
         send_runtime_command(
             &mut peer.runtime,
             NetworkCommand::SendTickWatermark(watermark),

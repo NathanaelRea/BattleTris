@@ -8040,7 +8040,7 @@ fn tick_network_game(
             return;
         };
 
-        let watermark = lockstep.mark_local_watermark(lockstep.current_tick());
+        let watermark = lockstep.mark_input_delay_watermark();
         try_send_network_command(
             network_runtime,
             network_state,
@@ -8061,7 +8061,7 @@ fn tick_network_game(
         }
 
         let previous_phase = clock.network_last_phase.unwrap_or(local.game.phase());
-        match lockstep.advance_ready(&mut local.game) {
+        match lockstep.advance_ready_limited(&mut local.game, 1) {
             Ok(_) => {
                 for report in lockstep.drain_pending_desync_reports(&local.game) {
                     fail_closed_on_desync(local, network_runtime, network_state, report);
@@ -9440,17 +9440,21 @@ fn network_session_status_label(
     let tick = lockstep
         .map(NetworkLockstep::current_tick)
         .unwrap_or(session.current_tick);
+    let local_watermark = lockstep
+        .map(NetworkLockstep::local_watermark)
+        .unwrap_or(session.current_tick);
     let peer_watermark = lockstep
         .and_then(NetworkLockstep::peer_watermark)
         .or(session.peer_watermark)
         .map(|tick| tick.to_string())
         .unwrap_or_else(|| "none".to_string());
     format!(
-        "Network: {mode}  slot {:?}  peer {}\nSeed {}  tick {}  peer watermark {}\nCommunity: {}  ranked: {}  result: {:?}",
+        "Network: {mode}  slot {:?}  peer {}\nSeed {}  tick {}  local watermark {}  peer watermark {}\nCommunity: {}  ranked: {}  result: {:?}",
         session.local_slot,
         session.peer_identity.display_name,
         session.base_seed,
         tick,
+        local_watermark,
         peer_watermark,
         community,
         session.ranked,

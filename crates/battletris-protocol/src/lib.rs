@@ -964,14 +964,15 @@ pub struct DirectConnection {
 impl DirectConnection {
     /// Opens a direct TCP connection to a peer.
     pub async fn connect(addr: SocketAddr) -> Result<Self, ProtocolError> {
-        Ok(Self {
-            stream: TcpStream::connect(addr).await?,
-        })
+        let stream = TcpStream::connect(addr).await?;
+        stream.set_nodelay(true)?;
+        Ok(Self { stream })
     }
 
     /// Wraps an accepted TCP stream.
     #[must_use]
-    pub const fn from_stream(stream: TcpStream) -> Self {
+    pub fn from_stream(stream: TcpStream) -> Self {
+        let _ = stream.set_nodelay(true);
         Self { stream }
     }
 
