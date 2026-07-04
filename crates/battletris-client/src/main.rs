@@ -9443,17 +9443,21 @@ fn network_session_status_label(
     let local_watermark = lockstep
         .map(NetworkLockstep::local_watermark)
         .unwrap_or(session.current_tick);
+    let input_delay = lockstep
+        .map(NetworkLockstep::input_delay_ticks)
+        .unwrap_or_default();
     let peer_watermark = lockstep
         .and_then(NetworkLockstep::peer_watermark)
         .or(session.peer_watermark)
         .map(|tick| tick.to_string())
         .unwrap_or_else(|| "none".to_string());
     format!(
-        "Network: {mode}  slot {:?}  peer {}\nSeed {}  tick {}  local watermark {}  peer watermark {}\nCommunity: {}  ranked: {}  result: {:?}",
+        "Network: {mode}  slot {:?}  peer {}\nSeed {}  tick {}  input delay {}  local watermark {}  peer watermark {}\nCommunity: {}  ranked: {}  result: {:?}",
         session.local_slot,
         session.peer_identity.display_name,
         session.base_seed,
         tick,
+        input_delay,
         local_watermark,
         peer_watermark,
         community,

@@ -34,8 +34,8 @@ use tokio::{
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 128;
 /// Deterministic network tick duration. This matches the existing 10 ms fixed step.
 pub const NETWORK_TICK_MS: u64 = 10;
-/// Initial LAN-safe delay for local inputs in deterministic lockstep ticks.
-pub const DEFAULT_INPUT_DELAY_TICKS: u64 = 6;
+/// Initial low-latency delay for local inputs in deterministic lockstep ticks.
+pub const DEFAULT_INPUT_DELAY_TICKS: u64 = 3;
 const CHECKSUM_HISTORY_TICKS: usize = 2_048;
 const ROLLBACK_HISTORY_TICKS: u64 = 128;
 const ROLLBACK_SNAPSHOT_INTERVAL_TICKS: u64 = 8;
