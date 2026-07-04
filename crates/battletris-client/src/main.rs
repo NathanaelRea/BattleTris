@@ -54,6 +54,7 @@ use tokio::sync::mpsc;
 const SMOKE_SCREENSHOT_CAPTURE_DELAY_FRAMES: u16 = 30;
 const SMOKE_SCREENSHOT_TIMEOUT_FRAMES: u16 = 300;
 const SETTINGS_FILE_NAME: &str = "settings.toml";
+const DEFAULT_LOBBY_ADDR: &str = "127.0.0.1:4404";
 const CLIENT_FIXED_TICK_MS: u64 = 10;
 const NETWORK_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
 const NETWORK_CHECKSUM_INTERVAL_MS: u64 = 5_000;
@@ -94,6 +95,7 @@ fn run_client(run_config: ClientRunConfig) {
         ClientSettings::load_or_default()
     };
     settings.content_mode = run_config.content_mode;
+    run_config.session_overrides.apply_to(&mut settings);
     if run_config.deterministic_capture {
         settings.sound_pack = SoundPackChoice::Muted;
         settings.settings_path = None;
@@ -110,10 +112,6 @@ fn run_client(run_config: ClientRunConfig) {
             settings.theme = job.theme;
         }
     }
-    let window = themes
-        .get(settings.theme)
-        .layout
-        .screen(ClientScreen::Startup);
     let mut local_game = LocalGame::new_human_vs_human();
     let mut recon_panel = ReconPanel::default();
     let mut bazaar_ui = BazaarUiState::default();
@@ -134,6 +132,7 @@ fn run_client(run_config: ClientRunConfig) {
             );
         }
     }
+    let window = themes.get(settings.theme).layout.screen(settings.screen);
     let asset_file_path = settings.assets_dir.to_string_lossy().into_owned();
     let mut app = App::new();
     app.insert_resource(ClearColor(themes.get(settings.theme).screen.background))
@@ -990,6 +989,9 @@ fn refresh_hosted_lobby(
     mut runtime: ResMut<ClientNetworkRuntime>,
     mut state: ResMut<ClientNetworkState>,
 ) {
+    if !settings.lobby_enabled {
+        return;
+    }
     if settings.screen != ClientScreen::Challenge && settings.screen != ClientScreen::Sleep {
         return;
     }
@@ -1028,6 +1030,9 @@ fn refresh_server_roster(
     mut state: ResMut<ClientNetworkState>,
     mut last_screen: Local<Option<ClientScreen>>,
 ) {
+    if !settings.lobby_enabled {
+        return;
+    }
     let entered_roster =
         settings.screen == ClientScreen::Roster && *last_screen != Some(ClientScreen::Roster);
     *last_screen = Some(settings.screen);
@@ -1110,6 +1115,38 @@ struct ClientRunConfig {
     capture: Option<VisualCaptureSpec>,
     deterministic_capture: bool,
     content_mode: ContentMode,
+    session_overrides: ClientSessionOverrides,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ClientSessionOverrides {
+    start_screen: Option<ClientScreen>,
+    mute: bool,
+    no_server: bool,
+    lobby_host: Option<String>,
+    lobby_port: Option<u16>,
+}
+
+impl ClientSessionOverrides {
+    fn apply_to(&self, settings: &mut ClientSettings) {
+        if let Some(screen) = self.start_screen {
+            settings.screen = screen;
+        }
+        if self.mute {
+            settings.sound_pack = SoundPackChoice::Muted;
+        }
+        if self.no_server {
+            settings.lobby_enabled = false;
+        }
+        if self.lobby_host.is_some() || self.lobby_port.is_some() {
+            settings.lobby_addr = lobby_addr_with_overrides(
+                &settings.lobby_addr,
+                self.lobby_host.as_deref(),
+                self.lobby_port,
+            )
+            .expect("legacy lobby override was validated during CLI parsing");
+        }
+    }
 }
 
 impl ClientRunConfig {
@@ -1128,12 +1165,13 @@ impl ClientRunConfig {
     }
 
     fn parse(args: Vec<OsString>, smoke_env: Option<OsString>) -> Result<Self, String> {
-        let (content_mode, args) = parse_content_mode_args(args);
+        let (content_mode, session_overrides, args) = parse_legacy_session_args(args)?;
         if args.is_empty() {
             return Ok(Self {
                 capture: smoke_env.map(|path| VisualCaptureSpec::Smoke { path: path.into() }),
                 deterministic_capture: false,
                 content_mode,
+                session_overrides,
             });
         }
 
@@ -1141,7 +1179,7 @@ impl ClientRunConfig {
             .first()
             .is_some_and(|arg| arg == OsStr::new("headless"))
         {
-            return parse_headless_args(&args[1..], content_mode);
+            return parse_headless_args(&args[1..], content_mode, session_overrides);
         }
 
         if args.len() == 1 && is_help_arg(&args[0]) {
@@ -1176,21 +1214,162 @@ impl ClientRunConfig {
             capture: smoke_path.map(|path| VisualCaptureSpec::Smoke { path }),
             deterministic_capture: false,
             content_mode,
+            session_overrides,
         })
     }
 }
 
-fn parse_content_mode_args(args: Vec<OsString>) -> (ContentMode, Vec<OsString>) {
+fn parse_legacy_session_args(
+    args: Vec<OsString>,
+) -> Result<(ContentMode, ClientSessionOverrides, Vec<OsString>), String> {
     let mut content_mode = ContentMode::Normal;
+    let mut session_overrides = ClientSessionOverrides::default();
     let mut remaining = Vec::with_capacity(args.len());
-    for arg in args {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
         if arg == OsStr::new("--rated") || arg == OsStr::new("-r") {
             content_mode = ContentMode::Rated;
+        } else if arg == OsStr::new("--sleep") || arg == OsStr::new("-s") {
+            session_overrides.start_screen = Some(ClientScreen::Sleep);
+        } else if arg == OsStr::new("--mute") || arg == OsStr::new("-m") {
+            session_overrides.mute = true;
+        } else if arg == OsStr::new("--no-server") || arg == OsStr::new("-X") {
+            session_overrides.no_server = true;
+        } else if arg == OsStr::new("--headphones") || arg == OsStr::new("-p") {
+            // Accepted for legacy CLI compatibility; modern audio has no speakerbox route.
+        } else if arg == OsStr::new("--a-team") || arg == OsStr::new("-a") {
+            // Accepted for legacy CLI compatibility; the A-Team welcome sound is not shipped.
+        } else if arg == OsStr::new("--server-host") || arg == OsStr::new("-S") {
+            index += 1;
+            session_overrides.lobby_host =
+                Some(required_arg(&args, index, display_arg(arg).as_str())?.to_string());
+        } else if let Some(host) = option_value(arg, "--server-host") {
+            session_overrides.lobby_host = Some(host.to_string());
+        } else if arg == OsStr::new("--server-port") || arg == OsStr::new("-P") {
+            index += 1;
+            session_overrides.lobby_port = Some(parse_lobby_port(required_arg(
+                &args,
+                index,
+                display_arg(arg).as_str(),
+            )?)?);
+        } else if let Some(port) = option_value(arg, "--server-port") {
+            session_overrides.lobby_port = Some(parse_lobby_port(port)?);
+        } else if arg == OsStr::new("-xrm") || arg == OsStr::new("--xrm") {
+            index += 1;
+            parse_xrm_override(
+                required_arg(&args, index, display_arg(arg).as_str())?,
+                &mut content_mode,
+                &mut session_overrides,
+            )?;
+        } else if let Some(resource) = option_value(arg, "--xrm") {
+            parse_xrm_override(resource, &mut content_mode, &mut session_overrides)?;
         } else {
-            remaining.push(arg);
+            remaining.push(arg.clone());
         }
+        index += 1;
     }
-    (content_mode, remaining)
+    if session_overrides.lobby_host.is_some() || session_overrides.lobby_port.is_some() {
+        lobby_addr_with_overrides(
+            DEFAULT_LOBBY_ADDR,
+            session_overrides.lobby_host.as_deref(),
+            session_overrides.lobby_port,
+        )?;
+    }
+    Ok((content_mode, session_overrides, remaining))
+}
+
+fn parse_lobby_port(value: &str) -> Result<u16, String> {
+    value
+        .parse::<u16>()
+        .map_err(|error| format!("invalid server port '{value}': {error}"))
+}
+
+fn parse_xrm_override(
+    resource: &str,
+    content_mode: &mut ContentMode,
+    session_overrides: &mut ClientSessionOverrides,
+) -> Result<(), String> {
+    let Some((name, value)) = resource
+        .split_once(':')
+        .or_else(|| resource.split_once('='))
+    else {
+        return Err(format!(
+            "-xrm resource override must be name: value, got '{resource}'"
+        ));
+    };
+    let resource_name = canonical_xrm_resource_name(name);
+    let value = value.trim();
+    match resource_name.as_str() {
+        "sleep" => {
+            session_overrides.start_screen = parse_xrm_bool(value)?.then_some(ClientScreen::Sleep)
+        }
+        "rrated" => {
+            *content_mode = if parse_xrm_bool(value)? {
+                ContentMode::Rated
+            } else {
+                ContentMode::Normal
+            };
+        }
+        "mute" => session_overrides.mute = parse_xrm_bool(value)?,
+        "noserver" => session_overrides.no_server = parse_xrm_bool(value)?,
+        "serverhost" => session_overrides.lobby_host = Some(value.to_string()),
+        "serverport" => session_overrides.lobby_port = Some(parse_lobby_port(value)?),
+        "headphones" | "ateam" | "keymappings" => {}
+        _ => {}
+    }
+    Ok(())
+}
+
+fn canonical_xrm_resource_name(name: &str) -> String {
+    name.rsplit(['*', '.'])
+        .next()
+        .unwrap_or(name)
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn parse_xrm_bool(value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Ok(true),
+        "false" | "no" | "off" | "0" => Ok(false),
+        _ => Err(format!("invalid boolean resource value '{value}'")),
+    }
+}
+
+fn lobby_addr_with_overrides(
+    current: &str,
+    host_override: Option<&str>,
+    port_override: Option<u16>,
+) -> Result<String, String> {
+    let current = current
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("current lobby address '{current}' is invalid: {error}"))?;
+    let host_socket = host_override.and_then(|host| host.trim().parse::<SocketAddr>().ok());
+    let port = port_override
+        .or_else(|| host_socket.map(|addr| addr.port()))
+        .unwrap_or_else(|| current.port());
+    let host = if let Some(addr) = host_socket {
+        addr.ip().to_string()
+    } else {
+        host_override
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| current.ip().to_string())
+    };
+    let candidate = match host.parse::<IpAddr>() {
+        Ok(ip) => SocketAddr::new(ip, port).to_string(),
+        Err(_) => format!("{host}:{port}"),
+    };
+    match candidate.parse::<SocketAddr>() {
+        Ok(_) => Ok(candidate),
+        Err(error) => Err(format!(
+            "invalid server host/port override '{candidate}': {error}"
+        )),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1357,6 +1536,7 @@ fn visual_capture_job(
 fn parse_headless_args(
     args: &[OsString],
     content_mode: ContentMode,
+    session_overrides: ClientSessionOverrides,
 ) -> Result<ClientRunConfig, String> {
     let Some(command) = args.first() else {
         return Err("headless requires a command: capture or capture-all".to_string());
@@ -1366,8 +1546,10 @@ fn parse_headless_args(
     }
 
     match command.to_str() {
-        Some("capture") => parse_headless_capture_args(&args[1..], content_mode),
-        Some("capture-all") => parse_headless_capture_all_args(&args[1..], content_mode),
+        Some("capture") => parse_headless_capture_args(&args[1..], content_mode, session_overrides),
+        Some("capture-all") => {
+            parse_headless_capture_all_args(&args[1..], content_mode, session_overrides)
+        }
         Some(other) => Err(format!("unrecognized headless command: {other}")),
         None => Err(format!(
             "headless command is not valid UTF-8: {}",
@@ -1379,6 +1561,7 @@ fn parse_headless_args(
 fn parse_headless_capture_args(
     args: &[OsString],
     content_mode: ContentMode,
+    session_overrides: ClientSessionOverrides,
 ) -> Result<ClientRunConfig, String> {
     let mut fixture = None;
     let mut theme = ThemeChoice::Original;
@@ -1423,12 +1606,14 @@ fn parse_headless_capture_args(
         }),
         deterministic_capture: true,
         content_mode,
+        session_overrides,
     })
 }
 
 fn parse_headless_capture_all_args(
     args: &[OsString],
     content_mode: ContentMode,
+    session_overrides: ClientSessionOverrides,
 ) -> Result<ClientRunConfig, String> {
     let mut theme = ThemeChoice::Original;
     let mut out_dir = None;
@@ -1463,6 +1648,7 @@ fn parse_headless_capture_all_args(
         }),
         deterministic_capture: true,
         content_mode,
+        session_overrides,
     })
 }
 
@@ -1525,7 +1711,7 @@ fn visual_fixture_list() -> String {
 
 fn client_usage() -> String {
     format!(
-        "Usage:\n  client [--rated|-r]\n  client [--rated|-r] --smoke-screenshot <path>\n  client [--rated|-r] headless capture --fixture <fixture> --theme <theme> [--rated|-r] --output <path>\n  client [--rated|-r] headless capture-all --theme <theme> [--rated|-r] --out-dir <dir>\n\nFixtures: {}\nThemes: original, high-contrast",
+        "Usage:\n  client [options]\n  client [options] --smoke-screenshot <path>\n  client [options] headless capture --fixture <fixture> --theme <theme> --output <path>\n  client [options] headless capture-all --theme <theme> --out-dir <dir>\n\nOptions:\n  -r, --rated              Enable legacy rated content for this run\n  -s, --sleep              Start on the Sleep screen\n  -m, --mute               Mute sound for this run\n  -X, --no-server          Disable self-hosted lobby/server features for this run\n  -S, --server-host <ip>   Override lobby server host for this run\n  -P, --server-port <port> Override lobby server port for this run\n  -xrm <resource: value>   Apply a legacy X resource override for known resources\n  -p, --headphones         Accepted as a legacy no-op\n  -a, --a-team             Accepted as a legacy no-op\n\nKnown -xrm resources: sleep, r_rated, mute, no_server, serverHost, serverPort.\nServer host overrides currently require a numeric IP address.\nFixtures: {}\nThemes: original, high-contrast",
         visual_fixture_list()
     )
 }
@@ -2587,6 +2773,7 @@ struct ClientSettings {
     direct_share_addr: String,
     direct_join_addr: String,
     lobby_addr: String,
+    lobby_enabled: bool,
     hosted_ranked: bool,
     settings_path: Option<PathBuf>,
     assets_dir: PathBuf,
@@ -2608,7 +2795,8 @@ impl Default for ClientSettings {
             direct_listen_addr: "0.0.0.0:4405".to_string(),
             direct_share_addr: suggested_share_addr_for("0.0.0.0:4405"),
             direct_join_addr: "127.0.0.1:4405".to_string(),
-            lobby_addr: "127.0.0.1:4404".to_string(),
+            lobby_addr: DEFAULT_LOBBY_ADDR.to_string(),
+            lobby_enabled: true,
             hosted_ranked: true,
             settings_path: settings_path(),
             assets_dir: assets_dir(),
@@ -2698,7 +2886,7 @@ impl ClientSettings {
             sanitize_share_addr_setting(persisted.direct_share_addr, &self.direct_listen_addr);
         self.direct_join_addr =
             sanitize_socket_setting(persisted.direct_join_addr, "127.0.0.1:4405");
-        self.lobby_addr = sanitize_socket_setting(persisted.lobby_addr, "127.0.0.1:4404");
+        self.lobby_addr = sanitize_socket_setting(persisted.lobby_addr, DEFAULT_LOBBY_ADDR);
         self.hosted_ranked = persisted.hosted_ranked;
     }
 }
@@ -2733,7 +2921,7 @@ impl Default for PersistedClientSettings {
             direct_listen_addr: "0.0.0.0:4405".to_string(),
             direct_share_addr: suggested_share_addr_for("0.0.0.0:4405"),
             direct_join_addr: "127.0.0.1:4405".to_string(),
-            lobby_addr: "127.0.0.1:4404".to_string(),
+            lobby_addr: DEFAULT_LOBBY_ADDR.to_string(),
             hosted_ranked: true,
         }
     }
@@ -2861,7 +3049,7 @@ fn apply_visual_fixture_state(
     settings.display_name = "Visual Fixture".to_string();
     settings.community_label = "visual".to_string();
     settings.direct_listen_addr = "127.0.0.1:4405".to_string();
-    settings.lobby_addr = "127.0.0.1:4404".to_string();
+    settings.lobby_addr = DEFAULT_LOBBY_ADDR.to_string();
 
     if fixture == VisualFixture::Settings {
         settings.controls = ControlScheme::LegacyInspired;
@@ -6521,9 +6709,17 @@ fn start_selected_challenge_mode(
             join_direct_challenge(settings, network_runtime, network_state)
         }
         ChallengeMode::HostViaLobby => {
+            if !settings.lobby_enabled {
+                network_state.push_message("Lobby server disabled by -X/--no-server");
+                return;
+            }
             host_via_lobby_challenge(settings, network_runtime, network_state)
         }
         ChallengeMode::BrowseLobby => {
+            if !settings.lobby_enabled {
+                network_state.push_message("Lobby server disabled by -X/--no-server");
+                return;
+            }
             start_or_browse_hosted_lobby(settings, network_runtime, network_state)
         }
         ChallengeMode::BrowseLan => start_or_browse_lan(settings, network_runtime, network_state),
@@ -6652,6 +6848,9 @@ fn register_hosted_lobby(
     network_runtime: &mut ClientNetworkRuntime,
     network_state: &mut ClientNetworkState,
 ) {
+    if !settings.lobby_enabled {
+        return;
+    }
     let Ok(server_addr) = parse_network_addr(&settings.lobby_addr, "lobby address", network_state)
     else {
         return;
@@ -6677,6 +6876,10 @@ fn browse_hosted_lobby(
     network_runtime: &mut ClientNetworkRuntime,
     network_state: &mut ClientNetworkState,
 ) {
+    if !settings.lobby_enabled {
+        network_state.push_message("Lobby server disabled by -X/--no-server");
+        return;
+    }
     let Ok(server_addr) = parse_network_addr(&settings.lobby_addr, "lobby address", network_state)
     else {
         return;
@@ -6750,6 +6953,10 @@ fn start_selected_hosted_game(
     network_runtime: &mut ClientNetworkRuntime,
     network_state: &mut ClientNetworkState,
 ) {
+    if !settings.lobby_enabled {
+        network_state.push_message("Lobby server disabled by -X/--no-server");
+        return;
+    }
     let Some(entry) = selected_lobby_entry(network_state).cloned() else {
         network_state.push_message("No lobby opponent selected");
         return;
@@ -6822,6 +7029,9 @@ fn poll_registered_hosted_status(
     network_runtime: &mut ClientNetworkRuntime,
     network_state: &mut ClientNetworkState,
 ) {
+    if !settings.lobby_enabled {
+        return;
+    }
     let Some(entry) = network_state.lobby_registration.clone() else {
         return;
     };
@@ -7952,6 +8162,12 @@ fn submit_hosted_ranked_result_claim(
     }
     if local.network_failed_closed {
         let status = FinalResultStatus::Rejected("desynced".to_string());
+        set_local_result_status(local, status.clone());
+        network_state.result_status = status;
+        return;
+    }
+    if !settings.lobby_enabled {
+        let status = FinalResultStatus::Rejected("lobby server disabled".to_string());
         set_local_result_status(local, status.clone());
         network_state.result_status = status;
         return;
@@ -9329,7 +9545,7 @@ fn screen_body_label(
         ClientScreen::Startup => String::new(),
         ClientScreen::Challenge => {
             format!(
-                "Challenge\nMode: {}\n\nLeft panel: choose Computer, Direct IP, hosted availability, or a lobby opponent.\nRight panel: shows the selected mode, addresses, challenge state, and next action.\n\nControls: 1-5 choose mode. Up/Down or mouse selects lobby opponents. Enter/C starts, refreshes, challenges, or accepts. D denies. Escape/Cancel backs out.\n\nIdentity: {} ({})  Community: {}\nProtocol v{}.{} ({}, {})",
+                "Challenge\nMode: {}\n\nLeft panel: choose Computer, Direct IP, hosted availability, a lobby opponent, or LAN discovery.\nRight panel: shows the selected mode, addresses, challenge state, and next action.\n\nControls: 1-6 choose mode. Up/Down or mouse selects opponents. Enter/C starts, refreshes, challenges, or accepts. D denies. Escape/Cancel backs out.\n\nIdentity: {} ({})  Community: {}\nProtocol v{}.{} ({}, {})",
                 settings.challenge_mode.label(),
                 settings.display_name,
                 hosted_player_id(settings),
@@ -9349,7 +9565,7 @@ fn screen_body_label(
                 hosted_player(settings).display_name,
                 hosted_player_id(settings),
                 settings.community_label,
-                settings.lobby_addr,
+                lobby_status_label(settings),
                 settings.hosted_ranked,
                 settings.direct_listen_addr,
                 share_addr,
@@ -9366,12 +9582,13 @@ fn screen_body_label(
         }
         ClientScreen::Roster => " ".to_string(),
         ClientScreen::Settings => format!(
-            "Theme: {:?}  Sound: {:?}  Controls: {}  Scale: {:.2}x\nHosted ranked preference: {}\n\n{}1 display name: {}\n{}2 community: {}\n{}3 host bind: {}\n{}4 share address: {}\n{}5 join address: {}\n{}6 lobby address: {}\n\nAddress guide:\nHost bind is where this client listens. Use 0.0.0.0:4405 to listen on all local interfaces, or a specific local LAN IP.\nShare address is what another player types and what the lobby advertises. Do not share 0.0.0.0.\nJoin address is the host's share address for Direct IP. Do not join 0.0.0.0 or 127.0.0.1 from another machine. Use the host LAN IP.\nLobby address is the self-hosted community server for presence, hosted sessions, ranked records, and roster records; it does not relay gameplay.\n127.0.0.1 only means this same computer and is useful for local tests.\nSuggested share address: {}\nHost must allow inbound TCP on the direct port. No NAT traversal or gameplay relay exists.\n\nT theme  O sound  M controls  R hosted ranked  -/= scale\nProtocol: v{}.{}\nAssets: {}\nSettings: {}",
+            "Theme: {:?}  Sound: {:?}  Controls: {}  Scale: {:.2}x\nHosted ranked preference: {}  Lobby server: {}\n\n{}1 display name: {}\n{}2 community: {}\n{}3 host bind: {}\n{}4 share address: {}\n{}5 join address: {}\n{}6 lobby address: {}\n\nAddress guide:\nHost bind is where this client listens. Use 0.0.0.0:4405 to listen on all local interfaces, or a specific local LAN IP.\nShare address is what another player types and what the lobby advertises. Do not share 0.0.0.0.\nJoin address is the host's share address for Direct IP. Do not join 0.0.0.0 or 127.0.0.1 from another machine. Use the host LAN IP.\nLobby address is the self-hosted community server for presence, hosted sessions, ranked records, and roster records; it does not relay gameplay.\n127.0.0.1 only means this same computer and is useful for local tests.\nSuggested share address: {}\nHost must allow inbound TCP on the direct port. No NAT traversal or gameplay relay exists.\n\nT theme  O sound  M controls  R hosted ranked  -/= scale\nProtocol: v{}.{}\nAssets: {}\nSettings: {}",
             settings.theme,
             settings.sound_pack,
             controls_label(settings.controls),
             settings.pixel_scale,
             settings.hosted_ranked,
+            lobby_status_label(settings),
             selected_settings_marker(settings_edit, SettingsField::DisplayName),
             settings.display_name,
             selected_settings_marker(settings_edit, SettingsField::CommunityLabel),
@@ -9403,6 +9620,14 @@ fn selected_settings_marker(edit: &SettingsEditState, field: SettingsField) -> &
         "> "
     } else {
         "  "
+    }
+}
+
+fn lobby_status_label(settings: &ClientSettings) -> String {
+    if settings.lobby_enabled {
+        settings.lobby_addr.clone()
+    } else {
+        "disabled by -X/--no-server".to_string()
     }
 }
 
@@ -9480,6 +9705,10 @@ fn challenge_opponent_list_label(
     }
     if settings.challenge_mode != ChallengeMode::BrowseLobby {
         text.push_str("Browse Lobby or Browse LAN lists\navailable players here.");
+        return text;
+    }
+    if !settings.lobby_enabled {
+        text.push_str("Lobby server disabled by -X.\nUse Direct IP or Browse LAN.");
         return text;
     }
     let Some(list) = &network_state.lobby_list else {
@@ -9597,6 +9826,12 @@ fn host_via_lobby_panel_label(
     settings: &ClientSettings,
     network_state: &ClientNetworkState,
 ) -> String {
+    if !settings.lobby_enabled {
+        return format!(
+            "Host Via Lobby\n\nLobby server disabled by -X/--no-server.\nUse Host Direct or Browse LAN for serverless play.\n\n{}",
+            challenge_status_lifecycle_label(network_state),
+        );
+    }
     let registration = network_state.lobby_registration.as_ref().map_or_else(
         || "Not registered yet".to_string(),
         |entry| {
@@ -9621,6 +9856,12 @@ fn browse_lobby_panel_label(
     settings: &ClientSettings,
     network_state: &ClientNetworkState,
 ) -> String {
+    if !settings.lobby_enabled {
+        return format!(
+            "Browse Lobby\n\nLobby server disabled by -X/--no-server.\nUse Join Direct or Browse LAN for serverless play.\n\n{}",
+            challenge_status_lifecycle_label(network_state),
+        );
+    }
     let selected = selected_lobby_entry(network_state).map_or_else(
         || "No opponent selected".to_string(),
         |entry| {
@@ -9679,6 +9920,9 @@ fn challenge_compact_status_label(
             let difficulty = selected_ernie_difficulty(settings);
             format!("Ernie: {}  level {}", difficulty.name, difficulty.level)
         }
+        ChallengeMode::HostViaLobby | ChallengeMode::BrowseLobby if !settings.lobby_enabled => {
+            "Lobby disabled".to_string()
+        }
         ChallengeMode::BrowseLan if !network_state.lan_entries.is_empty() => {
             format!("LAN hosts: {}", network_state.lan_entries.len())
         }
@@ -9699,7 +9943,9 @@ fn challenge_primary_button_label(
         }
         ChallengeMode::HostDirect => "Host Direct".to_string(),
         ChallengeMode::JoinDirect => "Join Direct".to_string(),
+        ChallengeMode::HostViaLobby if !settings.lobby_enabled => "Lobby Disabled".to_string(),
         ChallengeMode::HostViaLobby => "Host Via Lobby".to_string(),
+        ChallengeMode::BrowseLobby if !settings.lobby_enabled => "Lobby Disabled".to_string(),
         ChallengeMode::BrowseLobby => selected_lobby_entry(network_state).map_or_else(
             || "Browse Lobby".to_string(),
             |entry| format!("Challenge {}", entry.host.display_name),
@@ -9997,8 +10243,10 @@ fn sanitize_settings_after_edit(settings: &mut ClientSettings, field: SettingsFi
             );
         }
         SettingsField::LobbyAddress => {
-            settings.lobby_addr =
-                sanitize_socket_setting(std::mem::take(&mut settings.lobby_addr), "127.0.0.1:4404");
+            settings.lobby_addr = sanitize_socket_setting(
+                std::mem::take(&mut settings.lobby_addr),
+                DEFAULT_LOBBY_ADDR,
+            );
         }
     }
 }
@@ -11442,6 +11690,85 @@ mod tests {
         assert_eq!(short.content_mode, ContentMode::Rated);
         assert!(!long.deterministic_capture);
         assert!(!short.deterministic_capture);
+    }
+
+    #[test]
+    fn legacy_cli_flags_apply_session_overrides() {
+        let config = ClientRunConfig::parse(
+            vec![
+                OsString::from("-s"),
+                OsString::from("-m"),
+                OsString::from("-X"),
+                OsString::from("-S"),
+                OsString::from("127.0.0.2"),
+                OsString::from("-P"),
+                OsString::from("4410"),
+                OsString::from("-p"),
+                OsString::from("-a"),
+            ],
+            None,
+        )
+        .expect("legacy flags parse");
+        let mut settings = ClientSettings {
+            settings_path: None,
+            ..Default::default()
+        };
+
+        settings.content_mode = config.content_mode;
+        config.session_overrides.apply_to(&mut settings);
+
+        assert_eq!(settings.content_mode, ContentMode::Normal);
+        assert_eq!(settings.screen, ClientScreen::Sleep);
+        assert_eq!(settings.sound_pack, SoundPackChoice::Muted);
+        assert!(!settings.lobby_enabled);
+        assert_eq!(settings.lobby_addr, "127.0.0.2:4410");
+    }
+
+    #[test]
+    fn xrm_overrides_apply_known_legacy_resources() {
+        let config = ClientRunConfig::parse(
+            vec![
+                OsString::from("-xrm"),
+                OsString::from("BattleTris*sleep: True"),
+                OsString::from("-xrm"),
+                OsString::from("BattleTris*r_rated: on"),
+                OsString::from("-xrm"),
+                OsString::from("BattleTris*mute: yes"),
+                OsString::from("-xrm"),
+                OsString::from("BattleTris*no_server: 1"),
+                OsString::from("--xrm=BattleTris*serverHost: 127.0.0.3"),
+                OsString::from("-xrm"),
+                OsString::from("BattleTris.serverPort: 4411"),
+                OsString::from("-xrm"),
+                OsString::from("BattleTris*background: red"),
+            ],
+            None,
+        )
+        .expect("xrm overrides parse");
+        let mut settings = ClientSettings {
+            settings_path: None,
+            ..Default::default()
+        };
+
+        settings.content_mode = config.content_mode;
+        config.session_overrides.apply_to(&mut settings);
+
+        assert_eq!(settings.content_mode, ContentMode::Rated);
+        assert_eq!(settings.screen, ClientScreen::Sleep);
+        assert_eq!(settings.sound_pack, SoundPackChoice::Muted);
+        assert!(!settings.lobby_enabled);
+        assert_eq!(settings.lobby_addr, "127.0.0.3:4411");
+    }
+
+    #[test]
+    fn server_host_override_rejects_non_socket_hostnames() {
+        let error = ClientRunConfig::parse(
+            vec![OsString::from("-S"), OsString::from("battletris.example")],
+            None,
+        )
+        .expect_err("hostname server override is rejected until DNS addresses are supported");
+
+        assert!(error.contains("invalid server host/port override"));
     }
 
     #[test]
