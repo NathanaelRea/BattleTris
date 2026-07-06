@@ -6,8 +6,8 @@
 
 use battletris_client::net::{
     build_ranked_result_claim, FinalResultStatus, LanAvailability, LanDiscoveryEntry,
-    NetworkCommand, NetworkEvent, NetworkLifecycleState, NetworkLockstep, NetworkRuntime,
-    NetworkSession,
+    LegacyRemoteOpponentState, LegacyRemoteScoreUpdate, NetworkCommand, NetworkEvent,
+    NetworkLifecycleState, NetworkLockstep, NetworkMode, NetworkRuntime, NetworkSession,
 };
 use battletris_core::{
     ai::{computer_difficulty, ComputerOpponent, BAZAAR_LEAVE_DELAY_MS, COMPUTER_DIFFICULTIES},
@@ -23,10 +23,11 @@ use battletris_core::{
 };
 use battletris_db::{CommunityLabel, PersistencePaths, PlayerStore, StreakKind};
 use battletris_protocol::{
-    derive_player_seeds, BazaarBuy, BazaarDone, BazaarRemove, Challenge, GameChecksum, GameOver,
-    Heartbeat, HostedGameStart, HostedPlayer, HostedSessionStatus, HostedSessionStatusKind,
-    InputCommand, LobbyEntry, LobbyList, LobbyRegister, PlayerIdentity, PlayerInput, PlayerSlot,
-    RankedRecords, RankedResultPending, RankedResultRejected, TickWatermark, CAPABILITY_DIRECT_TCP,
+    derive_player_seeds, ArsenalEntry, ArsenalSnapshot, BazaarBuy, BazaarDone, BazaarRemove,
+    BoardSnapshot as WireBoardSnapshot, Challenge, GameChecksum, GameOver, Heartbeat,
+    HostedGameStart, HostedPlayer, HostedSessionStatus, HostedSessionStatusKind, InputCommand,
+    LobbyEntry, LobbyList, LobbyRegister, PlayerIdentity, PlayerInput, PlayerSlot, RankedRecords,
+    RankedResultPending, RankedResultRejected, ScoreSnapshot, TickWatermark, CAPABILITY_DIRECT_TCP,
     CAPABILITY_SELF_HOSTED_LOBBY, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 use bevy::ecs::system::SystemParam;
@@ -77,7 +78,8 @@ use self::visual::*;
 const SMOKE_SCREENSHOT_CAPTURE_DELAY_FRAMES: u16 = 30;
 const SMOKE_SCREENSHOT_TIMEOUT_FRAMES: u16 = 300;
 const SETTINGS_FILE_NAME: &str = "settings.toml";
-const DEFAULT_LOBBY_ADDR: &str = "127.0.0.1:4404";
+const DEFAULT_MODERN_SERVER_ADDR: &str = "127.0.0.1:4405";
+const DEFAULT_LEGACY_SERVER_ADDR: &str = "127.0.0.1:4404";
 const CLIENT_FIXED_TICK_MS: u64 = 10;
 const NETWORK_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
 const NETWORK_CHECKSUM_INTERVAL_MS: u64 = 5_000;

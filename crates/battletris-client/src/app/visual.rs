@@ -180,7 +180,8 @@ pub(super) fn apply_visual_fixture_state(
     settings.display_name = "Visual Fixture".to_string();
     settings.community_label = "visual".to_string();
     settings.direct_listen_addr = "127.0.0.1:4405".to_string();
-    settings.lobby_addr = DEFAULT_LOBBY_ADDR.to_string();
+    settings.modern_server_addr = DEFAULT_MODERN_SERVER_ADDR.to_string();
+    settings.legacy_server_addr = DEFAULT_LEGACY_SERVER_ADDR.to_string();
 
     if fixture == VisualFixture::Challenge {
         settings.ernie_level = 0;
@@ -244,6 +245,8 @@ pub(super) fn visual_computer_game(
         mode: LocalGameMode::ComputerOpponent,
         network_session: None,
         network_lockstep: None,
+        legacy_remote: None,
+        legacy_next_log_index: 0,
         network_failed_closed: false,
         network_game_over_sent: false,
         network_result_claim_submitted: false,
@@ -267,6 +270,8 @@ pub(super) fn visual_bazaar_game() -> LocalGame {
         mode: LocalGameMode::LocalHumanVsHuman,
         network_session: None,
         network_lockstep: None,
+        legacy_remote: None,
+        legacy_next_log_index: 0,
         network_failed_closed: false,
         network_game_over_sent: false,
         network_result_claim_submitted: false,
@@ -293,6 +298,8 @@ pub(super) fn visual_game_over_game() -> LocalGame {
         mode: LocalGameMode::LocalHumanVsHuman,
         network_session: None,
         network_lockstep: None,
+        legacy_remote: None,
+        legacy_next_log_index: 0,
         network_failed_closed: false,
         network_game_over_sent: false,
         network_result_claim_submitted: false,

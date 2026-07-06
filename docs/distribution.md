@@ -68,13 +68,13 @@ host's advertised gameplay address.
 Operator example:
 
 ```sh
-battletris-server --listen 0.0.0.0:4404 --community garage
+battletris-server --modern-listen 0.0.0.0:4405 --community garage
 ```
 
 Client setup:
 
-1. Set Lobby Address to the server's reachable address, for example
-   `192.168.1.10:4404`.
+1. Set Modern Server to the server's reachable address, for example
+   `192.168.1.10:4405`.
 2. The host still needs a direct gameplay bind/share address, for example bind
    `0.0.0.0:4405` and share `192.168.1.23:4405`.
 3. The joiner starts the hosted lobby session, receives server-owned start

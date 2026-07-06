@@ -199,6 +199,78 @@ pub(super) fn apply_network_game_event(
     event: &NetworkEvent,
 ) {
     match event {
+        NetworkEvent::LegacyRemoteScore(update) => {
+            apply_legacy_remote_score(local, update);
+        }
+        NetworkEvent::LegacyRemoteBoard(board) => {
+            let remote = local.legacy_remote.get_or_insert_with(Default::default);
+            remote.board = Some(board.clone());
+            local.status_message = Some("Legacy opponent board updated.".to_string());
+        }
+        NetworkEvent::LegacyRemoteArsenal(arsenal) => {
+            let remote = local.legacy_remote.get_or_insert_with(Default::default);
+            remote.arsenal = Some(arsenal.clone());
+            local.status_message = Some("Legacy opponent arsenal updated.".to_string());
+        }
+        NetworkEvent::LegacyRemoteBazaarStarted => {
+            let remote = local.legacy_remote.get_or_insert_with(Default::default);
+            remote.in_bazaar = true;
+            local.status_message = Some("Legacy opponent entered Bazaar.".to_string());
+        }
+        NetworkEvent::LegacyRemoteBazaarDone => {
+            let remote = local.legacy_remote.get_or_insert_with(Default::default);
+            remote.in_bazaar = false;
+            let _ = local.game.bazaar_done(opponent_player(local.local_player));
+            local.status_message = Some("Legacy opponent finished Bazaar.".to_string());
+        }
+        NetworkEvent::LegacyRemotePauseToggled => {
+            let remote = local.legacy_remote.get_or_insert_with(Default::default);
+            remote.paused = !remote.paused;
+            local.status_message = Some(
+                if remote.paused {
+                    "Legacy opponent paused."
+                } else {
+                    "Legacy opponent resumed."
+                }
+                .to_string(),
+            );
+        }
+        NetworkEvent::LegacyRemoteDead => {
+            local.status_message = Some("Legacy opponent ended the game.".to_string());
+            local.network_failed_closed = true;
+        }
+        NetworkEvent::LegacyIncomingWeapon { weapon } => {
+            if let Some(token) = WeaponToken::from_legacy_id(*weapon) {
+                let launcher = opponent_player(local.local_player);
+                let events = local
+                    .game
+                    .queue_incoming_weapon(launcher, local.local_player, token);
+                local.status_message = Some(format!(
+                    "Legacy opponent launched {}.",
+                    weapon_spec(token).name
+                ));
+                if events.is_empty() {
+                    state.push_message(format!(
+                        "Ignored unsupported legacy weapon {}.",
+                        weapon_spec(token).name
+                    ));
+                }
+            } else {
+                state.push_message(format!("Ignored unknown legacy weapon token {weapon}."));
+            }
+        }
+        NetworkEvent::LegacyRemoteWeaponOn { weapon } => {
+            let remote = local.legacy_remote.get_or_insert_with(Default::default);
+            if !remote.active_weapons.contains(weapon) {
+                remote.active_weapons.push(*weapon);
+            }
+            local.status_message = Some("Legacy opponent weapon became active.".to_string());
+        }
+        NetworkEvent::LegacyRemoteWeaponOff { weapon } => {
+            let remote = local.legacy_remote.get_or_insert_with(Default::default);
+            remote.active_weapons.retain(|active| active != weapon);
+            local.status_message = Some("Legacy opponent weapon expired.".to_string());
+        }
         NetworkEvent::PendingResult(pending) => {
             set_local_result_status(local, FinalResultStatus::Pending(pending.clone()));
         }
@@ -258,6 +330,27 @@ pub(super) fn apply_network_game_event(
             NetworkCommand::Disconnect { reason: message },
         );
     }
+}
+
+pub(super) fn apply_legacy_remote_score(local: &mut LocalGame, update: &LegacyRemoteScoreUpdate) {
+    let remote = local.legacy_remote.get_or_insert_with(Default::default);
+    match update {
+        LegacyRemoteScoreUpdate::Snapshot(snapshot) => {
+            remote.score = snapshot.score;
+            remote.funds = snapshot.funds;
+            remote.lines = snapshot.lines;
+        }
+        LegacyRemoteScoreUpdate::ScoreDelta(delta) => {
+            remote.score = remote.score.saturating_add(*delta);
+        }
+        LegacyRemoteScoreUpdate::FundsDelta(delta) => {
+            remote.funds = remote.funds.saturating_add(*delta);
+        }
+        LegacyRemoteScoreUpdate::LinesDelta(delta) => {
+            remote.lines = remote.lines.saturating_add(*delta);
+        }
+    }
+    local.status_message = Some("Legacy opponent score updated.".to_string());
 }
 
 pub(super) fn set_local_result_status(local: &mut LocalGame, status: FinalResultStatus) {
@@ -537,6 +630,16 @@ pub(super) fn reduce_client_network_event(
                 game_over.winner, game_over.loser, game_over.sequence, 0
             );
         }
+        NetworkEvent::LegacyRemoteScore(_)
+        | NetworkEvent::LegacyRemoteBoard(_)
+        | NetworkEvent::LegacyRemoteArsenal(_)
+        | NetworkEvent::LegacyRemoteBazaarStarted
+        | NetworkEvent::LegacyRemoteBazaarDone
+        | NetworkEvent::LegacyRemotePauseToggled
+        | NetworkEvent::LegacyRemoteDead
+        | NetworkEvent::LegacyIncomingWeapon { .. }
+        | NetworkEvent::LegacyRemoteWeaponOn { .. }
+        | NetworkEvent::LegacyRemoteWeaponOff { .. } => {}
         NetworkEvent::PendingResult(pending) => {
             state.result_status = FinalResultStatus::Pending(pending.clone());
             state.push_message("Ranked result pending: waiting for the peer claim.");
@@ -591,15 +694,18 @@ pub(super) fn reduce_client_network_event(
 pub(super) fn player_facing_network_error(message: &str) -> String {
     let lower = message.to_ascii_lowercase();
     if lower.contains("address already in use") || lower.contains("addrinuse") {
-        "Host bind failed: address already in use. Try another port or cancel the old host."
+        "Host bind failed: address already in use. The modern server may already be using port 4405; try another bind address or stop the old host."
             .to_string()
     } else if lower.contains("timed out connecting to direct peer")
         || lower.contains("timed out connecting to hosted direct peer")
         || lower.contains("join timed out")
     {
         format!("Join timed out. Check the host share address and firewall. {message}")
+    } else if lower.contains("original battletris") || lower.contains("invalid btrs response magic")
+    {
+        format!("Wrong server protocol. Modern play uses BTRS on port 4405. {message}")
     } else if lower.contains("lobby server") || lower.contains("hosted status") {
-        format!("Lobby server unavailable. Direct IP can still be used. {message}")
+        format!("Modern server unavailable. Direct IP can still be used. {message}")
     } else if lower.contains("challenge denied") || lower.contains("denied") {
         let reason = message
             .split_once(':')
@@ -743,8 +849,11 @@ pub(super) fn refresh_server_roster(
     if !entered_roster {
         return;
     }
-    let Ok(server_addr) = parse_network_addr(&settings.lobby_addr, "lobby address", &mut state)
-    else {
+    let Ok(server_addr) = parse_network_addr(
+        &settings.modern_server_addr,
+        "modern server address",
+        &mut state,
+    ) else {
         return;
     };
     try_send_network_command(

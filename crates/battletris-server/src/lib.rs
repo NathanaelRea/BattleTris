@@ -7,13 +7,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use battletris_db::{CommunityLabel, GameResult, OpponentKind, PlayerId, PlayerStore};
 use battletris_protocol::{
+    legacy::{LegacyNetworkEntry, LegacyNetworkStatus, LEGACY_DB_KEY_LEN},
     HostedGameStart, HostedPlayer, HostedSessionId, HostedSessionStatus, HostedSessionStatusKind,
     LobbyEntry, LobbyRegister, RankedPlayerRecord, RankedRecords, RankedResultClaim,
     PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
+
+/// Default idle timeout for original BattleTris roster registrations.
+pub const LEGACY_ROSTER_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Result type for server authority operations.
 pub type Result<T> = std::result::Result<T, ServerError>;
@@ -43,6 +48,28 @@ pub enum ServerError {
     /// The persistence layer rejected a ranked write.
     Persistence(battletris_db::Error),
 }
+
+/// Server-side legacy roster failures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacyRosterError {
+    /// The initial registration did not contain a usable legacy entry.
+    InvalidRegistration(&'static str),
+    /// The update/disconnect operation came from a connection without a roster entry.
+    UnregisteredConnection,
+}
+
+impl fmt::Display for LegacyRosterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRegistration(field) => {
+                write!(f, "invalid legacy roster registration field: {field}")
+            }
+            Self::UnregisteredConnection => write!(f, "legacy connection is not registered"),
+        }
+    }
+}
+
+impl std::error::Error for LegacyRosterError {}
 
 impl fmt::Display for ServerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -83,6 +110,120 @@ pub enum VerificationOutcome {
     AwaitingPeer,
     /// Both participants submitted matching claims and the server recorded the result.
     Recorded,
+}
+
+/// In-memory compatibility roster for the original `btserverd` client protocol.
+#[derive(Debug, Default)]
+pub struct LegacyRosterServer {
+    entries: BTreeMap<String, LegacyRosterEntry>,
+}
+
+impl LegacyRosterServer {
+    /// Creates an empty legacy roster.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stores or replaces one registered legacy client entry.
+    pub fn register(
+        &mut self,
+        owner_id: u64,
+        entry: LegacyNetworkEntry,
+        now: Instant,
+    ) -> std::result::Result<String, LegacyRosterError> {
+        validate_legacy_registration(&entry)?;
+        self.remove_owner(owner_id);
+        let key = legacy_roster_key(&entry);
+        self.entries.insert(
+            key.clone(),
+            LegacyRosterEntry {
+                owner_id,
+                entry,
+                last_seen: now,
+            },
+        );
+        Ok(key)
+    }
+
+    /// Returns roster entries sorted by roster key.
+    #[must_use]
+    pub fn entries(&self) -> Vec<LegacyNetworkEntry> {
+        self.entries
+            .values()
+            .map(|entry| entry.entry.clone())
+            .collect()
+    }
+
+    /// Refreshes the idle timestamp for a registered connection.
+    pub fn refresh_owner(&mut self, owner_id: u64, now: Instant) -> bool {
+        if let Some(entry) = self.owner_entry_mut(owner_id) {
+            entry.last_seen = now;
+            return true;
+        }
+        false
+    }
+
+    /// Verifies that a keyed entry exists and is waiting for a challenge.
+    #[must_use]
+    pub fn verify_key(&self, key_bytes: &[u8]) -> bool {
+        let key = legacy_key_from_bytes(key_bytes);
+        self.entries
+            .get(&key)
+            .is_some_and(|entry| entry.entry.status == LegacyNetworkStatus::Waiting)
+    }
+
+    /// Toggles the owning registered client between waiting and playing.
+    pub fn update_owner_status(
+        &mut self,
+        owner_id: u64,
+        now: Instant,
+    ) -> std::result::Result<(), LegacyRosterError> {
+        let Some(entry) = self.owner_entry_mut(owner_id) else {
+            return Err(LegacyRosterError::UnregisteredConnection);
+        };
+        entry.entry.status = match entry.entry.status {
+            LegacyNetworkStatus::Playing => LegacyNetworkStatus::Waiting,
+            _ => LegacyNetworkStatus::Playing,
+        };
+        entry.last_seen = now;
+        Ok(())
+    }
+
+    /// Removes any entry owned by the connection.
+    pub fn remove_owner(&mut self, owner_id: u64) -> bool {
+        let Some(key) = self.key_for_owner(owner_id) else {
+            return false;
+        };
+        self.entries.remove(&key).is_some()
+    }
+
+    /// Removes entries that have exceeded the idle timeout.
+    pub fn expire_idle(&mut self, now: Instant, timeout: Duration) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|_, entry| now.duration_since(entry.last_seen) < timeout);
+        before - self.entries.len()
+    }
+
+    fn owner_entry_mut(&mut self, owner_id: u64) -> Option<&mut LegacyRosterEntry> {
+        self.entries
+            .values_mut()
+            .find(|entry| entry.owner_id == owner_id)
+    }
+
+    fn key_for_owner(&self, owner_id: u64) -> Option<String> {
+        self.entries
+            .iter()
+            .find_map(|(key, entry)| (entry.owner_id == owner_id).then(|| key.clone()))
+    }
+}
+
+#[derive(Debug)]
+struct LegacyRosterEntry {
+    owner_id: u64,
+    entry: LegacyNetworkEntry,
+    last_seen: Instant,
 }
 
 /// In-memory self-hosted lobby authority for one community label.
@@ -484,6 +625,39 @@ fn game_result_from_claim(
     })
 }
 
+fn validate_legacy_registration(
+    entry: &LegacyNetworkEntry,
+) -> std::result::Result<(), LegacyRosterError> {
+    if entry.user_name.trim().is_empty() {
+        return Err(LegacyRosterError::InvalidRegistration("user_name"));
+    }
+    if entry.host_name.trim().is_empty() {
+        return Err(LegacyRosterError::InvalidRegistration("host_name"));
+    }
+    if entry.port == 0 {
+        return Err(LegacyRosterError::InvalidRegistration("port"));
+    }
+    Ok(())
+}
+
+fn legacy_roster_key(entry: &LegacyNetworkEntry) -> String {
+    if entry.key.is_empty() {
+        format!("{}\0{}\0{}", entry.user_name, entry.host_name, entry.port)
+    } else {
+        entry.key.clone()
+    }
+}
+
+fn legacy_key_from_bytes(bytes: &[u8]) -> String {
+    let key_len = bytes.len().min(LEGACY_DB_KEY_LEN);
+    let field = &bytes[..key_len];
+    let end = field
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(field.len());
+    String::from_utf8_lossy(&field[..end]).to_string()
+}
+
 /// Current server protocol version for lobby admission.
 #[must_use]
 pub const fn server_protocol_version() -> (u16, u16) {
@@ -494,6 +668,7 @@ pub const fn server_protocol_version() -> (u16, u16) {
 mod tests {
     use super::*;
     use battletris_db::STARTING_RANK;
+    use battletris_protocol::PlayerIdentity;
 
     fn player(id: &str, name: &str) -> HostedPlayer {
         HostedPlayer {
@@ -505,9 +680,32 @@ mod tests {
     fn register(player: HostedPlayer, ranked: bool) -> LobbyRegister {
         LobbyRegister {
             player,
-            direct_addr: "127.0.0.1:4404".to_string(),
+            direct_addr: "127.0.0.1:4405".to_string(),
             ranked,
         }
+    }
+
+    fn legacy_entry(name: &str, host: &str, port: u16, key: &str) -> LegacyNetworkEntry {
+        LegacyNetworkEntry {
+            key: key.to_string(),
+            user_name: name.to_string(),
+            host_name: host.to_string(),
+            timestamp: 1,
+            pid: 2,
+            addrnet: 127,
+            addrlna: 1,
+            port,
+            max_weapon: 34,
+            major: 1,
+            minor: 0,
+            status: LegacyNetworkStatus::Waiting,
+        }
+    }
+
+    fn legacy_key_payload(key: &str) -> Vec<u8> {
+        let mut bytes = vec![0; LEGACY_DB_KEY_LEN];
+        bytes[..key.len()].copy_from_slice(key.as_bytes());
+        bytes
     }
 
     fn claim(session_id: &HostedSessionId, reporter: &str) -> RankedResultClaim {
@@ -762,5 +960,109 @@ mod tests {
             server.session_status(&entry.session_id, "ada"),
             Err(ServerError::SessionUnavailable(_))
         ));
+    }
+
+    #[test]
+    fn legacy_roster_registers_and_lists_entries_by_key() {
+        let now = Instant::now();
+        let mut roster = LegacyRosterServer::new();
+        let ben = legacy_entry("Ben", "127.0.0.1", 4406, "b-key");
+        let ada = legacy_entry("Ada", "127.0.0.1", 4405, "a-key");
+
+        roster.register(1, ben.clone(), now).unwrap();
+        roster.register(2, ada.clone(), now).unwrap();
+
+        assert_eq!(roster.entries(), vec![ada, ben]);
+    }
+
+    #[test]
+    fn legacy_roster_replaces_duplicates_and_owner_entries() {
+        let now = Instant::now();
+        let mut roster = LegacyRosterServer::new();
+        let first = legacy_entry("Ada", "127.0.0.1", 4405, "same-key");
+        let mut replacement = first.clone();
+        replacement.host_name = "192.168.1.10".to_string();
+
+        roster.register(1, first, now).unwrap();
+        roster.register(2, replacement.clone(), now).unwrap();
+
+        assert_eq!(roster.entries(), vec![replacement]);
+        assert!(!roster.remove_owner(1));
+        assert!(roster.remove_owner(2));
+        assert!(roster.entries().is_empty());
+    }
+
+    #[test]
+    fn legacy_roster_verifies_only_waiting_keyed_entries() {
+        let now = Instant::now();
+        let mut roster = LegacyRosterServer::new();
+        roster
+            .register(1, legacy_entry("Ada", "127.0.0.1", 4405, "ada-key"), now)
+            .unwrap();
+
+        assert!(roster.verify_key(&legacy_key_payload("ada-key")));
+        assert!(!roster.verify_key(&legacy_key_payload("missing")));
+
+        roster.update_owner_status(1, now).unwrap();
+        assert!(!roster.verify_key(&legacy_key_payload("ada-key")));
+        roster.update_owner_status(1, now).unwrap();
+        assert!(roster.verify_key(&legacy_key_payload("ada-key")));
+    }
+
+    #[test]
+    fn legacy_roster_falls_back_to_identity_key_when_key_is_empty() {
+        let now = Instant::now();
+        let mut roster = LegacyRosterServer::new();
+        let entry = legacy_entry("Ada", "127.0.0.1", 4405, "");
+
+        let key = roster.register(1, entry, now).unwrap();
+
+        assert_eq!(key, format!("{}\0{}\0{}", "Ada", "127.0.0.1", 4405));
+    }
+
+    #[test]
+    fn legacy_roster_expires_idle_entries() {
+        let now = Instant::now();
+        let mut roster = LegacyRosterServer::new();
+        roster
+            .register(1, legacy_entry("Ada", "127.0.0.1", 4405, "ada-key"), now)
+            .unwrap();
+        roster
+            .register(
+                2,
+                legacy_entry("Ben", "127.0.0.1", 4406, "ben-key"),
+                now + Duration::from_secs(119),
+            )
+            .unwrap();
+
+        assert_eq!(
+            roster.expire_idle(now + LEGACY_ROSTER_IDLE_TIMEOUT, LEGACY_ROSTER_IDLE_TIMEOUT),
+            1
+        );
+        assert_eq!(roster.entries().len(), 1);
+        assert_eq!(roster.entries()[0].user_name, "Ben");
+    }
+
+    #[test]
+    fn legacy_roster_rejects_malformed_registration() {
+        let mut roster = LegacyRosterServer::new();
+        assert!(matches!(
+            roster.register(
+                1,
+                legacy_entry("", "127.0.0.1", 4405, "key"),
+                Instant::now()
+            ),
+            Err(LegacyRosterError::InvalidRegistration("user_name"))
+        ));
+
+        let waiting = LegacyNetworkEntry::waiting(
+            PlayerIdentity {
+                display_name: "Ada".to_string(),
+            },
+            "127.0.0.1:4405".parse().unwrap(),
+            1,
+            1,
+        );
+        roster.register(1, waiting, Instant::now()).unwrap();
     }
 }

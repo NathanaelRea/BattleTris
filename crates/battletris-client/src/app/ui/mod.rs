@@ -71,13 +71,12 @@ pub(super) use labels::{
     hosted_roster_user_info_label, incoming_challenge_panel_label, join_direct_panel_label,
     latest_weapon_feedback, legacy_arsenal_slot_label, legacy_challenge_info_panel_label,
     legacy_challenge_player_list_label, legacy_game_message_label, legacy_game_text_label,
-    legacy_host_panel_label, legacy_join_panel_label, legacy_score_label,
-    legacy_transport_status_label, lobby_status_label, local_game_result_for, menu_label,
-    network_session_status_label, opponent_player, phase_label, piece_label, player_hud,
-    player_label, recon_hud, roster_duration_label, roster_player_name_label, roster_text_label,
-    roster_user_info_label, roster_user_list_label, screen_body_label, short_weapon_name,
-    sleep_network_status_label, sorted_weapon_catalog, streak_label, truncate_label,
-    wrap_bazaar_description,
+    legacy_score_label, legacy_transport_status_label, lobby_status_label, local_game_result_for,
+    menu_label, network_session_status_label, opponent_player, phase_label, piece_label,
+    player_hud, player_label, recon_hud, roster_duration_label, roster_player_name_label,
+    roster_text_label, roster_user_info_label, roster_user_list_label, screen_body_label,
+    short_weapon_name, sleep_network_status_label, sorted_weapon_catalog, streak_label,
+    truncate_label, wrap_bazaar_description,
 };
 #[allow(unused_imports)]
 pub(super) use render::{

@@ -101,7 +101,7 @@ if [[ -x "$server_binary" && -x "$tools_binary" ]]; then
     "$server_binary" --help >/dev/null
     smoke_port=$((44040 + RANDOM % 1000))
     smoke_db="$scratch/package-smoke.db"
-    "$server_binary" --listen "127.0.0.1:$smoke_port" --db "$smoke_db" --community package-smoke --seed 900 >"$scratch/server.out" 2>"$scratch/server.err" &
+    "$server_binary" --modern-listen "127.0.0.1:$smoke_port" --db "$smoke_db" --community package-smoke --seed 900 >"$scratch/server.out" 2>"$scratch/server.err" &
     server_pid=$!
     cleanup_server() {
         if kill -0 "$server_pid" 2>/dev/null; then

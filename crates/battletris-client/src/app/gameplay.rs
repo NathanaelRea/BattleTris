@@ -10,6 +10,8 @@ pub(super) struct LocalGame {
     pub(super) mode: LocalGameMode,
     pub(super) network_session: Option<NetworkSession>,
     pub(super) network_lockstep: Option<NetworkLockstep>,
+    pub(super) legacy_remote: Option<LegacyRemoteOpponentState>,
+    pub(super) legacy_next_log_index: usize,
     pub(super) network_failed_closed: bool,
     pub(super) network_game_over_sent: bool,
     pub(super) network_result_claim_submitted: bool,
@@ -22,6 +24,7 @@ pub(super) enum LocalGameMode {
     ComputerOpponent,
     DirectConnect,
     HostedPlay,
+    LegacyDirect,
 }
 
 #[derive(Resource, Debug, Clone)]
@@ -111,6 +114,8 @@ impl LocalGame {
             mode: LocalGameMode::LocalHumanVsHuman,
             network_session: None,
             network_lockstep: None,
+            legacy_remote: None,
+            legacy_next_log_index: 0,
             network_failed_closed: false,
             network_game_over_sent: false,
             network_result_claim_submitted: false,
@@ -139,6 +144,8 @@ impl LocalGame {
             mode: LocalGameMode::ComputerOpponent,
             network_session: None,
             network_lockstep: None,
+            legacy_remote: None,
+            legacy_next_log_index: 0,
             network_failed_closed: false,
             network_game_over_sent: false,
             network_result_claim_submitted: false,
@@ -149,12 +156,13 @@ impl LocalGame {
     pub(super) fn new_networked(session: NetworkSession) -> Self {
         let (player_one_seed, player_two_seed) = derive_player_seeds(session.base_seed);
         let local_player = core_player_for_slot(session.local_slot);
-        let mode = if session.hosted.is_some() {
-            LocalGameMode::HostedPlay
-        } else {
-            LocalGameMode::DirectConnect
+        let mode = match session.mode {
+            NetworkMode::Direct => LocalGameMode::DirectConnect,
+            NetworkMode::Hosted => LocalGameMode::HostedPlay,
+            NetworkMode::LegacyDirect => LocalGameMode::LegacyDirect,
         };
         let status_message = Some(network_session_status_label(&session, None));
+        let is_legacy = session.mode == NetworkMode::LegacyDirect;
 
         Self {
             game: TwoPlayerGame::new(
@@ -164,7 +172,9 @@ impl LocalGame {
             computer: None,
             local_player,
             mode,
-            network_lockstep: Some(NetworkLockstep::new(session.local_slot)),
+            network_lockstep: (!is_legacy).then(|| NetworkLockstep::new(session.local_slot)),
+            legacy_remote: is_legacy.then(LegacyRemoteOpponentState::default),
+            legacy_next_log_index: 0,
             network_session: Some(session),
             network_failed_closed: false,
             network_game_over_sent: false,
@@ -183,7 +193,17 @@ impl LocalGame {
     }
 
     pub(super) fn is_networked(&self) -> bool {
+        self.network_session.is_some()
+    }
+
+    pub(super) fn is_lockstep_networked(&self) -> bool {
         self.network_session.is_some() && self.network_lockstep.is_some()
+    }
+
+    pub(super) fn is_legacy_networked(&self) -> bool {
+        self.network_session
+            .as_ref()
+            .is_some_and(|session| session.mode == NetworkMode::LegacyDirect)
     }
 }
 
@@ -449,7 +469,7 @@ pub(super) fn tick_game(
         return;
     }
 
-    if local.is_networked() {
+    if local.is_lockstep_networked() {
         tick_network_game(
             &mut local,
             &mut clock,
@@ -457,6 +477,19 @@ pub(super) fn tick_game(
             &mut network_state,
             &settings,
         );
+        return;
+    }
+
+    if local.is_legacy_networked() {
+        let local_player = local.local_player;
+        while clock.gameplay_elapsed_ms >= CLIENT_FIXED_TICK_MS {
+            clock.gameplay_elapsed_ms -= CLIENT_FIXED_TICK_MS;
+            let _ = local.game.tick_player(local_player, CLIENT_FIXED_TICK_MS);
+            if local.game.phase() != GamePhase::Playing {
+                break;
+            }
+        }
+        flush_legacy_outbound_events(&mut local, &mut network_runtime, &mut network_state);
         return;
     }
 
@@ -601,6 +634,201 @@ pub(super) fn send_network_checksum(
     );
 }
 
+pub(super) fn flush_legacy_outbound_events(
+    local: &mut LocalGame,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+) {
+    if !local.is_legacy_networked() || local.network_failed_closed {
+        return;
+    }
+
+    let local_player = local.local_player;
+    let events: Vec<LoggedEvent> = local.game.event_log()[local.legacy_next_log_index..].to_vec();
+    local.legacy_next_log_index = local.game.event_log().len();
+    for logged in events {
+        match logged.event {
+            BattleEvent::PlayerEvent { player, event } if player == local_player => match event {
+                CoreEvent::PieceLocked { .. } => {
+                    send_legacy_board_snapshot(local, network_runtime, network_state);
+                    send_legacy_score_snapshot(local, network_runtime, network_state);
+                }
+                CoreEvent::FastDropStarted { score_delta } => {
+                    send_i16_delta(
+                        network_runtime,
+                        network_state,
+                        score_delta,
+                        NetworkCommand::SendLegacyScoreDelta,
+                    );
+                    send_legacy_score_snapshot(local, network_runtime, network_state);
+                }
+                CoreEvent::LinesCleared { lines, funds } => {
+                    send_i16_delta(
+                        network_runtime,
+                        network_state,
+                        funds,
+                        NetworkCommand::SendLegacyFundsDelta,
+                    );
+                    send_i16_delta(
+                        network_runtime,
+                        network_state,
+                        i32::try_from(lines).unwrap_or(i32::MAX),
+                        NetworkCommand::SendLegacyLinesDelta,
+                    );
+                    send_legacy_board_snapshot(local, network_runtime, network_state);
+                    send_legacy_score_snapshot(local, network_runtime, network_state);
+                }
+                _ => {}
+            },
+            BattleEvent::BazaarEntered => {
+                try_send_network_command(
+                    network_runtime,
+                    network_state,
+                    NetworkCommand::SendLegacyStartBazaar,
+                );
+            }
+            BattleEvent::BazaarPlayerDone { player } if player == local_player => {
+                send_legacy_arsenal_snapshot(local, network_runtime, network_state);
+                try_send_network_command(
+                    network_runtime,
+                    network_state,
+                    NetworkCommand::SendLegacyEndBazaar,
+                );
+            }
+            BattleEvent::PlayerDied { player } if player == local_player => {
+                try_send_network_command(
+                    network_runtime,
+                    network_state,
+                    NetworkCommand::SendLegacyDead,
+                );
+            }
+            BattleEvent::GameOver { loser, .. } if loser == local_player => {
+                local.network_game_over_sent = try_send_network_command(
+                    network_runtime,
+                    network_state,
+                    NetworkCommand::SendLegacyDead,
+                );
+            }
+            BattleEvent::WeaponLaunched {
+                launcher, token, ..
+            } if launcher == local_player => {
+                try_send_network_command(
+                    network_runtime,
+                    network_state,
+                    NetworkCommand::SendLegacyWeaponLaunch {
+                        weapon: token.legacy_id(),
+                    },
+                );
+                send_legacy_arsenal_snapshot(local, network_runtime, network_state);
+            }
+            BattleEvent::TimedWeaponExpired { player, token } if player == local_player => {
+                try_send_network_command(
+                    network_runtime,
+                    network_state,
+                    NetworkCommand::SendLegacyWeaponOff {
+                        weapon: token.legacy_id(),
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn send_legacy_board_snapshot(
+    local: &LocalGame,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+) {
+    try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::SendLegacyBoard(legacy_local_board_snapshot(local)),
+    );
+}
+
+fn send_legacy_score_snapshot(
+    local: &LocalGame,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+) {
+    try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::SendLegacyScore(legacy_local_score_snapshot(local)),
+    );
+}
+
+fn send_legacy_arsenal_snapshot(
+    local: &LocalGame,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+) {
+    try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::SendLegacyArsenal(legacy_local_arsenal_snapshot(local)),
+    );
+}
+
+fn send_i16_delta(
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+    value: i32,
+    command: impl FnOnce(i16) -> NetworkCommand,
+) {
+    let value = value.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+    try_send_network_command(network_runtime, network_state, command(value));
+}
+
+fn legacy_local_score_snapshot(local: &LocalGame) -> ScoreSnapshot {
+    let player = local.game.player(local.local_player);
+    ScoreSnapshot {
+        player: protocol_slot_for_player(local.local_player),
+        score: player.score(),
+        funds: player.funds(),
+        lines: player.lines(),
+    }
+}
+
+fn legacy_local_board_snapshot(local: &LocalGame) -> WireBoardSnapshot {
+    let snapshot = local.game.player(local.local_player).board().snapshot();
+    let cells = snapshot
+        .cells
+        .into_iter()
+        .map(|cell| cell.map_or(0, Cell::legacy_id))
+        .collect();
+    WireBoardSnapshot::new(
+        protocol_slot_for_player(local.local_player),
+        0,
+        snapshot.width.try_into().expect("board width fits in u16"),
+        snapshot
+            .height
+            .try_into()
+            .expect("board height fits in u16"),
+        cells,
+    )
+    .expect("core board snapshot dimensions are valid for protocol")
+}
+
+fn legacy_local_arsenal_snapshot(local: &LocalGame) -> ArsenalSnapshot {
+    let mut slots = [None; 10];
+    let arsenal = local.game.bazaar_session(local.local_player).map_or_else(
+        || local.game.player(local.local_player).arsenal(),
+        |bazaar| bazaar.staged_arsenal(),
+    );
+    for (index, slot) in arsenal.slots().iter().enumerate() {
+        slots[index] = slot.map(|slot| ArsenalEntry {
+            weapon: slot.token.legacy_id(),
+            quantity: slot.quantity.min(u32::from(u16::MAX)) as u16,
+        });
+    }
+    ArsenalSnapshot {
+        player: protocol_slot_for_player(local.local_player),
+        slots,
+    }
+}
+
 pub(super) fn submit_hosted_ranked_result_claim(
     local: &mut LocalGame,
     duration_ticks: u64,
@@ -629,8 +857,11 @@ pub(super) fn submit_hosted_ranked_result_claim(
         network_state.result_status = status;
         return;
     }
-    let Ok(server_addr) = parse_network_addr(&settings.lobby_addr, "lobby address", network_state)
-    else {
+    let Ok(server_addr) = parse_network_addr(
+        &settings.modern_server_addr,
+        "modern server address",
+        network_state,
+    ) else {
         let status = FinalResultStatus::Rejected("connection error".to_string());
         set_local_result_status(local, status.clone());
         network_state.result_status = status;

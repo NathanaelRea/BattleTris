@@ -25,7 +25,8 @@ pub(super) struct ClientSettings {
     pub(super) direct_listen_addr: String,
     pub(super) direct_share_addr: String,
     pub(super) direct_join_addr: String,
-    pub(super) lobby_addr: String,
+    pub(super) modern_server_addr: String,
+    pub(super) legacy_server_addr: String,
     pub(super) lobby_enabled: bool,
     pub(super) hosted_ranked: bool,
     pub(super) settings_path: Option<PathBuf>,
@@ -50,7 +51,8 @@ impl Default for ClientSettings {
             direct_listen_addr: "0.0.0.0:4405".to_string(),
             direct_share_addr: suggested_share_addr_for("0.0.0.0:4405"),
             direct_join_addr: "127.0.0.1:4405".to_string(),
-            lobby_addr: DEFAULT_LOBBY_ADDR.to_string(),
+            modern_server_addr: DEFAULT_MODERN_SERVER_ADDR.to_string(),
+            legacy_server_addr: DEFAULT_LEGACY_SERVER_ADDR.to_string(),
             lobby_enabled: true,
             hosted_ranked: true,
             settings_path: settings_path(),
@@ -122,7 +124,8 @@ impl ClientSettings {
             direct_listen_addr: self.direct_listen_addr.clone(),
             direct_share_addr: self.direct_share_addr.clone(),
             direct_join_addr: self.direct_join_addr.clone(),
-            lobby_addr: self.lobby_addr.clone(),
+            modern_server_addr: self.modern_server_addr.clone(),
+            legacy_server_addr: self.legacy_server_addr.clone(),
             hosted_ranked: self.hosted_ranked,
         }
     }
@@ -145,7 +148,10 @@ impl ClientSettings {
             sanitize_share_addr_setting(persisted.direct_share_addr, &self.direct_listen_addr);
         self.direct_join_addr =
             sanitize_socket_setting(persisted.direct_join_addr, "127.0.0.1:4405");
-        self.lobby_addr = sanitize_socket_setting(persisted.lobby_addr, DEFAULT_LOBBY_ADDR);
+        self.modern_server_addr =
+            sanitize_socket_setting(persisted.modern_server_addr, DEFAULT_MODERN_SERVER_ADDR);
+        self.legacy_server_addr =
+            sanitize_socket_setting(persisted.legacy_server_addr, DEFAULT_LEGACY_SERVER_ADDR);
         self.hosted_ranked = persisted.hosted_ranked;
     }
 }
@@ -165,7 +171,8 @@ pub(super) struct PersistedClientSettings {
     pub(super) direct_listen_addr: String,
     pub(super) direct_share_addr: String,
     pub(super) direct_join_addr: String,
-    pub(super) lobby_addr: String,
+    pub(super) modern_server_addr: String,
+    pub(super) legacy_server_addr: String,
     pub(super) hosted_ranked: bool,
 }
 
@@ -184,7 +191,8 @@ impl Default for PersistedClientSettings {
             direct_listen_addr: "0.0.0.0:4405".to_string(),
             direct_share_addr: suggested_share_addr_for("0.0.0.0:4405"),
             direct_join_addr: "127.0.0.1:4405".to_string(),
-            lobby_addr: DEFAULT_LOBBY_ADDR.to_string(),
+            modern_server_addr: DEFAULT_MODERN_SERVER_ADDR.to_string(),
+            legacy_server_addr: DEFAULT_LEGACY_SERVER_ADDR.to_string(),
             hosted_ranked: true,
         }
     }
@@ -271,7 +279,8 @@ pub(super) fn settings_field_value(settings: &ClientSettings, field: SettingsFie
         SettingsField::HostBindAddress => &settings.direct_listen_addr,
         SettingsField::ShareAddress => &settings.direct_share_addr,
         SettingsField::JoinAddress => &settings.direct_join_addr,
-        SettingsField::LobbyAddress => &settings.lobby_addr,
+        SettingsField::ModernServerAddress => &settings.modern_server_addr,
+        SettingsField::LegacyServerAddress => &settings.legacy_server_addr,
     }
 }
 
@@ -285,7 +294,8 @@ pub(super) fn settings_field_value_mut(
         SettingsField::HostBindAddress => &mut settings.direct_listen_addr,
         SettingsField::ShareAddress => &mut settings.direct_share_addr,
         SettingsField::JoinAddress => &mut settings.direct_join_addr,
-        SettingsField::LobbyAddress => &mut settings.lobby_addr,
+        SettingsField::ModernServerAddress => &mut settings.modern_server_addr,
+        SettingsField::LegacyServerAddress => &mut settings.legacy_server_addr,
     }
 }
 
@@ -324,10 +334,16 @@ pub(super) fn sanitize_settings_after_edit(settings: &mut ClientSettings, field:
                 "127.0.0.1:4405",
             );
         }
-        SettingsField::LobbyAddress => {
-            settings.lobby_addr = sanitize_socket_setting(
-                std::mem::take(&mut settings.lobby_addr),
-                DEFAULT_LOBBY_ADDR,
+        SettingsField::ModernServerAddress => {
+            settings.modern_server_addr = sanitize_socket_setting(
+                std::mem::take(&mut settings.modern_server_addr),
+                DEFAULT_MODERN_SERVER_ADDR,
+            );
+        }
+        SettingsField::LegacyServerAddress => {
+            settings.legacy_server_addr = sanitize_socket_setting(
+                std::mem::take(&mut settings.legacy_server_addr),
+                DEFAULT_LEGACY_SERVER_ADDR,
             );
         }
     }

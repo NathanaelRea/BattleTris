@@ -5,10 +5,14 @@ edition.workspace = true
 publish.workspace = true
 description = "Optional BattleTris lobby, relay, or dedicated server service."
 
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
 [lints]
 workspace = true
 
 [dependencies]
 battletris-db = { path = "../battletris-db" }
 battletris-protocol = { path = "../battletris-protocol" }
-tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "rt-multi-thread", "sync"] }
+tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

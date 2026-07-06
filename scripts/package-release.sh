@@ -50,8 +50,8 @@ install_binary() {
 }
 
 install_binary client battletris-client
-install_binary battletris-server battletris-server
-install_binary battletris-tools battletris-tools
+install_binary server battletris-server
+install_binary tools battletris-tools
 
 cp -R assets/. "$package_dir/assets/"
 cp docs/rewrite-spec.md docs/traceability-checklist.md docs/rust-workspace.md docs/distribution.md docs/manual-network-tests.md "$package_dir/docs/"
@@ -104,10 +104,10 @@ Support checklist:
 
 An operator can run a small community lobby with:
 
-\`bin/battletris-server${exe_suffix} --listen 0.0.0.0:4404 --community garage\`
+\`bin/battletris-server${exe_suffix} --modern-listen 0.0.0.0:4405 --community garage\`
 
-Clients set Lobby Address to the server's reachable address, for example
-\`192.168.1.10:4404\`. Hosted games still require the host direct gameplay share
+Clients set Modern Server to the server's reachable address, for example
+\`192.168.1.10:4405\`. Hosted games still require the host direct gameplay share
 address to be reachable by the joiner. The lobby issues session metadata and
 ranked-result authority; it does not relay gameplay frames.
 

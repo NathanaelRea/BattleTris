@@ -5,11 +5,21 @@
 
 #[cfg(feature = "lan-discovery")]
 use std::collections::HashMap;
-use std::{collections::BTreeMap, net::SocketAddr, thread, time::Duration};
+use std::{
+    collections::BTreeMap,
+    net::{Ipv4Addr, SocketAddr},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use battletris_core::{
     game::{BattleEvent, Command, GamePhase, LoggedEvent, PlayerId, ShoppingError, TwoPlayerGame},
     weapons::WeaponToken,
+};
+use battletris_protocol::legacy::{
+    LegacyArsenalPayload, LegacyArsenalSlot, LegacyBoardPayload, LegacyConnection, LegacyError,
+    LegacyNetworkEntry, LegacyPacket, LegacyScorePayload, LegacyShortPayload, LegacyToken,
+    LegacyWeaponPayload, PendingLegacyChallenge, LEGACY_NO_WEAPON_TOKEN,
 };
 use battletris_protocol::{
     ArsenalEntry, ArsenalSnapshot, BazaarBuy, BazaarDone, BazaarRemove,
@@ -53,6 +63,42 @@ pub enum NetworkMode {
     Direct,
     /// Self-hosted lobby issued metadata, while gameplay remains direct TCP.
     Hosted,
+    /// Original BattleTris direct TCP gameplay protocol.
+    LegacyDirect,
+}
+
+/// Remote presentation state replicated by the original BattleTris protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LegacyRemoteOpponentState {
+    /// Latest opponent score.
+    pub score: i32,
+    /// Latest opponent funds.
+    pub funds: i32,
+    /// Latest opponent line count.
+    pub lines: u32,
+    /// Latest opponent board snapshot.
+    pub board: Option<WireBoardSnapshot>,
+    /// Latest opponent arsenal snapshot.
+    pub arsenal: Option<ArsenalSnapshot>,
+    /// Whether the peer is currently in Bazaar.
+    pub in_bazaar: bool,
+    /// Whether the peer has toggled pause.
+    pub paused: bool,
+    /// Timed weapon tokens currently visible as active for the peer.
+    pub active_weapons: Vec<u8>,
+}
+
+/// Score-family update carried by original BattleTris gameplay packets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacyRemoteScoreUpdate {
+    /// Full opponent score/funds/line snapshot.
+    Snapshot(ScoreSnapshot),
+    /// Opponent score delta.
+    ScoreDelta(i32),
+    /// Opponent funds delta.
+    FundsDelta(i32),
+    /// Opponent line-count delta.
+    LinesDelta(u32),
 }
 
 /// Final hosted ranked result status known by the client.
@@ -221,6 +267,23 @@ impl NetworkSession {
             },
         }
     }
+
+    /// Builds original BattleTris legacy direct-game session metadata.
+    #[must_use]
+    pub fn legacy_direct(local_slot: PlayerSlot, peer_identity: PlayerIdentity) -> Self {
+        Self {
+            mode: NetworkMode::LegacyDirect,
+            local_slot,
+            peer_identity,
+            base_seed: 0,
+            ranked: false,
+            hosted: None,
+            community_label: None,
+            current_tick: 0,
+            peer_watermark: None,
+            final_result_status: FinalResultStatus::Unranked,
+        }
+    }
 }
 
 /// Builds a deterministic hosted ranked result claim from final client game state.
@@ -309,6 +372,8 @@ pub enum NetworkLifecycleState {
     Challenged { challenge: Challenge },
     /// A game is connected and ready for deterministic simulation.
     Connected { session: Box<NetworkSession> },
+    /// Legacy challenge/start handshake completed; gameplay adapter is not lockstep.
+    LegacyConnected { peer_identity: PlayerIdentity },
     /// Disconnect command was sent and cleanup is underway.
     Disconnecting,
     /// Last operation failed.
@@ -338,6 +403,19 @@ pub enum NetworkCommand {
         peer_addr: SocketAddr,
         identity: PlayerIdentity,
         challenge_text: String,
+    },
+    /// Listen for one original BattleTris direct challenge and optionally advertise to `btserverd`.
+    LegacyHost {
+        bind_addr: SocketAddr,
+        identity: PlayerIdentity,
+        share_addr: SocketAddr,
+        server_addr: Option<SocketAddr>,
+    },
+    /// Join an original BattleTris direct challenge.
+    LegacyJoin {
+        peer_addr: SocketAddr,
+        identity: PlayerIdentity,
+        share_addr: SocketAddr,
     },
     /// Join a hosted direct peer after receiving server-owned start metadata.
     JoinHostedDirect {
@@ -400,6 +478,28 @@ pub enum NetworkCommand {
     SendBazaarRemove(BazaarRemove),
     /// Send a Bazaar done intent.
     SendBazaarDone { player: PlayerSlot },
+    /// Send a legacy full score/funds/lines snapshot.
+    SendLegacyScore(ScoreSnapshot),
+    /// Send a legacy score delta.
+    SendLegacyScoreDelta(i16),
+    /// Send a legacy funds delta.
+    SendLegacyFundsDelta(i16),
+    /// Send a legacy line-count delta.
+    SendLegacyLinesDelta(i16),
+    /// Send a legacy board snapshot.
+    SendLegacyBoard(WireBoardSnapshot),
+    /// Send a legacy arsenal snapshot.
+    SendLegacyArsenal(ArsenalSnapshot),
+    /// Send a legacy Bazaar start notification.
+    SendLegacyStartBazaar,
+    /// Send a legacy Bazaar done notification.
+    SendLegacyEndBazaar,
+    /// Send a legacy terminal death/game-over notification.
+    SendLegacyDead,
+    /// Send a legacy weapon launch notification.
+    SendLegacyWeaponLaunch { weapon: u8 },
+    /// Send a legacy timed weapon expiration notification.
+    SendLegacyWeaponOff { weapon: u8 },
     /// Submit a hosted ranked result claim.
     SubmitResult {
         server_addr: SocketAddr,
@@ -458,6 +558,26 @@ pub enum NetworkEvent {
     DesyncDetected(Box<DesyncReport>),
     /// Game-over message arrived.
     GameOver(GameOver),
+    /// Legacy peer score/funds/line state arrived.
+    LegacyRemoteScore(LegacyRemoteScoreUpdate),
+    /// Legacy peer board state arrived.
+    LegacyRemoteBoard(WireBoardSnapshot),
+    /// Legacy peer arsenal state arrived.
+    LegacyRemoteArsenal(ArsenalSnapshot),
+    /// Legacy peer entered Bazaar.
+    LegacyRemoteBazaarStarted,
+    /// Legacy peer finished Bazaar.
+    LegacyRemoteBazaarDone,
+    /// Legacy peer toggled pause state.
+    LegacyRemotePauseToggled,
+    /// Legacy peer death/game-over packet arrived.
+    LegacyRemoteDead,
+    /// Legacy peer launched a weapon at the local board.
+    LegacyIncomingWeapon { weapon: u8 },
+    /// Legacy peer timed weapon became visible as active.
+    LegacyRemoteWeaponOn { weapon: u8 },
+    /// Legacy peer timed weapon became visible as inactive.
+    LegacyRemoteWeaponOff { weapon: u8 },
     /// Hosted ranked result is pending a peer claim.
     PendingResult(RankedResultPending),
     /// Hosted ranked result was recorded by the server.
@@ -569,9 +689,16 @@ enum ActiveConnection {
     PendingDirect {
         pending: battletris_protocol::PendingDirectChallenge,
     },
+    PendingLegacy {
+        pending: PendingLegacyChallenge,
+    },
     Connected {
         connection: DirectConnection,
         session: Box<NetworkSession>,
+    },
+    LegacyConnected {
+        connection: LegacyConnection,
+        peer_identity: PlayerIdentity,
     },
 }
 
@@ -622,6 +749,39 @@ async fn run_network_loop(io: &mut NetworkIo, shutdown_rx: &mut oneshot::Receive
                     }
                 }
             }
+            ActiveConnection::LegacyConnected {
+                connection,
+                peer_identity,
+            } => {
+                tokio::select! {
+                    _ = &mut *shutdown_rx => break,
+                    command = io.command_rx.recv() => {
+                        let Some(command) = command else { break };
+                        if handle_legacy_connected_command(command, connection, peer_identity, io).await {
+                            active = ActiveConnection::Idle;
+                        }
+                    }
+                    packet = timeout(PEER_IDLE_TIMEOUT, connection.recv()) => {
+                        match packet {
+                            Ok(Ok(packet)) => {
+                                if handle_legacy_peer_packet(packet, peer_identity, io).await {
+                                    active = ActiveConnection::Idle;
+                                }
+                            }
+                            Ok(Err(error)) => {
+                                emit_error(io, format_legacy_error("legacy peer read failed", &error)).await;
+                                emit_state(io, NetworkLifecycleState::Idle).await;
+                                active = ActiveConnection::Idle;
+                            }
+                            Err(_) => {
+                                emit_error(io, format!("Legacy peer idle timeout after {}s: peer={}", PEER_IDLE_TIMEOUT.as_secs(), peer_identity.display_name)).await;
+                                emit_state(io, NetworkLifecycleState::Idle).await;
+                                active = ActiveConnection::Idle;
+                            }
+                        }
+                    }
+                }
+            }
             _ => {
                 tokio::select! {
                     _ = &mut *shutdown_rx => break,
@@ -634,6 +794,362 @@ async fn run_network_loop(io: &mut NetworkIo, shutdown_rx: &mut oneshot::Receive
         }
     }
     discovery.stop_advertising(io).await;
+}
+
+async fn handle_legacy_connected_command(
+    command: NetworkCommand,
+    connection: &mut LegacyConnection,
+    peer_identity: &PlayerIdentity,
+    io: &mut NetworkIo,
+) -> bool {
+    match command {
+        NetworkCommand::Cancel | NetworkCommand::Disconnect { .. } => {
+            let _ = connection
+                .send(&LegacyPacket::empty(LegacyToken::Null))
+                .await;
+            emit_state(io, NetworkLifecycleState::Idle).await;
+            true
+        }
+        NetworkCommand::SendLegacyScore(score) => {
+            send_legacy_gameplay_packet(connection, io, legacy_score_packet(&score)).await
+        }
+        NetworkCommand::SendLegacyScoreDelta(value) => {
+            send_legacy_gameplay_packet(
+                connection,
+                io,
+                Ok(LegacyPacket {
+                    token: LegacyToken::Score,
+                    payload: LegacyShortPayload { value }.encode(),
+                }),
+            )
+            .await
+        }
+        NetworkCommand::SendLegacyFundsDelta(value) => {
+            send_legacy_gameplay_packet(
+                connection,
+                io,
+                Ok(LegacyPacket {
+                    token: LegacyToken::Funds,
+                    payload: LegacyShortPayload { value }.encode(),
+                }),
+            )
+            .await
+        }
+        NetworkCommand::SendLegacyLinesDelta(value) => {
+            send_legacy_gameplay_packet(
+                connection,
+                io,
+                Ok(LegacyPacket {
+                    token: LegacyToken::Line,
+                    payload: LegacyShortPayload { value }.encode(),
+                }),
+            )
+            .await
+        }
+        NetworkCommand::SendLegacyBoard(board) => {
+            send_legacy_gameplay_packet(connection, io, legacy_board_packet(&board)).await
+        }
+        NetworkCommand::SendLegacyArsenal(arsenal) => {
+            send_legacy_gameplay_packet(connection, io, legacy_arsenal_packet(&arsenal)).await
+        }
+        NetworkCommand::SendLegacyStartBazaar => {
+            send_legacy_gameplay_packet(
+                connection,
+                io,
+                Ok(LegacyPacket::empty(LegacyToken::StartBazaar)),
+            )
+            .await
+        }
+        NetworkCommand::SendLegacyEndBazaar => {
+            send_legacy_gameplay_packet(
+                connection,
+                io,
+                Ok(LegacyPacket::empty(LegacyToken::EndBazaar)),
+            )
+            .await
+        }
+        NetworkCommand::SendLegacyDead => {
+            send_legacy_gameplay_packet(connection, io, Ok(LegacyPacket::empty(LegacyToken::Dead)))
+                .await
+        }
+        NetworkCommand::SendLegacyWeaponLaunch { weapon } => {
+            send_legacy_gameplay_packet(
+                connection,
+                io,
+                legacy_weapon_packet(LegacyToken::WeaponOn, weapon),
+            )
+            .await
+        }
+        NetworkCommand::SendLegacyWeaponOff { weapon } => {
+            send_legacy_gameplay_packet(
+                connection,
+                io,
+                legacy_weapon_packet(LegacyToken::WeaponOff, weapon),
+            )
+            .await
+        }
+        other => {
+            emit_error(
+                io,
+                format!(
+                    "legacy session with {} cannot handle {:?} until gameplay adapter is implemented",
+                    peer_identity.display_name,
+                    command_name(&other)
+                ),
+            )
+            .await;
+            false
+        }
+    }
+}
+
+async fn send_legacy_gameplay_packet(
+    connection: &mut LegacyConnection,
+    io: &mut NetworkIo,
+    packet: Result<LegacyPacket, LegacyError>,
+) -> bool {
+    let packet = match packet {
+        Ok(packet) => packet,
+        Err(error) => {
+            emit_error(
+                io,
+                format_legacy_error("legacy gameplay packet encode failed", &error),
+            )
+            .await;
+            return false;
+        }
+    };
+    if let Err(error) = connection.send(&packet).await {
+        emit_error(
+            io,
+            format_legacy_error("send legacy gameplay packet failed", &error),
+        )
+        .await;
+        emit_state(io, NetworkLifecycleState::Idle).await;
+        return true;
+    }
+    false
+}
+
+fn legacy_score_packet(score: &ScoreSnapshot) -> Result<LegacyPacket, LegacyError> {
+    Ok(LegacyPacket {
+        token: LegacyToken::Score,
+        payload: LegacyScorePayload {
+            score: u32::try_from(score.score).unwrap_or_default(),
+            opponent_score: 0,
+            lines: score.lines,
+            opponent_lines: 0,
+            funds: score.funds,
+            opponent_funds: 0,
+        }
+        .encode(),
+    })
+}
+
+fn legacy_board_packet(board: &WireBoardSnapshot) -> Result<LegacyPacket, LegacyError> {
+    let motivation = board.motivation.clamp(0, i32::from(u16::MAX)) as u16;
+    let cells = board
+        .cells
+        .iter()
+        .copied()
+        .map(|cell| u32::try_from(cell).unwrap_or_default())
+        .collect();
+    Ok(LegacyPacket {
+        token: LegacyToken::Board,
+        payload: LegacyBoardPayload::new(motivation, board.height, board.width, cells)?.encode()?,
+    })
+}
+
+fn legacy_arsenal_packet(arsenal: &ArsenalSnapshot) -> Result<LegacyPacket, LegacyError> {
+    let slots = arsenal
+        .slots
+        .iter()
+        .map(|slot| LegacyArsenalSlot {
+            weapon_token: slot.map_or(LEGACY_NO_WEAPON_TOKEN, |entry| u16::from(entry.weapon)),
+            quantity: slot.map_or(0, |entry| entry.quantity),
+        })
+        .collect();
+    Ok(LegacyPacket {
+        token: LegacyToken::Arsenal,
+        payload: LegacyArsenalPayload::new(slots)?.encode()?,
+    })
+}
+
+fn legacy_weapon_packet(token: LegacyToken, weapon: u8) -> Result<LegacyPacket, LegacyError> {
+    Ok(LegacyPacket {
+        token,
+        payload: LegacyWeaponPayload::new(u16::from(weapon))?.encode(),
+    })
+}
+
+async fn handle_legacy_peer_packet(
+    packet: LegacyPacket,
+    peer_identity: &PlayerIdentity,
+    io: &mut NetworkIo,
+) -> bool {
+    match legacy_event_from_packet(&packet) {
+        Ok(Some(event)) => {
+            let _ = io.event_tx.send(event).await;
+            return false;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            emit_error(
+                io,
+                format_legacy_error("legacy gameplay packet decode failed", &error),
+            )
+            .await;
+            return false;
+        }
+    }
+
+    match packet.token {
+        LegacyToken::Null | LegacyToken::Err => {
+            emit_error(
+                io,
+                format!("Legacy peer {} disconnected", peer_identity.display_name),
+            )
+            .await;
+            emit_state(io, NetworkLifecycleState::Idle).await;
+            true
+        }
+        token => {
+            log_net(&format!(
+                "legacy gameplay packet {:?} ({} bytes) ignored until adapter is implemented",
+                token,
+                packet.payload.len()
+            ));
+            false
+        }
+    }
+}
+
+fn legacy_event_from_packet(packet: &LegacyPacket) -> Result<Option<NetworkEvent>, LegacyError> {
+    let event = match packet.token {
+        LegacyToken::Score => {
+            if packet.payload.len() == battletris_protocol::legacy::LEGACY_SCORE_PAYLOAD_LEN {
+                let score = LegacyScorePayload::decode(&packet.payload)?;
+                NetworkEvent::LegacyRemoteScore(LegacyRemoteScoreUpdate::Snapshot(ScoreSnapshot {
+                    player: PlayerSlot::Two,
+                    score: score.score.min(i32::MAX as u32) as i32,
+                    funds: score.funds,
+                    lines: score.lines,
+                }))
+            } else {
+                let score_delta = LegacyShortPayload::decode(&packet.payload)?;
+                NetworkEvent::LegacyRemoteScore(LegacyRemoteScoreUpdate::ScoreDelta(i32::from(
+                    score_delta.value,
+                )))
+            }
+        }
+        LegacyToken::OpponentScore => {
+            let score = LegacyScorePayload::decode(&packet.payload)?;
+            NetworkEvent::LegacyRemoteScore(LegacyRemoteScoreUpdate::Snapshot(ScoreSnapshot {
+                player: PlayerSlot::Two,
+                score: score.score.min(i32::MAX as u32) as i32,
+                funds: score.funds,
+                lines: score.lines,
+            }))
+        }
+        LegacyToken::Funds => {
+            let funds_delta = LegacyShortPayload::decode(&packet.payload)?;
+            NetworkEvent::LegacyRemoteScore(LegacyRemoteScoreUpdate::FundsDelta(i32::from(
+                funds_delta.value,
+            )))
+        }
+        LegacyToken::Line => {
+            let lines_delta = LegacyShortPayload::decode(&packet.payload)?;
+            NetworkEvent::LegacyRemoteScore(LegacyRemoteScoreUpdate::LinesDelta(
+                u32::try_from(lines_delta.value).unwrap_or_default(),
+            ))
+        }
+        LegacyToken::Board => {
+            let board = LegacyBoardPayload::decode(&packet.payload)?;
+            NetworkEvent::LegacyRemoteBoard(legacy_board_snapshot(&board))
+        }
+        LegacyToken::Arsenal => {
+            let arsenal = LegacyArsenalPayload::decode(&packet.payload)?;
+            NetworkEvent::LegacyRemoteArsenal(legacy_arsenal_snapshot(&arsenal))
+        }
+        LegacyToken::StartBazaar => {
+            battletris_protocol::legacy::validate_legacy_empty_payload(&packet.payload)?;
+            NetworkEvent::LegacyRemoteBazaarStarted
+        }
+        LegacyToken::EndBazaar => {
+            battletris_protocol::legacy::validate_legacy_empty_payload(&packet.payload)?;
+            NetworkEvent::LegacyRemoteBazaarDone
+        }
+        LegacyToken::Pause => {
+            battletris_protocol::legacy::validate_legacy_empty_payload(&packet.payload)?;
+            NetworkEvent::LegacyRemotePauseToggled
+        }
+        LegacyToken::Dead | LegacyToken::GameOver => {
+            battletris_protocol::legacy::validate_legacy_empty_payload(&packet.payload)?;
+            NetworkEvent::LegacyRemoteDead
+        }
+        LegacyToken::WeaponOn | LegacyToken::WeaponLaunch => {
+            let weapon = LegacyWeaponPayload::decode(&packet.payload)?;
+            NetworkEvent::LegacyIncomingWeapon {
+                weapon: weapon
+                    .weapon_token
+                    .try_into()
+                    .expect("legacy weapon token fits in u8"),
+            }
+        }
+        LegacyToken::WeaponOff => {
+            let weapon = LegacyWeaponPayload::decode(&packet.payload)?;
+            NetworkEvent::LegacyRemoteWeaponOff {
+                weapon: weapon
+                    .weapon_token
+                    .try_into()
+                    .expect("legacy weapon token fits in u8"),
+            }
+        }
+        LegacyToken::CondorOff => {
+            battletris_protocol::legacy::validate_legacy_empty_payload(&packet.payload)?;
+            NetworkEvent::LegacyRemoteWeaponOff {
+                weapon: WeaponToken::Condor.legacy_id(),
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(event))
+}
+
+fn legacy_board_snapshot(payload: &LegacyBoardPayload) -> WireBoardSnapshot {
+    let cells = payload
+        .cells
+        .iter()
+        .copied()
+        .map(|cell| i16::try_from(cell).unwrap_or(-1))
+        .collect();
+    WireBoardSnapshot::new(
+        PlayerSlot::Two,
+        i32::from(payload.motivation),
+        payload.width,
+        payload.height,
+        cells,
+    )
+    .expect("legacy board payload dimensions were already validated")
+}
+
+fn legacy_arsenal_snapshot(payload: &LegacyArsenalPayload) -> ArsenalSnapshot {
+    let mut slots = [None; 10];
+    for (index, slot) in payload.slots.iter().take(slots.len()).enumerate() {
+        if slot.weapon_token != LEGACY_NO_WEAPON_TOKEN {
+            slots[index] = Some(ArsenalEntry {
+                weapon: slot
+                    .weapon_token
+                    .try_into()
+                    .expect("legacy weapon token fits in u8"),
+                quantity: slot.quantity,
+            });
+        }
+    }
+    ArsenalSnapshot {
+        player: PlayerSlot::Two,
+        slots,
+    }
 }
 
 async fn handle_lifecycle_command(
@@ -663,6 +1179,24 @@ async fn handle_lifecycle_command(
         } => {
             *active = ActiveConnection::Idle;
             join_direct(peer_addr, identity, challenge_text, active, io).await;
+        }
+        NetworkCommand::LegacyHost {
+            bind_addr,
+            identity,
+            share_addr,
+            server_addr,
+        } => {
+            *active = ActiveConnection::Idle;
+            host_until_legacy_challenge(bind_addr, identity, share_addr, server_addr, active, io)
+                .await;
+        }
+        NetworkCommand::LegacyJoin {
+            peer_addr,
+            identity,
+            share_addr,
+        } => {
+            *active = ActiveConnection::Idle;
+            join_legacy(peer_addr, identity, share_addr, active, io).await;
         }
         NetworkCommand::JoinHostedDirect {
             peer_addr,
@@ -718,10 +1252,13 @@ async fn handle_lifecycle_command(
         }
         NetworkCommand::Accept { seed, ranked } => {
             discovery.stop_advertising(io).await;
-            let ActiveConnection::PendingDirect { pending } =
-                std::mem::replace(active, ActiveConnection::Idle)
-            else {
-                emit_error(io, "no pending direct challenge to accept".to_string()).await;
+            let pending_active = std::mem::replace(active, ActiveConnection::Idle);
+            let ActiveConnection::PendingDirect { pending } = pending_active else {
+                if let ActiveConnection::PendingLegacy { pending } = pending_active {
+                    accept_legacy_challenge(pending, active, io).await;
+                } else {
+                    emit_error(io, "no pending direct challenge to accept".to_string()).await;
+                }
                 return;
             };
             match timeout(CHALLENGE_RESPONSE_TIMEOUT, pending.accept(seed, ranked)).await {
@@ -796,10 +1333,20 @@ async fn handle_lifecycle_command(
             }
         }
         NetworkCommand::Deny { reason } => {
-            let ActiveConnection::PendingDirect { pending } =
-                std::mem::replace(active, ActiveConnection::Idle)
-            else {
-                emit_error(io, "no pending direct challenge to deny".to_string()).await;
+            let pending_active = std::mem::replace(active, ActiveConnection::Idle);
+            let ActiveConnection::PendingDirect { pending } = pending_active else {
+                if let ActiveConnection::PendingLegacy { pending } = pending_active {
+                    if let Err(error) = pending.deny().await {
+                        emit_error(
+                            io,
+                            format_legacy_error("deny legacy challenge failed", &error),
+                        )
+                        .await;
+                    }
+                    emit_state(io, NetworkLifecycleState::Idle).await;
+                } else {
+                    emit_error(io, "no pending direct challenge to deny".to_string()).await;
+                }
                 return;
             };
             if let Err(error) = pending.deny(reason).await {
@@ -829,7 +1376,400 @@ async fn handle_lifecycle_command(
         | NetworkCommand::SendGameOver(_)
         | NetworkCommand::SendBazaarBuy(_)
         | NetworkCommand::SendBazaarRemove(_)
-        | NetworkCommand::SendBazaarDone { .. } => {}
+        | NetworkCommand::SendBazaarDone { .. }
+        | NetworkCommand::SendLegacyScore(_)
+        | NetworkCommand::SendLegacyScoreDelta(_)
+        | NetworkCommand::SendLegacyFundsDelta(_)
+        | NetworkCommand::SendLegacyLinesDelta(_)
+        | NetworkCommand::SendLegacyBoard(_)
+        | NetworkCommand::SendLegacyArsenal(_)
+        | NetworkCommand::SendLegacyStartBazaar
+        | NetworkCommand::SendLegacyEndBazaar
+        | NetworkCommand::SendLegacyDead
+        | NetworkCommand::SendLegacyWeaponLaunch { .. }
+        | NetworkCommand::SendLegacyWeaponOff { .. } => {}
+    }
+}
+
+async fn register_legacy_roster(
+    server_addr: SocketAddr,
+    identity: PlayerIdentity,
+    share_addr: SocketAddr,
+) -> Result<LegacyConnection, String> {
+    let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(server_addr))
+        .await
+        .map_err(|_| format!("timed out connecting to legacy server {server_addr}"))?
+        .map_err(|error| format!("connect to legacy server {server_addr} failed: {error}"))?;
+    let mut connection = LegacyConnection::from_stream(stream);
+    let packet = timeout(HANDSHAKE_TIMEOUT, connection.recv())
+        .await
+        .map_err(|_| format!("timed out waiting for legacy server accept from {server_addr}"))?
+        .map_err(|error| format_legacy_error("legacy server accept failed", &error))?;
+    if packet.token != LegacyToken::Accepted {
+        return Err(format!(
+            "legacy server rejected registration: expected BT_ACCEPTED, got {:?}",
+            packet.token
+        ));
+    }
+
+    let entry = LegacyNetworkEntry::waiting(
+        identity,
+        share_addr,
+        std::process::id(),
+        legacy_timestamp_now(),
+    );
+    connection
+        .send(&LegacyPacket {
+            token: LegacyToken::QueryConnection,
+            payload: entry.encode(),
+        })
+        .await
+        .map_err(|error| format_legacy_error("legacy server registration failed", &error))?;
+    Ok(connection)
+}
+
+async fn query_legacy_roster(
+    connection: &mut LegacyConnection,
+) -> Result<Vec<LegacyNetworkEntry>, String> {
+    connection
+        .send(&LegacyPacket::empty(LegacyToken::QueryNetworkDb))
+        .await
+        .map_err(|error| format_legacy_error("legacy roster query failed", &error))?;
+
+    let count_packet = connection
+        .recv()
+        .await
+        .map_err(|error| format_legacy_error("legacy roster length read failed", &error))?;
+    if count_packet.token != LegacyToken::ResponseDbLen {
+        return Err(format!(
+            "legacy roster query expected BT_RESP_DBLEN, got {:?}",
+            count_packet.token
+        ));
+    }
+    let count_len = count_packet.payload.len();
+    if count_len != 4 && count_len != battletris_protocol::legacy::LEGACY_C_ULONG_LEN {
+        return Err(format!(
+            "legacy roster length payload has wrong size: {} bytes",
+            count_len
+        ));
+    }
+    let count = u32::from_be_bytes(
+        count_packet.payload[..4]
+            .try_into()
+            .expect("legacy DB length size checked"),
+    ) as usize;
+
+    let db_packet = connection
+        .recv()
+        .await
+        .map_err(|error| format_legacy_error("legacy roster read failed", &error))?;
+    if db_packet.token != LegacyToken::ResponseNetworkDb {
+        return Err(format!(
+            "legacy roster query expected BT_RESP_NETDB, got {:?}",
+            db_packet.token
+        ));
+    }
+    let expected_len = count * battletris_protocol::legacy::LEGACY_NETWORK_ENTRY_LEN;
+    if db_packet.payload.len() != expected_len {
+        return Err(format!(
+            "legacy roster payload has wrong size: expected {expected_len} bytes, got {}",
+            db_packet.payload.len()
+        ));
+    }
+
+    let mut entries = Vec::with_capacity(count);
+    for chunk in db_packet
+        .payload
+        .chunks_exact(battletris_protocol::legacy::LEGACY_NETWORK_ENTRY_LEN)
+    {
+        entries.push(
+            LegacyNetworkEntry::decode(chunk).map_err(|error| {
+                format_legacy_error("legacy roster entry decode failed", &error)
+            })?,
+        );
+    }
+    Ok(entries)
+}
+
+async fn emit_legacy_roster(io: &mut NetworkIo, entries: Vec<LegacyNetworkEntry>) {
+    let list = LobbyList {
+        entries: legacy_roster_lobby_entries(entries),
+    };
+    let _ = io.event_tx.send(NetworkEvent::LobbyList(list)).await;
+}
+
+async fn disconnect_legacy_roster(connection: &mut Option<LegacyConnection>) {
+    if let Some(connection) = connection.as_mut() {
+        let _ = connection
+            .send(&LegacyPacket::empty(LegacyToken::Disconnect))
+            .await;
+    }
+    *connection = None;
+}
+
+fn legacy_roster_lobby_entries(entries: Vec<LegacyNetworkEntry>) -> Vec<LobbyEntry> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            let player_id = if entry.key.is_empty() {
+                format!("{}@{}:{}", entry.user_name, entry.host_name, entry.port)
+            } else {
+                entry.key.clone()
+            };
+            LobbyEntry {
+                session_id: HostedSessionId(player_id.clone()),
+                host: HostedPlayer {
+                    player_id,
+                    display_name: entry.user_name.clone(),
+                },
+                direct_addr: legacy_entry_direct_addr(&entry),
+                ranked: false,
+                protocol_major: entry.major,
+                protocol_minor: entry.minor,
+            }
+        })
+        .collect()
+}
+
+fn legacy_entry_direct_addr(entry: &LegacyNetworkEntry) -> String {
+    let ip = entry
+        .host_name
+        .parse::<Ipv4Addr>()
+        .unwrap_or_else(|_| legacy_inet_addr(entry.addrnet, entry.addrlna));
+    SocketAddr::from((ip, entry.port)).to_string()
+}
+
+fn legacy_inet_addr(addrnet: u32, addrlna: u32) -> Ipv4Addr {
+    let raw = if addrnet <= 0xff {
+        (addrnet << 24) | (addrlna & 0x00ff_ffff)
+    } else if addrnet <= 0xffff {
+        (addrnet << 16) | (addrlna & 0x0000_ffff)
+    } else {
+        (addrnet << 8) | (addrlna & 0x0000_00ff)
+    };
+    Ipv4Addr::from(raw)
+}
+
+async fn host_until_legacy_challenge(
+    bind_addr: SocketAddr,
+    identity: PlayerIdentity,
+    advertised_addr: SocketAddr,
+    server_addr: Option<SocketAddr>,
+    active: &mut ActiveConnection,
+    io: &mut NetworkIo,
+) {
+    log_net(&format!("hosting legacy game on {bind_addr}"));
+    emit_state(io, NetworkLifecycleState::Hosting { bind_addr }).await;
+    let listener = match TcpListener::bind(bind_addr).await {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            let fallback_addr = SocketAddr::new(bind_addr.ip(), 0);
+            match TcpListener::bind(fallback_addr).await {
+                Ok(listener) => listener,
+                Err(fallback_error) => {
+                    emit_error(
+                        io,
+                        format!(
+                            "Legacy host bind failed on {bind_addr}: {error}; fallback {fallback_addr} also failed: {fallback_error}."
+                        ),
+                    )
+                    .await;
+                    emit_state(io, NetworkLifecycleState::Idle).await;
+                    return;
+                }
+            }
+        }
+        Err(error) => {
+            let message = format!("Legacy host bind failed on {bind_addr}: {error}.");
+            emit_error(io, message).await;
+            emit_state(io, NetworkLifecycleState::Idle).await;
+            return;
+        }
+    };
+    let actual_addr = listener.local_addr().unwrap_or(bind_addr);
+    let share_addr = share_addr_for(actual_addr);
+    let legacy_roster_addr =
+        legacy_roster_registration_addr(bind_addr, advertised_addr, share_addr);
+    let mut legacy_server = match server_addr {
+        Some(server_addr) => {
+            match register_legacy_roster(server_addr, identity, legacy_roster_addr).await {
+                Ok(mut server) => {
+                    match query_legacy_roster(&mut server).await {
+                        Ok(entries) => emit_legacy_roster(io, entries).await,
+                        Err(error) => emit_error(io, error).await,
+                    }
+                    Some(server)
+                }
+                Err(error) => {
+                    emit_error(io, error).await;
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let _ = io
+        .event_tx
+        .send(NetworkEvent::Listening {
+            bind_addr: actual_addr,
+            share_addr,
+        })
+        .await;
+    emit_state(
+        io,
+        NetworkLifecycleState::Hosting {
+            bind_addr: actual_addr,
+        },
+    )
+    .await;
+
+    loop {
+        tokio::select! {
+            pending = battletris_protocol::legacy::accept_pending_legacy_challenge(&listener) => {
+                match pending {
+                    Ok(pending) => {
+                        disconnect_legacy_roster(&mut legacy_server).await;
+                        let challenge = legacy_challenge_from_entry(&pending.challenger);
+                        log_net(&format!("incoming legacy challenge peer={}", challenge.challenger.display_name));
+                        emit_state(io, NetworkLifecycleState::Challenged { challenge: challenge.clone() }).await;
+                        let _ = io.event_tx.send(NetworkEvent::IncomingChallenge { challenge }).await;
+                        *active = ActiveConnection::PendingLegacy { pending };
+                    }
+                    Err(error) => {
+                        disconnect_legacy_roster(&mut legacy_server).await;
+                        emit_error(io, format_legacy_error("legacy host handshake failed", &error)).await;
+                        emit_state(io, NetworkLifecycleState::Idle).await;
+                    }
+                }
+                break;
+            }
+            command = io.command_rx.recv() => {
+                match command {
+                    Some(NetworkCommand::Cancel) => {
+                        disconnect_legacy_roster(&mut legacy_server).await;
+                        emit_state(io, NetworkLifecycleState::Idle).await;
+                        break;
+                    }
+                    Some(NetworkCommand::BrowseLobby { .. }) => {
+                        if let Some(server) = legacy_server.as_mut() {
+                            match query_legacy_roster(server).await {
+                                Ok(entries) => emit_legacy_roster(io, entries).await,
+                                Err(error) => emit_error(io, error).await,
+                            }
+                        } else {
+                            emit_error(io, "Legacy server roster is not connected".to_string()).await;
+                        }
+                    }
+                    Some(other) => {
+                        disconnect_legacy_roster(&mut legacy_server).await;
+                        emit_error(io, format!("legacy host canceled by {:?}", command_name(&other))).await;
+                        emit_state(io, NetworkLifecycleState::Idle).await;
+                        break;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+}
+
+fn legacy_roster_registration_addr(
+    requested_bind_addr: SocketAddr,
+    advertised_addr: SocketAddr,
+    actual_share_addr: SocketAddr,
+) -> SocketAddr {
+    if requested_bind_addr.port() == actual_share_addr.port() {
+        return advertised_addr;
+    }
+    SocketAddr::new(advertised_addr.ip(), actual_share_addr.port())
+}
+
+async fn join_legacy(
+    peer_addr: SocketAddr,
+    identity: PlayerIdentity,
+    share_addr: SocketAddr,
+    active: &mut ActiveConnection,
+    io: &mut NetworkIo,
+) {
+    log_net(&format!("joining legacy peer {peer_addr}"));
+    emit_state(io, NetworkLifecycleState::Joining { peer_addr }).await;
+    let entry = LegacyNetworkEntry::waiting(
+        identity.clone(),
+        share_addr,
+        std::process::id(),
+        legacy_timestamp_now(),
+    );
+    let joined = tokio::select! {
+        joined = timeout(CONNECT_TIMEOUT + HANDSHAKE_TIMEOUT, battletris_protocol::legacy::join_legacy_game(peer_addr, entry)) => joined,
+        command = io.command_rx.recv() => {
+            match command {
+                Some(NetworkCommand::Cancel) => emit_state(io, NetworkLifecycleState::Idle).await,
+                Some(other) => {
+                    emit_error(io, format!("legacy join canceled by {:?}", command_name(&other))).await;
+                    emit_state(io, NetworkLifecycleState::Idle).await;
+                }
+                None => {}
+            }
+            return;
+        }
+    };
+
+    match joined {
+        Ok(Ok(joined)) => {
+            let peer_identity = PlayerIdentity {
+                display_name: peer_addr.to_string(),
+            };
+            let session = NetworkSession::legacy_direct(PlayerSlot::Two, peer_identity.clone());
+            emit_connected(io, &session).await;
+            *active = ActiveConnection::LegacyConnected {
+                connection: joined.connection,
+                peer_identity,
+            };
+        }
+        Ok(Err(error)) => {
+            emit_error(io, format_legacy_error("legacy join failed", &error)).await;
+            emit_state(io, NetworkLifecycleState::Idle).await;
+        }
+        Err(_) => {
+            emit_error(
+                io,
+                format!("Legacy join timed out. Check the host share address and firewall. Tried {peer_addr}."),
+            )
+            .await;
+            emit_state(io, NetworkLifecycleState::Idle).await;
+        }
+    }
+}
+
+async fn accept_legacy_challenge(
+    pending: PendingLegacyChallenge,
+    active: &mut ActiveConnection,
+    io: &mut NetworkIo,
+) {
+    match timeout(CHALLENGE_RESPONSE_TIMEOUT, pending.accept()).await {
+        Ok(Ok(accepted)) => {
+            let peer_identity = PlayerIdentity {
+                display_name: accepted.challenger.user_name,
+            };
+            let session = NetworkSession::legacy_direct(PlayerSlot::One, peer_identity.clone());
+            emit_connected(io, &session).await;
+            *active = ActiveConnection::LegacyConnected {
+                connection: accepted.connection,
+                peer_identity,
+            };
+        }
+        Ok(Err(error)) => {
+            emit_error(
+                io,
+                format_legacy_error("accept legacy challenge failed", &error),
+            )
+            .await;
+            emit_state(io, NetworkLifecycleState::Idle).await;
+        }
+        Err(_) => {
+            emit_error(io, "timed out accepting legacy challenge".to_string()).await;
+            emit_state(io, NetworkLifecycleState::Idle).await;
+        }
     }
 }
 
@@ -1332,6 +2272,8 @@ async fn handle_connected_command(
         }
         NetworkCommand::Host { .. }
         | NetworkCommand::Join { .. }
+        | NetworkCommand::LegacyHost { .. }
+        | NetworkCommand::LegacyJoin { .. }
         | NetworkCommand::JoinHostedDirect { .. }
         | NetworkCommand::RegisterLobby { .. }
         | NetworkCommand::BrowseLobby { .. }
@@ -1340,7 +2282,18 @@ async fn handle_connected_command(
         | NetworkCommand::CancelHostedSession { .. }
         | NetworkCommand::Accept { .. }
         | NetworkCommand::AcceptHosted { .. }
-        | NetworkCommand::Deny { .. } => {
+        | NetworkCommand::Deny { .. }
+        | NetworkCommand::SendLegacyScore(_)
+        | NetworkCommand::SendLegacyScoreDelta(_)
+        | NetworkCommand::SendLegacyFundsDelta(_)
+        | NetworkCommand::SendLegacyLinesDelta(_)
+        | NetworkCommand::SendLegacyBoard(_)
+        | NetworkCommand::SendLegacyArsenal(_)
+        | NetworkCommand::SendLegacyStartBazaar
+        | NetworkCommand::SendLegacyEndBazaar
+        | NetworkCommand::SendLegacyDead
+        | NetworkCommand::SendLegacyWeaponLaunch { .. }
+        | NetworkCommand::SendLegacyWeaponOff { .. } => {
             emit_error(
                 io,
                 "network command is not valid while connected".to_string(),
@@ -1490,11 +2443,55 @@ fn log_net(message: &str) {
 
 fn format_protocol_error(context: &str, error: &ProtocolError) -> String {
     match error {
+        ProtocolError::BadMagic { actual } => {
+            let hint = if looks_like_legacy_server_first_packet(*actual) {
+                " Endpoint looks like original BattleTris; use Legacy mode or the modern server port 4405."
+            } else {
+                " Check that this is a modern BattleTris BTRS endpoint."
+            };
+            format!("{context}: invalid BTRS response magic {actual:?}.{hint}")
+        }
+        ProtocolError::UnsupportedMajor { major } => {
+            format!("{context}: incompatible modern protocol major {major}; this client requires major 2.")
+        }
+        ProtocolError::IncompatiblePeerVersion { major, minor } => {
+            format!("{context}: incompatible modern protocol v{major}.{minor}; this client requires major 2.")
+        }
         ProtocolError::ChallengeDenied { reason } => {
             format!("{context}: challenge denied: {reason}")
         }
         _ => format!("{context}: {error:?}"),
     }
+}
+
+fn looks_like_legacy_server_first_packet(actual: [u8; 4]) -> bool {
+    u32::from_be_bytes(actual) <= u16::MAX as u32 || u32::from_le_bytes(actual) <= u16::MAX as u32
+}
+
+fn format_legacy_error(context: &str, error: &LegacyError) -> String {
+    match error {
+        LegacyError::ChallengeDenied => format!("{context}: challenge denied"),
+        LegacyError::PeerBusy => format!("{context}: peer is busy"),
+        _ => format!("{context}: {error}"),
+    }
+}
+
+fn legacy_challenge_from_entry(entry: &LegacyNetworkEntry) -> Challenge {
+    Challenge {
+        challenger: PlayerIdentity {
+            display_name: entry.user_name.clone(),
+        },
+        message: "legacy packet challenge".to_string(),
+        hosted_session_id: None,
+        hosted_player_id: None,
+    }
+}
+
+fn legacy_timestamp_now() -> u32 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().min(u64::from(u32::MAX)) as u32)
+        .unwrap_or(0)
 }
 
 fn share_addr_for(bind_addr: SocketAddr) -> SocketAddr {
@@ -1762,6 +2759,8 @@ fn command_name(command: &NetworkCommand) -> &'static str {
         NetworkCommand::StopLanAdvertising => "stop LAN advertising",
         NetworkCommand::BrowseLan => "browse LAN",
         NetworkCommand::Join { .. } => "join",
+        NetworkCommand::LegacyHost { .. } => "legacy host",
+        NetworkCommand::LegacyJoin { .. } => "legacy join",
         NetworkCommand::JoinHostedDirect { .. } => "join hosted direct",
         NetworkCommand::RegisterLobby { .. } => "register lobby",
         NetworkCommand::BrowseLobby { .. } => "browse lobby",
@@ -1780,6 +2779,17 @@ fn command_name(command: &NetworkCommand) -> &'static str {
         NetworkCommand::SendBazaarBuy(_) => "send bazaar buy",
         NetworkCommand::SendBazaarRemove(_) => "send bazaar remove",
         NetworkCommand::SendBazaarDone { .. } => "send bazaar done",
+        NetworkCommand::SendLegacyScore(_) => "send legacy score",
+        NetworkCommand::SendLegacyScoreDelta(_) => "send legacy score delta",
+        NetworkCommand::SendLegacyFundsDelta(_) => "send legacy funds delta",
+        NetworkCommand::SendLegacyLinesDelta(_) => "send legacy lines delta",
+        NetworkCommand::SendLegacyBoard(_) => "send legacy board",
+        NetworkCommand::SendLegacyArsenal(_) => "send legacy arsenal",
+        NetworkCommand::SendLegacyStartBazaar => "send legacy bazaar start",
+        NetworkCommand::SendLegacyEndBazaar => "send legacy bazaar done",
+        NetworkCommand::SendLegacyDead => "send legacy death",
+        NetworkCommand::SendLegacyWeaponLaunch { .. } => "send legacy weapon launch",
+        NetworkCommand::SendLegacyWeaponOff { .. } => "send legacy weapon off",
         NetworkCommand::SubmitResult { .. } => "submit result",
         NetworkCommand::Cancel => "cancel",
         NetworkCommand::Disconnect { .. } => "disconnect",
@@ -1807,7 +2817,13 @@ pub fn reduce_state(
         NetworkCommand::Host { bind_addr, .. } => NetworkLifecycleState::Hosting {
             bind_addr: *bind_addr,
         },
+        NetworkCommand::LegacyHost { bind_addr, .. } => NetworkLifecycleState::Hosting {
+            bind_addr: *bind_addr,
+        },
         NetworkCommand::Join { peer_addr, .. } => NetworkLifecycleState::Joining {
+            peer_addr: *peer_addr,
+        },
+        NetworkCommand::LegacyJoin { peer_addr, .. } => NetworkLifecycleState::Joining {
             peer_addr: *peer_addr,
         },
         NetworkCommand::JoinHostedDirect { peer_addr, .. } => NetworkLifecycleState::Joining {
@@ -1837,6 +2853,17 @@ pub fn reduce_state(
         | NetworkCommand::SendBazaarBuy(_)
         | NetworkCommand::SendBazaarRemove(_)
         | NetworkCommand::SendBazaarDone { .. }
+        | NetworkCommand::SendLegacyScore(_)
+        | NetworkCommand::SendLegacyScoreDelta(_)
+        | NetworkCommand::SendLegacyFundsDelta(_)
+        | NetworkCommand::SendLegacyLinesDelta(_)
+        | NetworkCommand::SendLegacyBoard(_)
+        | NetworkCommand::SendLegacyArsenal(_)
+        | NetworkCommand::SendLegacyStartBazaar
+        | NetworkCommand::SendLegacyEndBazaar
+        | NetworkCommand::SendLegacyDead
+        | NetworkCommand::SendLegacyWeaponLaunch { .. }
+        | NetworkCommand::SendLegacyWeaponOff { .. }
         | NetworkCommand::SubmitResult { .. } => state.clone(),
     }
 }
@@ -2463,6 +3490,228 @@ mod tests {
     }
 
     #[test]
+    fn legacy_direct_session_is_unranked_non_hosted_metadata() {
+        let session = NetworkSession::legacy_direct(PlayerSlot::Two, identity("Legacy Host"));
+
+        assert_eq!(session.mode, NetworkMode::LegacyDirect);
+        assert_eq!(session.local_slot, PlayerSlot::Two);
+        assert_eq!(session.peer_identity.display_name, "Legacy Host");
+        assert!(!session.ranked);
+        assert_eq!(session.final_result_status, FinalResultStatus::Unranked);
+        assert!(session.hosted.is_none());
+    }
+
+    #[test]
+    fn legacy_roster_entries_convert_to_joinable_lobby_rows() {
+        let entry = LegacyNetworkEntry::waiting(
+            identity("Ada"),
+            "192.168.1.44:4405".parse().unwrap(),
+            7,
+            8,
+        );
+
+        let rows = legacy_roster_lobby_entries(vec![entry.clone()]);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].host.display_name, "Ada");
+        assert_eq!(rows[0].direct_addr, "192.168.1.44:4405");
+        assert_eq!(rows[0].protocol_major, entry.major);
+        assert_eq!(rows[0].protocol_minor, entry.minor);
+        assert!(!rows[0].ranked);
+    }
+
+    #[test]
+    fn legacy_roster_registration_uses_actual_port_after_fallback_bind() {
+        let requested = "0.0.0.0:4405".parse().unwrap();
+        let configured_share = "192.168.1.44:4405".parse().unwrap();
+        let actual_share = "127.0.0.1:51234".parse().unwrap();
+
+        let registered = legacy_roster_registration_addr(requested, configured_share, actual_share);
+
+        assert_eq!(registered.to_string(), "192.168.1.44:51234");
+    }
+
+    #[test]
+    fn legacy_roster_registration_preserves_explicit_share_when_requested_port_is_bound() {
+        let requested = "0.0.0.0:4405".parse().unwrap();
+        let configured_share = "192.168.1.44:4405".parse().unwrap();
+        let actual_share = "127.0.0.1:4405".parse().unwrap();
+
+        let registered = legacy_roster_registration_addr(requested, configured_share, actual_share);
+
+        assert_eq!(registered, configured_share);
+    }
+
+    #[test]
+    fn legacy_classful_network_parts_reconstruct_ipv4_addresses() {
+        assert_eq!(legacy_inet_addr(127, 1), Ipv4Addr::new(127, 0, 0, 1));
+        assert_eq!(
+            legacy_inet_addr(0x0000_ac10, 0x0000_0102),
+            Ipv4Addr::new(172, 16, 1, 2)
+        );
+        assert_eq!(
+            legacy_inet_addr(0x00c0_a801, 44),
+            Ipv4Addr::new(192, 168, 1, 44)
+        );
+    }
+
+    #[test]
+    fn legacy_score_packets_map_to_remote_score_updates() {
+        let payload = LegacyScorePayload {
+            score: 12_345,
+            opponent_score: 99,
+            lines: 7,
+            opponent_lines: 3,
+            funds: -25,
+            opponent_funds: 400,
+        }
+        .encode();
+        let event = legacy_event_from_packet(&LegacyPacket {
+            token: LegacyToken::Score,
+            payload,
+        })
+        .expect("score packet decodes")
+        .expect("score packet maps");
+
+        assert_eq!(
+            event,
+            NetworkEvent::LegacyRemoteScore(LegacyRemoteScoreUpdate::Snapshot(ScoreSnapshot {
+                player: PlayerSlot::Two,
+                score: 12_345,
+                funds: -25,
+                lines: 7,
+            }))
+        );
+
+        let event = legacy_event_from_packet(&LegacyPacket {
+            token: LegacyToken::Funds,
+            payload: LegacyShortPayload { value: 42 }.encode(),
+        })
+        .expect("funds packet decodes")
+        .expect("funds packet maps");
+        assert_eq!(
+            event,
+            NetworkEvent::LegacyRemoteScore(LegacyRemoteScoreUpdate::FundsDelta(42))
+        );
+    }
+
+    #[test]
+    fn legacy_board_and_arsenal_packets_map_to_remote_snapshots() {
+        let board = LegacyBoardPayload::new(5, 2, 3, vec![0, 1, 20, 21, 22, 29])
+            .expect("board payload is valid");
+        let event = legacy_event_from_packet(&LegacyPacket {
+            token: LegacyToken::Board,
+            payload: board.encode().expect("board encodes"),
+        })
+        .expect("board packet decodes")
+        .expect("board packet maps");
+        assert_eq!(
+            event,
+            NetworkEvent::LegacyRemoteBoard(
+                WireBoardSnapshot::new(PlayerSlot::Two, 5, 3, 2, vec![0, 1, 20, 21, 22, 29])
+                    .expect("snapshot is valid")
+            )
+        );
+
+        let arsenal = LegacyArsenalPayload::new(vec![
+            battletris_protocol::legacy::LegacyArsenalSlot {
+                weapon_token: 1,
+                quantity: 2,
+            },
+            battletris_protocol::legacy::LegacyArsenalSlot {
+                weapon_token: LEGACY_NO_WEAPON_TOKEN,
+                quantity: 0,
+            },
+        ])
+        .expect("arsenal payload is valid");
+        let event = legacy_event_from_packet(&LegacyPacket {
+            token: LegacyToken::Arsenal,
+            payload: arsenal.encode().expect("arsenal encodes"),
+        })
+        .expect("arsenal packet decodes")
+        .expect("arsenal packet maps");
+
+        let mut slots = [None; 10];
+        slots[0] = Some(ArsenalEntry {
+            weapon: 1,
+            quantity: 2,
+        });
+        assert_eq!(
+            event,
+            NetworkEvent::LegacyRemoteArsenal(ArsenalSnapshot {
+                player: PlayerSlot::Two,
+                slots,
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_weapon_packets_map_to_incoming_and_expiration_events() {
+        let event = legacy_event_from_packet(&LegacyPacket {
+            token: LegacyToken::WeaponOn,
+            payload: LegacyWeaponPayload::new(u16::from(WeaponToken::Gimp.legacy_id()))
+                .expect("weapon payload is valid")
+                .encode(),
+        })
+        .expect("weapon packet decodes")
+        .expect("weapon packet maps");
+        assert_eq!(
+            event,
+            NetworkEvent::LegacyIncomingWeapon {
+                weapon: WeaponToken::Gimp.legacy_id(),
+            }
+        );
+
+        let event = legacy_event_from_packet(&LegacyPacket {
+            token: LegacyToken::WeaponOff,
+            payload: LegacyWeaponPayload::new(u16::from(WeaponToken::Speedy.legacy_id()))
+                .expect("weapon payload is valid")
+                .encode(),
+        })
+        .expect("weapon packet decodes")
+        .expect("weapon packet maps");
+        assert_eq!(
+            event,
+            NetworkEvent::LegacyRemoteWeaponOff {
+                weapon: WeaponToken::Speedy.legacy_id(),
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_outbound_snapshot_packets_use_original_tokens() {
+        let score = legacy_score_packet(&ScoreSnapshot {
+            player: PlayerSlot::One,
+            score: 123,
+            funds: -7,
+            lines: 4,
+        })
+        .expect("score packet encodes");
+        assert_eq!(score.token, LegacyToken::Score);
+        assert_eq!(
+            LegacyScorePayload::decode(&score.payload).expect("score payload decodes"),
+            LegacyScorePayload {
+                score: 123,
+                opponent_score: 0,
+                lines: 4,
+                opponent_lines: 0,
+                funds: -7,
+                opponent_funds: 0,
+            }
+        );
+
+        let weapon = legacy_weapon_packet(LegacyToken::WeaponOn, WeaponToken::Gimp.legacy_id())
+            .expect("weapon packet encodes");
+        assert_eq!(weapon.token, LegacyToken::WeaponOn);
+        assert_eq!(
+            LegacyWeaponPayload::decode(&weapon.payload).expect("weapon payload decodes"),
+            LegacyWeaponPayload {
+                weapon_token: u16::from(WeaponToken::Gimp.legacy_id()),
+            }
+        );
+    }
+
+    #[test]
     fn network_session_keeps_seed_ranked_and_hosted_metadata_explicit() {
         let direct = NetworkSession::direct(
             PlayerSlot::Two,
@@ -2689,6 +3938,43 @@ mod tests {
 
         host.shutdown();
         std::net::TcpListener::bind(addr).expect("canceled host releases listener port");
+    }
+
+    #[test]
+    fn runtime_legacy_host_falls_back_when_requested_port_is_in_use() {
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let occupied_addr = reserved.local_addr().unwrap();
+
+        let mut host = NetworkRuntime::start();
+        host.channels_mut()
+            .command_sender()
+            .try_send(NetworkCommand::LegacyHost {
+                bind_addr: occupied_addr,
+                identity: identity("Ada"),
+                share_addr: occupied_addr,
+                server_addr: None,
+            })
+            .unwrap();
+
+        let listening = wait_for_event(host.channels_mut(), |event| match event {
+            NetworkEvent::Listening { bind_addr, .. } => Some(bind_addr),
+            NetworkEvent::Error { message } => panic!("legacy host should fall back: {message}"),
+            _ => None,
+        });
+
+        assert_eq!(listening.ip(), occupied_addr.ip());
+        assert_ne!(listening.port(), occupied_addr.port());
+
+        host.channels_mut()
+            .command_sender()
+            .try_send(NetworkCommand::Cancel)
+            .unwrap();
+        wait_for_event(host.channels_mut(), |event| match event {
+            NetworkEvent::StateChanged(NetworkLifecycleState::Idle) => Some(()),
+            _ => None,
+        });
+        host.shutdown();
+        drop(reserved);
     }
 
     #[test]

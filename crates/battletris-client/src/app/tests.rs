@@ -126,6 +126,104 @@ fn networked_local_game_uses_session_seed_and_slot() {
 }
 
 #[test]
+fn legacy_networked_local_game_has_remote_state_without_lockstep() {
+    let session = NetworkSession::legacy_direct(
+        PlayerSlot::Two,
+        PlayerIdentity {
+            display_name: "Legacy Host".to_string(),
+        },
+    );
+
+    let local = LocalGame::new_networked(session.clone());
+
+    assert_eq!(local.local_player, PlayerId::Two);
+    assert_eq!(local.mode, LocalGameMode::LegacyDirect);
+    assert!(local.computer.is_none());
+    assert!(local.network_session.is_some());
+    assert!(local.network_lockstep.is_none());
+    assert!(local.legacy_remote.is_some());
+    assert!(local.is_networked());
+    assert!(!local.is_lockstep_networked());
+    assert_eq!(local.game.mode(), GameMode::HumanVsHuman);
+    let expected_status = network_session_status_label(&session, None);
+    assert_eq!(
+        local.status_message.as_deref(),
+        Some(expected_status.as_str())
+    );
+}
+
+#[test]
+fn legacy_remote_events_update_presentation_state() {
+    let session = NetworkSession::legacy_direct(
+        PlayerSlot::One,
+        PlayerIdentity {
+            display_name: "Legacy Peer".to_string(),
+        },
+    );
+    let mut local = LocalGame::new_networked(session);
+    let mut runtime = ClientNetworkRuntime::default();
+    let mut state = ClientNetworkState::default();
+
+    apply_network_game_event(
+        &mut local,
+        &mut runtime,
+        &mut state,
+        &NetworkEvent::LegacyRemoteScore(LegacyRemoteScoreUpdate::Snapshot(
+            battletris_protocol::ScoreSnapshot {
+                player: PlayerSlot::Two,
+                score: 500,
+                funds: 25,
+                lines: 3,
+            },
+        )),
+    );
+    apply_network_game_event(
+        &mut local,
+        &mut runtime,
+        &mut state,
+        &NetworkEvent::LegacyRemoteBoard(
+            battletris_protocol::BoardSnapshot::new(
+                PlayerSlot::Two,
+                0,
+                BOARD_WIDTH as u16,
+                BOARD_HEIGHT as u16,
+                vec![0; BOARD_WIDTH * BOARD_HEIGHT],
+            )
+            .expect("board snapshot is valid"),
+        ),
+    );
+    let mut slots = [None; 10];
+    slots[0] = Some(battletris_protocol::ArsenalEntry {
+        weapon: WeaponToken::FourByFour.legacy_id(),
+        quantity: 2,
+    });
+    apply_network_game_event(
+        &mut local,
+        &mut runtime,
+        &mut state,
+        &NetworkEvent::LegacyRemoteArsenal(battletris_protocol::ArsenalSnapshot {
+            player: PlayerSlot::Two,
+            slots,
+        }),
+    );
+
+    let remote = local.legacy_remote.as_ref().expect("remote state exists");
+    assert_eq!(remote.score, 500);
+    assert_eq!(remote.funds, 25);
+    assert_eq!(remote.lines, 3);
+    assert!(remote.board.is_some());
+    assert!(remote.arsenal.is_some());
+    assert!(player_view_visible(
+        &local,
+        &ReconPanel::default(),
+        PlayerId::Two
+    ));
+    assert!(legacy_score_label(&local).contains("Opponent's score:    500"));
+
+    runtime.runtime.shutdown();
+}
+
+#[test]
 fn client_network_tick_loop_runs_past_checksum_tick_without_desync() {
     let mut host = TestClientPeer::new("Ada");
     let mut joiner = TestClientPeer::new("Ben");
@@ -369,7 +467,7 @@ fn legacy_cli_flags_apply_session_overrides() {
     assert_eq!(settings.screen, ClientScreen::Sleep);
     assert_eq!(settings.sound_pack, SoundPackChoice::Muted);
     assert!(!settings.lobby_enabled);
-    assert_eq!(settings.lobby_addr, "127.0.0.2:4410");
+    assert_eq!(settings.legacy_server_addr, "127.0.0.2:4410");
 }
 
 #[test]
@@ -405,7 +503,7 @@ fn xrm_overrides_apply_known_legacy_resources() {
     assert_eq!(settings.screen, ClientScreen::Sleep);
     assert_eq!(settings.sound_pack, SoundPackChoice::Muted);
     assert!(!settings.lobby_enabled);
-    assert_eq!(settings.lobby_addr, "127.0.0.3:4411");
+    assert_eq!(settings.legacy_server_addr, "127.0.0.3:4411");
 }
 
 #[test]
@@ -716,6 +814,8 @@ fn rated_game_over_message_uses_local_result() {
         mode: LocalGameMode::LocalHumanVsHuman,
         network_session: None,
         network_lockstep: None,
+        legacy_remote: None,
+        legacy_next_log_index: 0,
         network_failed_closed: false,
         network_game_over_sent: false,
         network_result_claim_submitted: false,
@@ -790,6 +890,8 @@ fn human_opponent_frame_is_hidden_without_recon() {
         mode: LocalGameMode::LocalHumanVsHuman,
         network_session: None,
         network_lockstep: None,
+        legacy_remote: None,
+        legacy_next_log_index: 0,
         network_failed_closed: false,
         network_game_over_sent: false,
         network_result_claim_submitted: false,
@@ -866,7 +968,8 @@ fn client_settings_round_trip_as_toml() {
         direct_listen_addr: "0.0.0.0:4405".to_string(),
         direct_share_addr: "192.168.1.10:4405".to_string(),
         direct_join_addr: "192.168.1.10:4405".to_string(),
-        lobby_addr: "127.0.0.1:4404".to_string(),
+        modern_server_addr: "127.0.0.1:4405".to_string(),
+        legacy_server_addr: "127.0.0.1:4404".to_string(),
         hosted_ranked: false,
     };
 
@@ -877,7 +980,39 @@ fn client_settings_round_trip_as_toml() {
     assert!(encoded.contains("high-contrast"));
     assert!(encoded.contains("original"));
     assert!(encoded.contains("legacy"));
+    assert!(encoded.contains("modern-server-addr"));
+    assert!(encoded.contains("legacy-server-addr"));
+    assert!(!encoded.contains("lobby-addr"));
     assert!(encoded.contains("Ada"));
+}
+
+#[test]
+fn legacy_lobby_addr_setting_is_not_migrated() {
+    let persisted: PersistedClientSettings = toml::from_str(
+        r#"
+ui-style = "original"
+theme = "original"
+sound-pack = "generated-default"
+controls = "original"
+pixel-scale = 1.0
+ernie-level = 7
+challenge-style = "legacy"
+display-name = "Ada"
+community-label = "garage"
+direct-listen-addr = "0.0.0.0:4405"
+direct-share-addr = "192.168.1.10:4405"
+direct-join-addr = "192.168.1.10:4405"
+lobby-addr = "127.0.0.9:4499"
+hosted-ranked = false
+"#,
+    )
+    .expect("old settings decode with ignored lobby-addr");
+    let mut settings = ClientSettings::default();
+
+    settings.apply_persisted(persisted);
+
+    assert_eq!(settings.modern_server_addr, DEFAULT_MODERN_SERVER_ADDR);
+    assert_eq!(settings.legacy_server_addr, DEFAULT_LEGACY_SERVER_ADDR);
 }
 
 #[test]
@@ -978,14 +1113,16 @@ fn invalid_network_settings_fall_back_to_safe_defaults() {
         direct_listen_addr: "".to_string(),
         direct_share_addr: "not an address".to_string(),
         direct_join_addr: "also bad".to_string(),
-        lobby_addr: "".to_string(),
+        modern_server_addr: "".to_string(),
+        legacy_server_addr: "".to_string(),
         ..Default::default()
     });
 
     assert_eq!(settings.direct_listen_addr, "0.0.0.0:4405");
     assert!(!socket_addr_is_unspecified(&settings.direct_share_addr));
     assert_eq!(settings.direct_join_addr, "127.0.0.1:4405");
-    assert_eq!(settings.lobby_addr, "127.0.0.1:4404");
+    assert_eq!(settings.modern_server_addr, "127.0.0.1:4405");
+    assert_eq!(settings.legacy_server_addr, "127.0.0.1:4404");
 }
 
 #[test]

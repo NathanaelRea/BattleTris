@@ -822,7 +822,7 @@ pub(in crate::app) fn spawn_settings_ui_shell(
                     );
                     spawn_settings_dropdown_ui_row(
                         parent,
-                        "Challenge Style",
+                        "Challenge Protocol",
                         SettingsControl::ChallengeStyle,
                         SettingsUiValue::ChallengeStyle,
                     );
@@ -851,7 +851,8 @@ pub(in crate::app) fn spawn_settings_ui_shell(
                         ("Host Bind", SettingsField::HostBindAddress),
                         ("Share Address", SettingsField::ShareAddress),
                         ("Join Address", SettingsField::JoinAddress),
-                        ("Lobby Address", SettingsField::LobbyAddress),
+                        ("Modern Server", SettingsField::ModernServerAddress),
+                        ("Legacy Server", SettingsField::LegacyServerAddress),
                     ] {
                         spawn_settings_text_input_ui_row(parent, label, field);
                     }
@@ -2994,7 +2995,7 @@ pub(in crate::app) fn secondary_screen_buttons(theme: &LoadedTheme) -> [MenuButt
             label: "Update",
             center: rects.challenge_level_up.center(),
             size: rects.challenge_level_up.size(),
-            action: MenuAction::GoTo(ClientScreen::Challenge),
+            action: MenuAction::UpdateChallenge,
         },
         MenuButtonSpec {
             screen: ClientScreen::Challenge,

@@ -117,11 +117,15 @@ pub(in crate::app) fn handle_mouse_buttons(mut input: MouseButtonParams) {
         return;
     }
     if input.settings.screen == ClientScreen::Challenge
-        && select_challenge_entry_at_world(
-            world,
-            input.settings.challenge_mode,
-            &mut input.network_state,
-        )
+        && if input.settings.challenge_style == ChallengeStyle::Legacy {
+            select_lobby_entry_at_world(world, &mut input.network_state)
+        } else {
+            select_challenge_entry_at_world(
+                world,
+                input.settings.challenge_mode,
+                &mut input.network_state,
+            )
+        }
     {
         queue_sound(&mut input.sound, SoundEvent::MenuAction);
         return;
@@ -374,6 +378,11 @@ pub(in crate::app) fn apply_menu_action(
                 );
             }
         }
+        MenuAction::UpdateChallenge => {
+            if settings.screen == ClientScreen::Challenge {
+                update_challenge_mode(settings, network_runtime, network_state);
+            }
+        }
         MenuAction::StartHumanVsComputer => {
             *local = LocalGame::new_human_vs_computer(settings.ernie_level);
             settings.screen = ClientScreen::Game;
@@ -506,26 +515,23 @@ pub(in crate::app) fn handle_challenge_input(
         queue_sound(sound, SoundEvent::MenuAction);
     }
     if keys.just_pressed(KeyCode::Digit4) {
-        settings.challenge_mode = ChallengeMode::LegacyHost;
-        queue_sound(sound, SoundEvent::MenuAction);
-    }
-    if keys.just_pressed(KeyCode::Digit5) {
-        settings.challenge_mode = ChallengeMode::LegacyJoin;
-        queue_sound(sound, SoundEvent::MenuAction);
-    }
-    if keys.just_pressed(KeyCode::Digit6) {
         settings.challenge_mode = ChallengeMode::HostViaLobby;
         queue_sound(sound, SoundEvent::MenuAction);
     }
-    if keys.just_pressed(KeyCode::Digit7) {
+    if keys.just_pressed(KeyCode::Digit5) {
         settings.challenge_mode = ChallengeMode::BrowseLobby;
         queue_sound(sound, SoundEvent::MenuAction);
     }
-    if keys.just_pressed(KeyCode::Digit8) {
+    if keys.just_pressed(KeyCode::Digit6) {
         settings.challenge_mode = ChallengeMode::BrowseLan;
         queue_sound(sound, SoundEvent::MenuAction);
     }
-    if matches!(
+    if settings.challenge_style == ChallengeStyle::Legacy
+        && (keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::KeyK))
+    {
+        select_lobby_entry(network_state, -1);
+        queue_sound(sound, SoundEvent::MenuAction);
+    } else if matches!(
         settings.challenge_mode,
         ChallengeMode::BrowseLobby | ChallengeMode::BrowseLan
     ) && (keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::KeyK))
@@ -533,7 +539,12 @@ pub(in crate::app) fn handle_challenge_input(
         select_challenge_entry(network_state, settings.challenge_mode, -1);
         queue_sound(sound, SoundEvent::MenuAction);
     }
-    if matches!(
+    if settings.challenge_style == ChallengeStyle::Legacy
+        && (keys.just_pressed(KeyCode::ArrowDown) || keys.just_pressed(KeyCode::KeyI))
+    {
+        select_lobby_entry(network_state, 1);
+        queue_sound(sound, SoundEvent::MenuAction);
+    } else if matches!(
         settings.challenge_mode,
         ChallengeMode::BrowseLobby | ChallengeMode::BrowseLan
     ) && (keys.just_pressed(KeyCode::ArrowDown) || keys.just_pressed(KeyCode::KeyI))
@@ -577,7 +588,7 @@ pub(in crate::app) fn start_selected_challenge_mode(
     }
 
     if settings.challenge_style == ChallengeStyle::Legacy {
-        start_legacy_challenge_mode(settings, network_state);
+        start_legacy_challenge_mode(settings, network_runtime, network_state);
         return;
     }
 
@@ -593,8 +604,6 @@ pub(in crate::app) fn start_selected_challenge_mode(
         ChallengeMode::JoinDirect => {
             join_direct_challenge(settings, network_runtime, network_state)
         }
-        ChallengeMode::LegacyHost => start_legacy_host_challenge(settings, network_state),
-        ChallengeMode::LegacyJoin => start_legacy_join_challenge(settings, network_state),
         ChallengeMode::HostViaLobby => {
             if !settings.lobby_enabled {
                 network_state.push_message("Lobby server disabled by -X/--no-server");
@@ -615,29 +624,135 @@ pub(in crate::app) fn start_selected_challenge_mode(
 
 pub(in crate::app) fn start_legacy_challenge_mode(
     settings: &ClientSettings,
+    network_runtime: &mut ClientNetworkRuntime,
     network_state: &mut ClientNetworkState,
 ) {
-    start_legacy_join_challenge(settings, network_state);
+    let selected_addr = selected_lobby_entry(network_state).map(|entry| entry.direct_addr.clone());
+    start_legacy_join_challenge(
+        settings,
+        network_runtime,
+        network_state,
+        selected_addr.as_deref(),
+    );
 }
 
 pub(in crate::app) fn start_legacy_host_challenge(
     settings: &ClientSettings,
+    network_runtime: &mut ClientNetworkRuntime,
     network_state: &mut ClientNetworkState,
 ) {
-    network_state.push_message(format!(
-        "Legacy host compatibility is not wired yet. Planned bind: {}.",
-        settings.direct_listen_addr
-    ));
+    let Ok(bind_addr) = parse_network_addr(
+        &settings.direct_listen_addr,
+        "legacy host bind",
+        network_state,
+    ) else {
+        return;
+    };
+    let server_addr = if settings.lobby_enabled {
+        match parse_network_addr(
+            &settings.legacy_server_addr,
+            "legacy server address",
+            network_state,
+        ) {
+            Ok(server_addr) => Some(server_addr),
+            Err(_) => return,
+        }
+    } else {
+        None
+    };
+    let share_addr = effective_direct_share_addr(settings, network_state);
+    let Ok(share_addr) = parse_network_addr(&share_addr, "legacy share address", network_state)
+    else {
+        return;
+    };
+    try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::LegacyHost {
+            bind_addr,
+            identity: direct_identity(settings),
+            share_addr,
+            server_addr,
+        },
+    );
 }
 
 pub(in crate::app) fn start_legacy_join_challenge(
     settings: &ClientSettings,
+    network_runtime: &mut ClientNetworkRuntime,
+    network_state: &mut ClientNetworkState,
+    selected_addr: Option<&str>,
+) {
+    let join_addr = selected_addr.unwrap_or(&settings.direct_join_addr);
+    let Ok(peer_addr) = parse_network_addr(join_addr, "legacy join address", network_state) else {
+        return;
+    };
+    let share_addr = effective_direct_share_addr(settings, network_state);
+    let Ok(share_addr) = parse_network_addr(&share_addr, "legacy share address", network_state)
+    else {
+        return;
+    };
+    try_send_network_command(
+        network_runtime,
+        network_state,
+        NetworkCommand::LegacyJoin {
+            peer_addr,
+            identity: direct_identity(settings),
+            share_addr,
+        },
+    );
+}
+
+pub(in crate::app) fn update_challenge_mode(
+    settings: &ClientSettings,
+    network_runtime: &mut ClientNetworkRuntime,
     network_state: &mut ClientNetworkState,
 ) {
-    network_state.push_message(format!(
-        "Legacy join compatibility is not wired yet. Planned peer: {}.",
-        settings.direct_join_addr
-    ));
+    if settings.challenge_style == ChallengeStyle::Legacy {
+        if matches!(
+            network_state.lifecycle,
+            NetworkLifecycleState::Hosting { .. }
+        ) {
+            if let Ok(server_addr) = parse_network_addr(
+                &settings.legacy_server_addr,
+                "legacy server address",
+                network_state,
+            ) {
+                try_send_network_command(
+                    network_runtime,
+                    network_state,
+                    NetworkCommand::BrowseLobby {
+                        server_addr,
+                        ranked_only: false,
+                    },
+                );
+            }
+            return;
+        }
+        start_legacy_host_challenge(settings, network_runtime, network_state);
+        return;
+    }
+
+    match settings.challenge_mode {
+        ChallengeMode::HostDirect | ChallengeMode::HostViaLobby => {
+            if settings.challenge_mode == ChallengeMode::HostViaLobby {
+                host_via_lobby_challenge(settings, network_runtime, network_state)
+            } else {
+                host_direct_challenge(settings, network_runtime, network_state)
+            }
+        }
+        ChallengeMode::BrowseLobby => {
+            if settings.lobby_enabled {
+                browse_hosted_lobby(settings, network_runtime, network_state);
+            } else {
+                network_state.push_message("Lobby server disabled by -X/--no-server");
+            }
+        }
+        ChallengeMode::BrowseLan => start_or_browse_lan(settings, network_runtime, network_state),
+        ChallengeMode::ComputerOpponent | ChallengeMode::JoinDirect => {
+            network_state.push_message("Update has no action for this mode")
+        }
+    }
 }
 
 pub(in crate::app) fn host_direct_challenge(
@@ -765,8 +880,11 @@ pub(in crate::app) fn register_hosted_lobby(
     if !settings.lobby_enabled {
         return;
     }
-    let Ok(server_addr) = parse_network_addr(&settings.lobby_addr, "lobby address", network_state)
-    else {
+    let Ok(server_addr) = parse_network_addr(
+        &settings.modern_server_addr,
+        "modern server address",
+        network_state,
+    ) else {
         return;
     };
     let direct_addr = effective_direct_share_addr(settings, network_state);
@@ -794,8 +912,11 @@ pub(in crate::app) fn browse_hosted_lobby(
         network_state.push_message("Lobby server disabled by -X/--no-server");
         return;
     }
-    let Ok(server_addr) = parse_network_addr(&settings.lobby_addr, "lobby address", network_state)
-    else {
+    let Ok(server_addr) = parse_network_addr(
+        &settings.modern_server_addr,
+        "modern server address",
+        network_state,
+    ) else {
         return;
     };
     try_send_network_command(
@@ -889,8 +1010,11 @@ pub(in crate::app) fn start_selected_hosted_game(
         network_state.push_message("Cannot challenge your own lobby entry");
         return;
     }
-    let Ok(server_addr) = parse_network_addr(&settings.lobby_addr, "lobby address", network_state)
-    else {
+    let Ok(server_addr) = parse_network_addr(
+        &settings.modern_server_addr,
+        "modern server address",
+        network_state,
+    ) else {
         return;
     };
     try_send_network_command(
@@ -954,7 +1078,7 @@ pub(in crate::app) fn poll_registered_hosted_status(
     };
     let server_addr = network_state
         .lobby_server_addr
-        .or_else(|| settings.lobby_addr.parse::<SocketAddr>().ok());
+        .or_else(|| settings.modern_server_addr.parse::<SocketAddr>().ok());
     let Some(server_addr) = server_addr else {
         return;
     };
@@ -1556,6 +1680,7 @@ pub(in crate::app) fn handle_game_input(ctx: GameInputContext<'_>, elapsed_ms: u
             ctx.bazaar_ui,
             ctx.settings.content_mode,
         );
+        flush_legacy_outbound_events(ctx.local, ctx.network_runtime, ctx.network_state);
         return;
     }
 
@@ -1563,7 +1688,7 @@ pub(in crate::app) fn handle_game_input(ctx: GameInputContext<'_>, elapsed_ms: u
         return;
     }
 
-    if ctx.local.is_networked() {
+    if ctx.local.is_lockstep_networked() {
         send_network_player_controls(
             ctx.keys,
             ctx.local,
@@ -1588,7 +1713,12 @@ pub(in crate::app) fn handle_game_input(ctx: GameInputContext<'_>, elapsed_ms: u
         return;
     }
 
-    for player in [PlayerId::One, PlayerId::Two] {
+    let controlled_players: &[PlayerId] = if ctx.local.is_legacy_networked() {
+        std::slice::from_ref(&ctx.local.local_player)
+    } else {
+        &[PlayerId::One, PlayerId::Two]
+    };
+    for &player in controlled_players {
         if ctx
             .local
             .computer
@@ -1609,12 +1739,14 @@ pub(in crate::app) fn handle_game_input(ctx: GameInputContext<'_>, elapsed_ms: u
 
     for (label, key) in slot_keys() {
         if ctx.keys.just_pressed(key) {
-            let player =
-                if ctx.keys.pressed(KeyCode::ShiftLeft) || ctx.keys.pressed(KeyCode::ShiftRight) {
-                    PlayerId::Two
-                } else {
-                    PlayerId::One
-                };
+            let player = if ctx.local.is_legacy_networked() {
+                ctx.local.local_player
+            } else if ctx.keys.pressed(KeyCode::ShiftLeft) || ctx.keys.pressed(KeyCode::ShiftRight)
+            {
+                PlayerId::Two
+            } else {
+                PlayerId::One
+            };
             if ctx
                 .local
                 .computer
@@ -1625,6 +1757,7 @@ pub(in crate::app) fn handle_game_input(ctx: GameInputContext<'_>, elapsed_ms: u
             }
         }
     }
+    flush_legacy_outbound_events(ctx.local, ctx.network_runtime, ctx.network_state);
 }
 
 pub(in crate::app) fn send_player_controls(
@@ -1753,23 +1886,29 @@ pub(in crate::app) fn handle_bazaar_input(
     content_mode: ContentMode,
 ) {
     let is_networked = local.is_networked();
+    let is_lockstep_networked = local.is_lockstep_networked();
+    let primary_player = if is_networked {
+        local.local_player
+    } else {
+        PlayerId::One
+    };
     if keys.just_pressed(KeyCode::Enter) {
-        let events = if is_networked {
+        let events = if is_lockstep_networked {
             send_network_bazaar_done(local, network_runtime, network_state, bazaar_ui)
         } else {
-            local.game.bazaar_done(PlayerId::One)
+            local.game.bazaar_done(primary_player)
         };
         match events {
             events if events.is_empty() => {
                 bazaar_ui.last_message = UiTextTone::bazaar_waiting_copy(
                     content_mode,
-                    BazaarWaitingText::PlayerRepeated(PlayerId::One),
+                    BazaarWaitingText::PlayerRepeated(primary_player),
                 )
             }
             _ => {
                 bazaar_ui.last_message = UiTextTone::bazaar_waiting_copy(
                     content_mode,
-                    BazaarWaitingText::PlayerWaiting(PlayerId::One),
+                    BazaarWaitingText::PlayerWaiting(primary_player),
                 )
             }
         }
@@ -1803,7 +1942,7 @@ pub(in crate::app) fn handle_bazaar_input(
             network_runtime,
             network_state,
             bazaar_ui,
-            PlayerId::One,
+            primary_player,
         );
     }
     if keys.just_pressed(KeyCode::KeyX) || keys.just_pressed(KeyCode::Minus) {
@@ -1812,19 +1951,21 @@ pub(in crate::app) fn handle_bazaar_input(
             network_runtime,
             network_state,
             bazaar_ui,
-            PlayerId::One,
+            primary_player,
         );
     }
 
     for (token, key) in bazaar_catalog_keys() {
         if keys.just_pressed(key) {
-            let player = if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
+            let player = if local.is_legacy_networked() {
+                local.local_player
+            } else if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
                 PlayerId::Two
             } else {
                 PlayerId::One
             };
             bazaar_ui.selected = token;
-            if is_networked {
+            if is_lockstep_networked {
                 buy_bazaar_weapon(
                     local,
                     network_runtime,
@@ -2143,7 +2284,7 @@ pub(in crate::app) fn handle_bazaar_click(
         return;
     }
     if bazaar_done_rect(theme).contains(world) {
-        let events = if local.is_networked() {
+        let events = if local.is_lockstep_networked() {
             send_network_bazaar_done(local, network_runtime, network_state, ui)
         } else {
             local.game.bazaar_done(player)
@@ -2191,7 +2332,7 @@ pub(in crate::app) fn buy_bazaar_weapon(
     player: PlayerId,
     token: WeaponToken,
 ) {
-    let result = if local.is_networked() {
+    let result = if local.is_lockstep_networked() {
         send_network_bazaar_buy(local, network_runtime, network_state, player, token)
     } else {
         local
@@ -2221,7 +2362,7 @@ pub(in crate::app) fn remove_selected_bazaar_weapon(
     player: PlayerId,
 ) {
     let token = ui.selected;
-    let result = if local.is_networked() {
+    let result = if local.is_lockstep_networked() {
         send_network_bazaar_remove(local, network_runtime, network_state, player, token)
     } else {
         local
