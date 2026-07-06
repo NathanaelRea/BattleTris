@@ -109,7 +109,8 @@ pub(super) enum SettingsField {
     HostBindAddress,
     ShareAddress,
     JoinAddress,
-    LobbyAddress,
+    ModernServerAddress,
+    LegacyServerAddress,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,7 +125,7 @@ pub(super) enum SettingsControl {
 }
 
 impl SettingsControl {
-    pub(super) const ALL: [Self; 12] = [
+    pub(super) const ALL: [Self; 13] = [
         Self::UiStyle,
         Self::Theme,
         Self::SoundPack,
@@ -136,7 +137,8 @@ impl SettingsControl {
         Self::Text(SettingsField::HostBindAddress),
         Self::Text(SettingsField::ShareAddress),
         Self::Text(SettingsField::JoinAddress),
-        Self::Text(SettingsField::LobbyAddress),
+        Self::Text(SettingsField::ModernServerAddress),
+        Self::Text(SettingsField::LegacyServerAddress),
     ];
 
     pub(super) const fn text_field(self) -> Option<SettingsField> {

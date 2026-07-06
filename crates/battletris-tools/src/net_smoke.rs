@@ -9,7 +9,8 @@ use battletris_core::{
 use battletris_protocol::{
     accept_direct_game, derive_player_seeds, join_direct_game,
     legacy::{
-        LegacyConnection, LegacyNetworkEntry, LegacyPacket, LegacyToken, LEGACY_C_ULONG_LEN,
+        accept_pending_legacy_challenge, join_legacy_game, LegacyConnection, LegacyNetworkEntry,
+        LegacyNetworkStatus, LegacyPacket, LegacyToken, LEGACY_C_ULONG_LEN, LEGACY_DB_KEY_LEN,
         LEGACY_NETWORK_ENTRY_LEN,
     },
     read_message, write_message, DirectConnection, Disconnect, GameChecksum, Hello,
@@ -70,6 +71,11 @@ async fn run_async(mut args: Vec<String>) -> Result<(), String> {
             let share = parse_flag_addr(&mut args, "--share")?;
             ensure_no_extra_args(&args)?;
             legacy_roster(server, share).await
+        }
+        "legacy-rust-interop" => {
+            let server = parse_flag_addr(&mut args, "--server")?;
+            ensure_no_extra_args(&args)?;
+            legacy_rust_interop(server).await
         }
         "ranked-result" => {
             let server = parse_flag_addr(&mut args, "--server")?;
@@ -293,73 +299,317 @@ async fn hosted_lobby(server: SocketAddr) -> Result<HostedGameStartPair, String>
 }
 
 async fn legacy_roster(server: SocketAddr, share: SocketAddr) -> Result<(), String> {
-    let stream = timeout(SMOKE_TIMEOUT, TcpStream::connect(server))
-        .await
-        .map_err(|_| format!("timed out connecting to legacy server {server}"))?
-        .map_err(|error| format!("connect to legacy server {server} failed: {error}"))?;
-    let mut connection = LegacyConnection::from_stream(stream);
-    let accepted = timeout(SMOKE_TIMEOUT, connection.recv())
-        .await
-        .map_err(|_| "timed out waiting for legacy server accept".to_string())?
-        .map_err(|error| format!("legacy server accept read failed: {error}"))?;
-    if accepted.token != LegacyToken::Accepted {
-        return Err(format!("expected BT_ACCEPTED, got {:?}", accepted.token));
+    let entry = LegacyNetworkEntry::waiting(identity("Smoke Legacy"), share, std::process::id(), 1);
+    let mut connection = connect_legacy_roster(server, &entry, "legacy").await?;
+    let entries = query_legacy_roster(&mut connection, "legacy roster").await?;
+    let count = entries.len();
+    println!("legacy-roster ok entries={count}");
+    for entry in entries {
+        println!("{} {}:{}", entry.user_name, entry.host_name, entry.port);
     }
 
-    let entry = LegacyNetworkEntry::waiting(identity("Smoke Legacy"), share, std::process::id(), 1);
     connection
         .send(&LegacyPacket {
-            token: LegacyToken::QueryConnection,
-            payload: entry.encode(),
+            token: LegacyToken::QueryVerify,
+            payload: legacy_key_payload(&entry.key),
         })
         .await
-        .map_err(|error| format!("legacy register failed: {error}"))?;
+        .map_err(|error| format!("legacy verify query failed: {error}"))?;
+    expect_legacy_verify(&mut connection, true).await?;
+
     connection
-        .send(&LegacyPacket::empty(LegacyToken::QueryNetworkDb))
+        .send(&LegacyPacket::empty(LegacyToken::QueryPlayerDb))
         .await
-        .map_err(|error| format!("legacy roster query failed: {error}"))?;
-    let count_packet = connection
-        .recv()
-        .await
-        .map_err(|error| format!("legacy roster length read failed: {error}"))?;
-    if count_packet.token != LegacyToken::ResponseDbLen {
+        .map_err(|error| format!("legacy player DB query failed: {error}"))?;
+    let count_packet = recv_legacy_packet(&mut connection, "legacy player DB length").await?;
+    if count_packet.token != LegacyToken::ResponseDbLen || legacy_db_count(&count_packet)? != 0 {
+        return Err("expected empty legacy player DB length".to_string());
+    }
+    let player_db_packet = recv_legacy_packet(&mut connection, "legacy player DB").await?;
+    if player_db_packet.token != LegacyToken::ResponsePlayerDb
+        || !player_db_packet.payload.is_empty()
+    {
         return Err(format!(
-            "expected BT_RESP_DBLEN, got {:?}",
-            count_packet.token
+            "expected empty BT_RESP_PLYDB, got {:?} with {} bytes",
+            player_db_packet.token,
+            player_db_packet.payload.len()
         ));
     }
-    if count_packet.payload.len() != 4 && count_packet.payload.len() != LEGACY_C_ULONG_LEN {
-        return Err(format!(
-            "unexpected legacy roster length payload size {}",
-            count_packet.payload.len()
-        ));
-    }
-    let count = u32::from_be_bytes(count_packet.payload[..4].try_into().unwrap()) as usize;
-    let db_packet = connection
-        .recv()
+
+    connection
+        .send(&LegacyPacket::empty(LegacyToken::QueryUpdate))
         .await
-        .map_err(|error| format!("legacy roster read failed: {error}"))?;
-    if db_packet.token != LegacyToken::ResponseNetworkDb {
-        return Err(format!("expected BT_RESP_NETDB, got {:?}", db_packet.token));
-    }
-    let expected_len = count * LEGACY_NETWORK_ENTRY_LEN;
-    if db_packet.payload.len() != expected_len {
-        return Err(format!(
-            "legacy roster payload size mismatch: expected {expected_len}, got {}",
-            db_packet.payload.len()
-        ));
-    }
-    println!("legacy-roster ok entries={count}");
-    for chunk in db_packet.payload.chunks_exact(LEGACY_NETWORK_ENTRY_LEN) {
-        let entry = LegacyNetworkEntry::decode(chunk)
-            .map_err(|error| format!("legacy roster entry decode failed: {error}"))?;
-        println!("{} {}:{}", entry.user_name, entry.host_name, entry.port);
+        .map_err(|error| format!("legacy status update failed: {error}"))?;
+    connection
+        .send(&LegacyPacket {
+            token: LegacyToken::QueryVerify,
+            payload: legacy_key_payload(&entry.key),
+        })
+        .await
+        .map_err(|error| format!("legacy verify after update failed: {error}"))?;
+    expect_legacy_verify(&mut connection, false).await?;
+
+    connection
+        .send(&LegacyPacket {
+            token: LegacyToken::QueryResult,
+            payload: vec![0xaa; 16],
+        })
+        .await
+        .map_err(|error| format!("legacy ignored result send failed: {error}"))?;
+    let entries = query_legacy_roster(&mut connection, "legacy roster after result").await?;
+    if entries.len() != 1 {
+        return Err("legacy roster was not healthy after ignored result".to_string());
     }
     connection
         .send(&LegacyPacket::empty(LegacyToken::Disconnect))
         .await
         .map_err(|error| format!("legacy disconnect failed: {error}"))?;
     Ok(())
+}
+
+async fn legacy_rust_interop(server: SocketAddr) -> Result<(), String> {
+    let host_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|error| format!("bind legacy host listener failed: {error}"))?;
+    let host_addr = host_listener
+        .local_addr()
+        .map_err(|error| format!("read legacy host address failed: {error}"))?;
+    let join_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|error| format!("bind legacy joiner listener failed: {error}"))?;
+    let join_addr = join_listener
+        .local_addr()
+        .map_err(|error| format!("read legacy joiner address failed: {error}"))?;
+
+    let host_entry = LegacyNetworkEntry::waiting(identity("Smoke Legacy Host"), host_addr, 11, 1);
+    let join_entry = LegacyNetworkEntry::waiting(identity("Smoke Legacy Join"), join_addr, 12, 1);
+    let mut host_roster = connect_legacy_roster(server, &host_entry, "host").await?;
+    let mut join_roster = connect_legacy_roster(server, &join_entry, "joiner").await?;
+
+    let entries = query_legacy_roster(&mut join_roster, "joiner roster discovery").await?;
+    let discovered_host = entries
+        .iter()
+        .find(|entry| entry.key == host_entry.key)
+        .ok_or_else(|| "joiner did not discover host roster entry".to_string())?;
+    if discovered_host.status != LegacyNetworkStatus::Waiting {
+        return Err("discovered host was not waiting".to_string());
+    }
+    send_legacy_verify(&mut join_roster, &host_entry.key, true).await?;
+
+    let expected_join_key = join_entry.key.clone();
+    let host = tokio::spawn(async move {
+        let pending = timeout(
+            SMOKE_TIMEOUT,
+            accept_pending_legacy_challenge(&host_listener),
+        )
+        .await
+        .map_err(|_| "legacy host timed out waiting for challenge".to_string())?
+        .map_err(|error| format!("legacy host challenge accept failed: {error}"))?;
+        if pending.challenger.key != expected_join_key {
+            return Err("legacy host received unexpected challenger entry".to_string());
+        }
+        let mut accepted = pending
+            .accept()
+            .await
+            .map_err(|error| format!("legacy host start handshake failed: {error}"))?;
+        let packet = recv_legacy_packet(&mut accepted.connection, "legacy direct score").await?;
+        if packet.token != LegacyToken::Score {
+            return Err(format!("expected direct BT_SCORE, got {:?}", packet.token));
+        }
+        accepted
+            .connection
+            .send(&LegacyPacket::empty(LegacyToken::GameOver))
+            .await
+            .map_err(|error| format!("legacy host game-over send failed: {error}"))?;
+        Ok::<(), String>(())
+    });
+    let mut joined = timeout(SMOKE_TIMEOUT, join_legacy_game(host_addr, join_entry))
+        .await
+        .map_err(|_| "legacy joiner timed out connecting to host".to_string())?
+        .map_err(|error| format!("legacy joiner direct handshake failed: {error}"))?;
+    joined
+        .connection
+        .send(&LegacyPacket {
+            token: LegacyToken::Score,
+            payload: vec![
+                0, 0, 0, 7, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 2,
+            ],
+        })
+        .await
+        .map_err(|error| format!("legacy joiner score send failed: {error}"))?;
+    let packet = recv_legacy_packet(&mut joined.connection, "legacy direct game over").await?;
+    if packet.token != LegacyToken::GameOver {
+        return Err(format!(
+            "expected direct BT_GAMEOVER, got {:?}",
+            packet.token
+        ));
+    }
+    host.await
+        .map_err(|error| format!("legacy direct host task failed: {error}"))??;
+
+    for (connection, label) in [(&mut host_roster, "host"), (&mut join_roster, "joiner")] {
+        connection
+            .send(&LegacyPacket::empty(LegacyToken::QueryUpdate))
+            .await
+            .map_err(|error| format!("legacy {label} status update failed: {error}"))?;
+        connection
+            .send(&LegacyPacket {
+                token: LegacyToken::QueryResult,
+                payload: vec![0xbb; 32],
+            })
+            .await
+            .map_err(|error| format!("legacy {label} ignored result failed: {error}"))?;
+    }
+    let entries = query_legacy_roster(&mut host_roster, "post-game roster").await?;
+    if entries.len() != 2 {
+        return Err(format!(
+            "expected 2 legacy roster entries after game, got {}",
+            entries.len()
+        ));
+    }
+    for connection in [&mut host_roster, &mut join_roster] {
+        connection
+            .send(&LegacyPacket::empty(LegacyToken::Disconnect))
+            .await
+            .map_err(|error| format!("legacy disconnect failed: {error}"))?;
+    }
+    println!("legacy-rust-interop ok entries=2 direct_peer={host_addr}");
+    Ok(())
+}
+
+async fn connect_legacy_roster(
+    server: SocketAddr,
+    entry: &LegacyNetworkEntry,
+    label: &str,
+) -> Result<LegacyConnection, String> {
+    let stream = timeout(SMOKE_TIMEOUT, TcpStream::connect(server))
+        .await
+        .map_err(|_| format!("timed out connecting {label} to legacy server {server}"))?
+        .map_err(|error| format!("connect {label} to legacy server {server} failed: {error}"))?;
+    let mut connection = LegacyConnection::from_stream(stream);
+    let accepted = timeout(SMOKE_TIMEOUT, connection.recv())
+        .await
+        .map_err(|_| format!("timed out waiting for {label} legacy server accept"))?
+        .map_err(|error| format!("{label} legacy server accept read failed: {error}"))?;
+    if accepted.token != LegacyToken::Accepted {
+        return Err(format!(
+            "expected BT_ACCEPTED for {label}, got {:?}",
+            accepted.token
+        ));
+    }
+    connection
+        .send(&LegacyPacket {
+            token: LegacyToken::QueryConnection,
+            payload: entry.encode(),
+        })
+        .await
+        .map_err(|error| format!("legacy {label} register failed: {error}"))?;
+    Ok(connection)
+}
+
+async fn query_legacy_roster(
+    connection: &mut LegacyConnection,
+    context: &str,
+) -> Result<Vec<LegacyNetworkEntry>, String> {
+    connection
+        .send(&LegacyPacket::empty(LegacyToken::QueryNetworkDb))
+        .await
+        .map_err(|error| format!("{context} query failed: {error}"))?;
+    let count_packet = recv_legacy_packet(connection, &format!("{context} length")).await?;
+    if count_packet.token != LegacyToken::ResponseDbLen {
+        return Err(format!(
+            "expected BT_RESP_DBLEN for {context}, got {:?}",
+            count_packet.token
+        ));
+    }
+    let count = legacy_db_count(&count_packet)?;
+    let db_packet = recv_legacy_packet(connection, context).await?;
+    if db_packet.token != LegacyToken::ResponseNetworkDb {
+        return Err(format!(
+            "expected BT_RESP_NETDB for {context}, got {:?}",
+            db_packet.token
+        ));
+    }
+    let expected_len = count * LEGACY_NETWORK_ENTRY_LEN;
+    if db_packet.payload.len() != expected_len {
+        return Err(format!(
+            "legacy roster payload size mismatch for {context}: expected {expected_len}, got {}",
+            db_packet.payload.len()
+        ));
+    }
+    db_packet
+        .payload
+        .chunks_exact(LEGACY_NETWORK_ENTRY_LEN)
+        .map(|chunk| {
+            LegacyNetworkEntry::decode(chunk).map_err(|error| {
+                format!("legacy roster entry decode failed for {context}: {error}")
+            })
+        })
+        .collect()
+}
+
+async fn send_legacy_verify(
+    connection: &mut LegacyConnection,
+    key: &str,
+    expected: bool,
+) -> Result<(), String> {
+    connection
+        .send(&LegacyPacket {
+            token: LegacyToken::QueryVerify,
+            payload: legacy_key_payload(key),
+        })
+        .await
+        .map_err(|error| format!("legacy verify query failed: {error}"))?;
+    expect_legacy_verify(connection, expected).await
+}
+
+async fn recv_legacy_packet(
+    connection: &mut LegacyConnection,
+    context: &str,
+) -> Result<LegacyPacket, String> {
+    timeout(SMOKE_TIMEOUT, connection.recv())
+        .await
+        .map_err(|_| format!("timed out waiting for {context}"))?
+        .map_err(|error| format!("{context} read failed: {error}"))
+}
+
+async fn expect_legacy_verify(
+    connection: &mut LegacyConnection,
+    expected: bool,
+) -> Result<(), String> {
+    let packet = recv_legacy_packet(connection, "legacy verify response").await?;
+    if packet.token != LegacyToken::ResponseVerify || packet.payload.len() != 2 {
+        return Err(format!(
+            "expected BT_RESP_VERIFY, got {:?} with {} bytes",
+            packet.token,
+            packet.payload.len()
+        ));
+    }
+    let value = u16::from_be_bytes(packet.payload.try_into().unwrap()) == 1;
+    if value != expected {
+        return Err(format!(
+            "legacy verify mismatch: expected {expected}, got {value}"
+        ));
+    }
+    Ok(())
+}
+
+fn legacy_db_count(packet: &LegacyPacket) -> Result<usize, String> {
+    if packet.payload.len() != 4 && packet.payload.len() != LEGACY_C_ULONG_LEN {
+        return Err(format!(
+            "unexpected legacy DB length payload size {}",
+            packet.payload.len()
+        ));
+    }
+    Ok(u32::from_be_bytes(packet.payload[..4].try_into().unwrap()) as usize)
+}
+
+fn legacy_key_payload(key: &str) -> Vec<u8> {
+    let mut payload = vec![0; LEGACY_DB_KEY_LEN];
+    let bytes = key.as_bytes();
+    let copy_len = bytes.len().min(LEGACY_DB_KEY_LEN.saturating_sub(1));
+    payload[..copy_len].copy_from_slice(&bytes[..copy_len]);
+    payload
 }
 
 async fn ranked_result(server: SocketAddr) -> Result<(), String> {
@@ -704,7 +954,7 @@ fn ensure_no_extra_args(args: &[String]) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "Usage: battletris-tools net-smoke <command>\n\nCommands:\n  direct-loopback\n  direct-host --listen ADDR:PORT\n  direct-join --addr ADDR:PORT\n  hosted-lobby --server ADDR:PORT\n  legacy-roster --server ADDR:PORT --share ADDR:PORT\n  ranked-result --server ADDR:PORT\n\nProtocol: {}.{} ({})",
+        "Usage: battletris-tools net-smoke <command>\n\nCommands:\n  direct-loopback\n  direct-host --listen ADDR:PORT\n  direct-join --addr ADDR:PORT\n  hosted-lobby --server ADDR:PORT\n  legacy-roster --server ADDR:PORT --share ADDR:PORT\n  legacy-rust-interop --server ADDR:PORT\n  ranked-result --server ADDR:PORT\n\nProtocol: {}.{} ({})",
         PROTOCOL_MAJOR, PROTOCOL_MINOR, CAPABILITY_DIRECT_TCP
     );
 

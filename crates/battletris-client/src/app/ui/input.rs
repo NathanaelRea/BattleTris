@@ -649,7 +649,11 @@ pub(in crate::app) fn start_legacy_host_challenge(
         return;
     };
     let server_addr = if settings.lobby_enabled {
-        match parse_network_addr(&settings.lobby_addr, "legacy server address", network_state) {
+        match parse_network_addr(
+            &settings.legacy_server_addr,
+            "legacy server address",
+            network_state,
+        ) {
             Ok(server_addr) => Some(server_addr),
             Err(_) => return,
         }
@@ -709,9 +713,11 @@ pub(in crate::app) fn update_challenge_mode(
             network_state.lifecycle,
             NetworkLifecycleState::Hosting { .. }
         ) {
-            if let Ok(server_addr) =
-                parse_network_addr(&settings.lobby_addr, "legacy server address", network_state)
-            {
+            if let Ok(server_addr) = parse_network_addr(
+                &settings.legacy_server_addr,
+                "legacy server address",
+                network_state,
+            ) {
                 try_send_network_command(
                     network_runtime,
                     network_state,
@@ -874,8 +880,11 @@ pub(in crate::app) fn register_hosted_lobby(
     if !settings.lobby_enabled {
         return;
     }
-    let Ok(server_addr) = parse_network_addr(&settings.lobby_addr, "lobby address", network_state)
-    else {
+    let Ok(server_addr) = parse_network_addr(
+        &settings.modern_server_addr,
+        "modern server address",
+        network_state,
+    ) else {
         return;
     };
     let direct_addr = effective_direct_share_addr(settings, network_state);
@@ -903,8 +912,11 @@ pub(in crate::app) fn browse_hosted_lobby(
         network_state.push_message("Lobby server disabled by -X/--no-server");
         return;
     }
-    let Ok(server_addr) = parse_network_addr(&settings.lobby_addr, "lobby address", network_state)
-    else {
+    let Ok(server_addr) = parse_network_addr(
+        &settings.modern_server_addr,
+        "modern server address",
+        network_state,
+    ) else {
         return;
     };
     try_send_network_command(
@@ -998,8 +1010,11 @@ pub(in crate::app) fn start_selected_hosted_game(
         network_state.push_message("Cannot challenge your own lobby entry");
         return;
     }
-    let Ok(server_addr) = parse_network_addr(&settings.lobby_addr, "lobby address", network_state)
-    else {
+    let Ok(server_addr) = parse_network_addr(
+        &settings.modern_server_addr,
+        "modern server address",
+        network_state,
+    ) else {
         return;
     };
     try_send_network_command(
@@ -1063,7 +1078,7 @@ pub(in crate::app) fn poll_registered_hosted_status(
     };
     let server_addr = network_state
         .lobby_server_addr
-        .or_else(|| settings.lobby_addr.parse::<SocketAddr>().ok());
+        .or_else(|| settings.modern_server_addr.parse::<SocketAddr>().ok());
     let Some(server_addr) = server_addr else {
         return;
     };

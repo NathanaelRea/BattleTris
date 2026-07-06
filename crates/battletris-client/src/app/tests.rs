@@ -467,7 +467,7 @@ fn legacy_cli_flags_apply_session_overrides() {
     assert_eq!(settings.screen, ClientScreen::Sleep);
     assert_eq!(settings.sound_pack, SoundPackChoice::Muted);
     assert!(!settings.lobby_enabled);
-    assert_eq!(settings.lobby_addr, "127.0.0.2:4410");
+    assert_eq!(settings.legacy_server_addr, "127.0.0.2:4410");
 }
 
 #[test]
@@ -503,7 +503,7 @@ fn xrm_overrides_apply_known_legacy_resources() {
     assert_eq!(settings.screen, ClientScreen::Sleep);
     assert_eq!(settings.sound_pack, SoundPackChoice::Muted);
     assert!(!settings.lobby_enabled);
-    assert_eq!(settings.lobby_addr, "127.0.0.3:4411");
+    assert_eq!(settings.legacy_server_addr, "127.0.0.3:4411");
 }
 
 #[test]
@@ -968,7 +968,8 @@ fn client_settings_round_trip_as_toml() {
         direct_listen_addr: "0.0.0.0:4405".to_string(),
         direct_share_addr: "192.168.1.10:4405".to_string(),
         direct_join_addr: "192.168.1.10:4405".to_string(),
-        lobby_addr: "127.0.0.1:4404".to_string(),
+        modern_server_addr: "127.0.0.1:4405".to_string(),
+        legacy_server_addr: "127.0.0.1:4404".to_string(),
         hosted_ranked: false,
     };
 
@@ -979,7 +980,39 @@ fn client_settings_round_trip_as_toml() {
     assert!(encoded.contains("high-contrast"));
     assert!(encoded.contains("original"));
     assert!(encoded.contains("legacy"));
+    assert!(encoded.contains("modern-server-addr"));
+    assert!(encoded.contains("legacy-server-addr"));
+    assert!(!encoded.contains("lobby-addr"));
     assert!(encoded.contains("Ada"));
+}
+
+#[test]
+fn legacy_lobby_addr_setting_is_not_migrated() {
+    let persisted: PersistedClientSettings = toml::from_str(
+        r#"
+ui-style = "original"
+theme = "original"
+sound-pack = "generated-default"
+controls = "original"
+pixel-scale = 1.0
+ernie-level = 7
+challenge-style = "legacy"
+display-name = "Ada"
+community-label = "garage"
+direct-listen-addr = "0.0.0.0:4405"
+direct-share-addr = "192.168.1.10:4405"
+direct-join-addr = "192.168.1.10:4405"
+lobby-addr = "127.0.0.9:4499"
+hosted-ranked = false
+"#,
+    )
+    .expect("old settings decode with ignored lobby-addr");
+    let mut settings = ClientSettings::default();
+
+    settings.apply_persisted(persisted);
+
+    assert_eq!(settings.modern_server_addr, DEFAULT_MODERN_SERVER_ADDR);
+    assert_eq!(settings.legacy_server_addr, DEFAULT_LEGACY_SERVER_ADDR);
 }
 
 #[test]
@@ -1080,14 +1113,16 @@ fn invalid_network_settings_fall_back_to_safe_defaults() {
         direct_listen_addr: "".to_string(),
         direct_share_addr: "not an address".to_string(),
         direct_join_addr: "also bad".to_string(),
-        lobby_addr: "".to_string(),
+        modern_server_addr: "".to_string(),
+        legacy_server_addr: "".to_string(),
         ..Default::default()
     });
 
     assert_eq!(settings.direct_listen_addr, "0.0.0.0:4405");
     assert!(!socket_addr_is_unspecified(&settings.direct_share_addr));
     assert_eq!(settings.direct_join_addr, "127.0.0.1:4405");
-    assert_eq!(settings.lobby_addr, "127.0.0.1:4404");
+    assert_eq!(settings.modern_server_addr, "127.0.0.1:4405");
+    assert_eq!(settings.legacy_server_addr, "127.0.0.1:4404");
 }
 
 #[test]

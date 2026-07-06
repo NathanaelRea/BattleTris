@@ -851,7 +851,8 @@ pub(in crate::app) fn spawn_settings_ui_shell(
                         ("Host Bind", SettingsField::HostBindAddress),
                         ("Share Address", SettingsField::ShareAddress),
                         ("Join Address", SettingsField::JoinAddress),
-                        ("Lobby Address", SettingsField::LobbyAddress),
+                        ("Modern Server", SettingsField::ModernServerAddress),
+                        ("Legacy Server", SettingsField::LegacyServerAddress),
                     ] {
                         spawn_settings_text_input_ui_row(parent, label, field);
                     }

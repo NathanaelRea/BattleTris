@@ -694,15 +694,18 @@ pub(super) fn reduce_client_network_event(
 pub(super) fn player_facing_network_error(message: &str) -> String {
     let lower = message.to_ascii_lowercase();
     if lower.contains("address already in use") || lower.contains("addrinuse") {
-        "Host bind failed: address already in use. Try another port or cancel the old host."
+        "Host bind failed: address already in use. The modern server may already be using port 4405; try another bind address or stop the old host."
             .to_string()
     } else if lower.contains("timed out connecting to direct peer")
         || lower.contains("timed out connecting to hosted direct peer")
         || lower.contains("join timed out")
     {
         format!("Join timed out. Check the host share address and firewall. {message}")
+    } else if lower.contains("original battletris") || lower.contains("invalid btrs response magic")
+    {
+        format!("Wrong server protocol. Modern play uses BTRS on port 4405. {message}")
     } else if lower.contains("lobby server") || lower.contains("hosted status") {
-        format!("Lobby server unavailable. Direct IP can still be used. {message}")
+        format!("Modern server unavailable. Direct IP can still be used. {message}")
     } else if lower.contains("challenge denied") || lower.contains("denied") {
         let reason = message
             .split_once(':')
@@ -846,8 +849,11 @@ pub(super) fn refresh_server_roster(
     if !entered_roster {
         return;
     }
-    let Ok(server_addr) = parse_network_addr(&settings.lobby_addr, "lobby address", &mut state)
-    else {
+    let Ok(server_addr) = parse_network_addr(
+        &settings.modern_server_addr,
+        "modern server address",
+        &mut state,
+    ) else {
         return;
     };
     try_send_network_command(

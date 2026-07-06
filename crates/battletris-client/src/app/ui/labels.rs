@@ -346,7 +346,10 @@ pub(in crate::app) fn challenge_screen_body_label(settings: &ClientSettings) -> 
 
 pub(in crate::app) fn lobby_status_label(settings: &ClientSettings) -> String {
     if settings.lobby_enabled {
-        settings.lobby_addr.clone()
+        match settings.challenge_style {
+            ChallengeStyle::Legacy => settings.legacy_server_addr.clone(),
+            ChallengeStyle::Modern => settings.modern_server_addr.clone(),
+        }
     } else {
         "disabled by -X/--no-server".to_string()
     }
@@ -655,8 +658,8 @@ pub(in crate::app) fn host_via_lobby_panel_label(
         },
     );
     format!(
-        "Host Via Lobby\n\nBecome available in the self-hosted lobby, then wait for a challenger to connect directly.\n\nLobby: {}\nCommunity: {}\nShare: {}\nRanked requested: {}\n{}\n\n{}",
-        settings.lobby_addr,
+        "Host Via Lobby\n\nBecome available in the self-hosted lobby, then wait for a challenger to connect directly.\n\nModern server: {}\nCommunity: {}\nShare: {}\nRanked requested: {}\n{}\n\n{}",
+        settings.modern_server_addr,
         settings.community_label,
         effective_direct_share_addr(settings, network_state),
         settings.hosted_ranked,
@@ -691,8 +694,8 @@ pub(in crate::app) fn browse_lobby_panel_label(
         },
     );
     format!(
-        "Browse Lobby\n\nFind available players from the self-hosted lobby and challenge one. Gameplay still connects directly to the host.\n\nLobby: {}\nCommunity: {}\n{}\n\nUp/Down or mouse selects.\nEnter/C refreshes when empty or challenges the selected player.\n\n{}",
-        settings.lobby_addr,
+        "Browse Lobby\n\nFind available players from the self-hosted lobby and challenge one. Gameplay still connects directly to the host.\n\nModern server: {}\nCommunity: {}\n{}\n\nUp/Down or mouse selects.\nEnter/C refreshes when empty or challenges the selected player.\n\n{}",
+        settings.modern_server_addr,
         settings.community_label,
         selected,
         challenge_status_lifecycle_label(network_state),

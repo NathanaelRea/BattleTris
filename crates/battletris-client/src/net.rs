@@ -1562,13 +1562,25 @@ async fn host_until_legacy_challenge(
     emit_state(io, NetworkLifecycleState::Hosting { bind_addr }).await;
     let listener = match TcpListener::bind(bind_addr).await {
         Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            let fallback_addr = SocketAddr::new(bind_addr.ip(), 0);
+            match TcpListener::bind(fallback_addr).await {
+                Ok(listener) => listener,
+                Err(fallback_error) => {
+                    emit_error(
+                        io,
+                        format!(
+                            "Legacy host bind failed on {bind_addr}: {error}; fallback {fallback_addr} also failed: {fallback_error}."
+                        ),
+                    )
+                    .await;
+                    emit_state(io, NetworkLifecycleState::Idle).await;
+                    return;
+                }
+            }
+        }
         Err(error) => {
-            let message = if error.kind() == std::io::ErrorKind::AddrInUse {
-                "Legacy host bind failed: address already in use. Try another port or cancel the old host."
-                    .to_string()
-            } else {
-                format!("Legacy host bind failed on {bind_addr}: {error}.")
-            };
+            let message = format!("Legacy host bind failed on {bind_addr}: {error}.");
             emit_error(io, message).await;
             emit_state(io, NetworkLifecycleState::Idle).await;
             return;
@@ -1576,9 +1588,11 @@ async fn host_until_legacy_challenge(
     };
     let actual_addr = listener.local_addr().unwrap_or(bind_addr);
     let share_addr = share_addr_for(actual_addr);
+    let legacy_roster_addr =
+        legacy_roster_registration_addr(bind_addr, advertised_addr, share_addr);
     let mut legacy_server = match server_addr {
         Some(server_addr) => {
-            match register_legacy_roster(server_addr, identity, advertised_addr).await {
+            match register_legacy_roster(server_addr, identity, legacy_roster_addr).await {
                 Ok(mut server) => {
                     match query_legacy_roster(&mut server).await {
                         Ok(entries) => emit_legacy_roster(io, entries).await,
@@ -1657,6 +1671,17 @@ async fn host_until_legacy_challenge(
             }
         }
     }
+}
+
+fn legacy_roster_registration_addr(
+    requested_bind_addr: SocketAddr,
+    advertised_addr: SocketAddr,
+    actual_share_addr: SocketAddr,
+) -> SocketAddr {
+    if requested_bind_addr.port() == actual_share_addr.port() {
+        return advertised_addr;
+    }
+    SocketAddr::new(advertised_addr.ip(), actual_share_addr.port())
 }
 
 async fn join_legacy(
@@ -2418,11 +2443,29 @@ fn log_net(message: &str) {
 
 fn format_protocol_error(context: &str, error: &ProtocolError) -> String {
     match error {
+        ProtocolError::BadMagic { actual } => {
+            let hint = if looks_like_legacy_server_first_packet(*actual) {
+                " Endpoint looks like original BattleTris; use Legacy mode or the modern server port 4405."
+            } else {
+                " Check that this is a modern BattleTris BTRS endpoint."
+            };
+            format!("{context}: invalid BTRS response magic {actual:?}.{hint}")
+        }
+        ProtocolError::UnsupportedMajor { major } => {
+            format!("{context}: incompatible modern protocol major {major}; this client requires major 2.")
+        }
+        ProtocolError::IncompatiblePeerVersion { major, minor } => {
+            format!("{context}: incompatible modern protocol v{major}.{minor}; this client requires major 2.")
+        }
         ProtocolError::ChallengeDenied { reason } => {
             format!("{context}: challenge denied: {reason}")
         }
         _ => format!("{context}: {error:?}"),
     }
+}
+
+fn looks_like_legacy_server_first_packet(actual: [u8; 4]) -> bool {
+    u32::from_be_bytes(actual) <= u16::MAX as u32 || u32::from_le_bytes(actual) <= u16::MAX as u32
 }
 
 fn format_legacy_error(context: &str, error: &LegacyError) -> String {
@@ -3478,6 +3521,28 @@ mod tests {
     }
 
     #[test]
+    fn legacy_roster_registration_uses_actual_port_after_fallback_bind() {
+        let requested = "0.0.0.0:4405".parse().unwrap();
+        let configured_share = "192.168.1.44:4405".parse().unwrap();
+        let actual_share = "127.0.0.1:51234".parse().unwrap();
+
+        let registered = legacy_roster_registration_addr(requested, configured_share, actual_share);
+
+        assert_eq!(registered.to_string(), "192.168.1.44:51234");
+    }
+
+    #[test]
+    fn legacy_roster_registration_preserves_explicit_share_when_requested_port_is_bound() {
+        let requested = "0.0.0.0:4405".parse().unwrap();
+        let configured_share = "192.168.1.44:4405".parse().unwrap();
+        let actual_share = "127.0.0.1:4405".parse().unwrap();
+
+        let registered = legacy_roster_registration_addr(requested, configured_share, actual_share);
+
+        assert_eq!(registered, configured_share);
+    }
+
+    #[test]
     fn legacy_classful_network_parts_reconstruct_ipv4_addresses() {
         assert_eq!(legacy_inet_addr(127, 1), Ipv4Addr::new(127, 0, 0, 1));
         assert_eq!(
@@ -3873,6 +3938,43 @@ mod tests {
 
         host.shutdown();
         std::net::TcpListener::bind(addr).expect("canceled host releases listener port");
+    }
+
+    #[test]
+    fn runtime_legacy_host_falls_back_when_requested_port_is_in_use() {
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let occupied_addr = reserved.local_addr().unwrap();
+
+        let mut host = NetworkRuntime::start();
+        host.channels_mut()
+            .command_sender()
+            .try_send(NetworkCommand::LegacyHost {
+                bind_addr: occupied_addr,
+                identity: identity("Ada"),
+                share_addr: occupied_addr,
+                server_addr: None,
+            })
+            .unwrap();
+
+        let listening = wait_for_event(host.channels_mut(), |event| match event {
+            NetworkEvent::Listening { bind_addr, .. } => Some(bind_addr),
+            NetworkEvent::Error { message } => panic!("legacy host should fall back: {message}"),
+            _ => None,
+        });
+
+        assert_eq!(listening.ip(), occupied_addr.ip());
+        assert_ne!(listening.port(), occupied_addr.port());
+
+        host.channels_mut()
+            .command_sender()
+            .try_send(NetworkCommand::Cancel)
+            .unwrap();
+        wait_for_event(host.channels_mut(), |event| match event {
+            NetworkEvent::StateChanged(NetworkLifecycleState::Idle) => Some(()),
+            _ => None,
+        });
+        host.shutdown();
+        drop(reserved);
     }
 
     #[test]

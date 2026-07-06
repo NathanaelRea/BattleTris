@@ -200,7 +200,7 @@ validated.
 
 ### Rust Protocol Boundary
 
-Phase 14 implements `battletris-protocol` as a standalone wire boundary. Frames use the ADR 0003 16-byte big-endian envelope with magic `BTRS`, protocol version `1.0`, message kind, flags, and payload length. Payloads are postcard-encoded serde structs, and decoders validate magic, major version, maximum payload length, and exact frame length before deserializing.
+Phase 14 implements `battletris-protocol` as a standalone wire boundary. Frames use the ADR 0003 16-byte big-endian envelope with magic `BTRS`, modern protocol version `2.0`, message kind, flags, and payload length. Payloads are postcard-encoded serde structs, and decoders validate magic, major version, maximum payload length, and exact frame length before deserializing.
 
 The first public message set covers direct-connect foundations: hello/version advertisement, challenge, accept, deny, deterministic start, player input, board/score/arsenal snapshots, weapon launch/active/expired messages, bazaar done/state, game-over, pause/resume state, and graceful disconnect. These are intentionally protocol-owned types rather than `battletris-core::BattleEvent` values so local ring events such as bazaar start remain derived locally unless a later protocol ADR changes that boundary.
 

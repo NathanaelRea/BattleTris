@@ -368,6 +368,7 @@ fn lan_advertisement_contains_required_best_effort_metadata() {
 
     assert_eq!(ad.service, battletris_protocol::LAN_DISCOVERY_SERVICE);
     assert_eq!(ad.port, 4404);
+    assert_eq!(PROTOCOL_MAJOR, 2);
     assert_eq!(ad.txt["protocol_major"], PROTOCOL_MAJOR.to_string());
     assert_eq!(ad.txt["display_name"], "Ada");
     assert_eq!(ad.txt["port"], "4404");

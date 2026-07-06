@@ -31,8 +31,8 @@ impl ClientSessionOverrides {
             settings.lobby_enabled = false;
         }
         if self.lobby_host.is_some() || self.lobby_port.is_some() {
-            settings.lobby_addr = lobby_addr_with_overrides(
-                &settings.lobby_addr,
+            settings.legacy_server_addr = server_addr_with_overrides(
+                &settings.legacy_server_addr,
                 self.lobby_host.as_deref(),
                 self.lobby_port,
             )
@@ -162,8 +162,8 @@ pub(super) fn parse_legacy_session_args(
         index += 1;
     }
     if session_overrides.lobby_host.is_some() || session_overrides.lobby_port.is_some() {
-        lobby_addr_with_overrides(
-            DEFAULT_LOBBY_ADDR,
+        server_addr_with_overrides(
+            DEFAULT_LEGACY_SERVER_ADDR,
             session_overrides.lobby_host.as_deref(),
             session_overrides.lobby_port,
         )?;
@@ -231,7 +231,7 @@ pub(super) fn parse_xrm_bool(value: &str) -> Result<bool, String> {
     }
 }
 
-pub(super) fn lobby_addr_with_overrides(
+pub(super) fn server_addr_with_overrides(
     current: &str,
     host_override: Option<&str>,
     port_override: Option<u16>,

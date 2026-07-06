@@ -180,7 +180,8 @@ pub(super) fn apply_visual_fixture_state(
     settings.display_name = "Visual Fixture".to_string();
     settings.community_label = "visual".to_string();
     settings.direct_listen_addr = "127.0.0.1:4405".to_string();
-    settings.lobby_addr = DEFAULT_LOBBY_ADDR.to_string();
+    settings.modern_server_addr = DEFAULT_MODERN_SERVER_ADDR.to_string();
+    settings.legacy_server_addr = DEFAULT_LEGACY_SERVER_ADDR.to_string();
 
     if fixture == VisualFixture::Challenge {
         settings.ernie_level = 0;

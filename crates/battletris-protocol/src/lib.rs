@@ -19,7 +19,7 @@ pub mod legacy;
 /// Fixed frame magic used by every BattleTris rewrite protocol frame.
 pub const MAGIC: [u8; 4] = *b"BTRS";
 /// Current supported protocol major version.
-pub const PROTOCOL_MAJOR: u16 = 1;
+pub const PROTOCOL_MAJOR: u16 = 2;
 /// Current supported protocol minor version.
 pub const PROTOCOL_MINOR: u16 = 0;
 /// Header size in bytes: magic, version, kind, flags, and payload length.
@@ -1574,7 +1574,7 @@ mod tests {
             }),
             WireMessage::LobbyRegister(LobbyRegister {
                 player: hosted_player("ada", "Ada"),
-                direct_addr: "127.0.0.1:4404".to_string(),
+                direct_addr: "127.0.0.1:4405".to_string(),
                 ranked: true,
             }),
             WireMessage::LobbyListRequest(LobbyListRequest { ranked_only: true }),
@@ -1582,7 +1582,7 @@ mod tests {
                 entries: vec![LobbyEntry {
                     session_id: HostedSessionId("session-1".to_string()),
                     host: hosted_player("ada", "Ada"),
-                    direct_addr: "127.0.0.1:4404".to_string(),
+                    direct_addr: "127.0.0.1:4405".to_string(),
                     ranked: true,
                     protocol_major: PROTOCOL_MAJOR,
                     protocol_minor: PROTOCOL_MINOR,
@@ -1724,30 +1724,30 @@ mod tests {
         assert_eq!(
             encoded,
             vec![
-                vec![66, 84, 82, 83, 0, 1, 0, 0, 0, 25, 0, 0, 0, 0, 0, 2, 0, 48],
-                vec![66, 84, 82, 83, 0, 1, 0, 0, 0, 26, 0, 0, 0, 0, 0, 3, 1, 52, 48],
-                vec![66, 84, 82, 83, 0, 1, 0, 0, 0, 27, 0, 0, 0, 0, 0, 3, 0, 5, 1],
-                vec![66, 84, 82, 83, 0, 1, 0, 0, 0, 28, 0, 0, 0, 0, 0, 3, 0, 0, 2],
+                vec![66, 84, 82, 83, 0, 2, 0, 0, 0, 25, 0, 0, 0, 0, 0, 2, 0, 48],
+                vec![66, 84, 82, 83, 0, 2, 0, 0, 0, 26, 0, 0, 0, 0, 0, 3, 1, 52, 48],
+                vec![66, 84, 82, 83, 0, 2, 0, 0, 0, 27, 0, 0, 0, 0, 0, 3, 0, 5, 1],
+                vec![66, 84, 82, 83, 0, 2, 0, 0, 0, 28, 0, 0, 0, 0, 0, 3, 0, 0, 2],
                 vec![
-                    66, 84, 82, 83, 0, 1, 0, 0, 0, 29, 0, 0, 0, 0, 0, 18, 9, 115, 101, 115, 115,
+                    66, 84, 82, 83, 0, 2, 0, 0, 0, 29, 0, 0, 0, 0, 0, 18, 9, 115, 101, 115, 115,
                     105, 111, 110, 45, 49, 3, 98, 101, 110, 3, 66, 101, 110,
                 ],
                 vec![
-                    66, 84, 82, 83, 0, 1, 0, 0, 0, 30, 0, 0, 0, 0, 0, 14, 9, 115, 101, 115, 115,
+                    66, 84, 82, 83, 0, 2, 0, 0, 0, 30, 0, 0, 0, 0, 0, 14, 9, 115, 101, 115, 115,
                     105, 111, 110, 45, 49, 3, 97, 100, 97,
                 ],
                 vec![
-                    66, 84, 82, 83, 0, 1, 0, 0, 0, 31, 0, 0, 0, 0, 0, 11, 9, 115, 101, 115, 115,
+                    66, 84, 82, 83, 0, 2, 0, 0, 0, 31, 0, 0, 0, 0, 0, 11, 9, 115, 101, 115, 115,
                     105, 111, 110, 45, 49, 0,
                 ],
                 vec![
-                    66, 84, 82, 83, 0, 1, 0, 0, 0, 32, 0, 0, 0, 0, 0, 46, 9, 115, 101, 115, 115,
+                    66, 84, 82, 83, 0, 2, 0, 0, 0, 32, 0, 0, 0, 0, 0, 46, 9, 115, 101, 115, 115,
                     105, 111, 110, 45, 49, 35, 97, 119, 97, 105, 116, 105, 110, 103, 32, 109, 97,
                     116, 99, 104, 105, 110, 103, 32, 112, 101, 101, 114, 32, 114, 101, 115, 117,
                     108, 116, 32, 99, 108, 97, 105, 109,
                 ],
                 vec![
-                    66, 84, 82, 83, 0, 1, 0, 0, 0, 33, 0, 0, 0, 0, 0, 8, 0, 60, 190, 245, 250, 215,
+                    66, 84, 82, 83, 0, 2, 0, 0, 0, 33, 0, 0, 0, 0, 0, 8, 0, 60, 190, 245, 250, 215,
                     12, 44,
                 ],
             ]
@@ -1780,10 +1780,10 @@ mod tests {
         ));
 
         let mut bad_major = encoded.clone();
-        bad_major[5] = 2;
+        bad_major[5] = 1;
         assert_eq!(
             decode_message(&bad_major),
-            Err(ProtocolError::UnsupportedMajor { major: 2 })
+            Err(ProtocolError::UnsupportedMajor { major: 1 })
         );
 
         encoded.pop();
@@ -1919,7 +1919,7 @@ mod tests {
         let flow = vec![
             WireMessage::LobbyRegister(LobbyRegister {
                 player: ada.clone(),
-                direct_addr: "192.0.2.10:4404".to_string(),
+                direct_addr: "192.0.2.10:4405".to_string(),
                 ranked: true,
             }),
             WireMessage::LobbyListRequest(LobbyListRequest { ranked_only: true }),
@@ -1927,7 +1927,7 @@ mod tests {
                 entries: vec![LobbyEntry {
                     session_id: session_id.clone(),
                     host: ada.clone(),
-                    direct_addr: "192.0.2.10:4404".to_string(),
+                    direct_addr: "192.0.2.10:4405".to_string(),
                     ranked: true,
                     protocol_major: PROTOCOL_MAJOR,
                     protocol_minor: PROTOCOL_MINOR,

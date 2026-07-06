@@ -857,8 +857,11 @@ pub(super) fn submit_hosted_ranked_result_claim(
         network_state.result_status = status;
         return;
     }
-    let Ok(server_addr) = parse_network_addr(&settings.lobby_addr, "lobby address", network_state)
-    else {
+    let Ok(server_addr) = parse_network_addr(
+        &settings.modern_server_addr,
+        "modern server address",
+        network_state,
+    ) else {
         let status = FinalResultStatus::Rejected("connection error".to_string());
         set_local_result_status(local, status.clone());
         network_state.result_status = status;
