@@ -50,8 +50,8 @@ install_binary() {
 }
 
 install_binary client battletris-client
-install_binary battletris-server battletris-server
-install_binary battletris-tools battletris-tools
+install_binary server battletris-server
+install_binary tools battletris-tools
 
 cp -R assets/. "$package_dir/assets/"
 cp docs/rewrite-spec.md docs/traceability-checklist.md docs/rust-workspace.md docs/distribution.md docs/manual-network-tests.md "$package_dir/docs/"
