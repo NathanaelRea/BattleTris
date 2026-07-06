@@ -399,6 +399,7 @@ pub(in crate::app) struct MenuButton {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::app) enum MenuAction {
     StartSelectedChallenge,
+    UpdateChallenge,
     StartHumanVsComputer,
     GoTo(ClientScreen),
     Quit,

@@ -7,15 +7,22 @@ use battletris_core::{
     rng::GameSeed,
 };
 use battletris_protocol::{
-    accept_direct_game, derive_player_seeds, join_direct_game, read_message, write_message,
-    DirectConnection, Disconnect, GameChecksum, Hello, HostedJoinRequest, HostedPlayer,
-    HostedSessionStatus, HostedSessionStatusKind, HostedSessionStatusRequest, InputCommand,
-    LobbyEntry, LobbyList, LobbyListRequest, LobbyRegister, PlayerIdentity, PlayerInput,
-    PlayerSlot, RankedRecordsRequest, RankedResultAccepted, RankedResultClaim, RankedResultPending,
-    RankedResultRejected, TickWatermark, WireMessage, CAPABILITY_DIRECT_TCP, PROTOCOL_MAJOR,
-    PROTOCOL_MINOR,
+    accept_direct_game, derive_player_seeds, join_direct_game,
+    legacy::{
+        LegacyConnection, LegacyNetworkEntry, LegacyPacket, LegacyToken, LEGACY_C_ULONG_LEN,
+        LEGACY_NETWORK_ENTRY_LEN,
+    },
+    read_message, write_message, DirectConnection, Disconnect, GameChecksum, Hello,
+    HostedJoinRequest, HostedPlayer, HostedSessionStatus, HostedSessionStatusKind,
+    HostedSessionStatusRequest, InputCommand, LobbyEntry, LobbyList, LobbyListRequest,
+    LobbyRegister, PlayerIdentity, PlayerInput, PlayerSlot, RankedRecordsRequest,
+    RankedResultAccepted, RankedResultClaim, RankedResultPending, RankedResultRejected,
+    TickWatermark, WireMessage, CAPABILITY_DIRECT_TCP, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
-use tokio::{net::TcpListener, time::timeout};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    time::timeout,
+};
 
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(10);
 const SCRIPT_SEED: u64 = 0x5eed_0000_0000_0002;
@@ -57,6 +64,12 @@ async fn run_async(mut args: Vec<String>) -> Result<(), String> {
             let server = parse_flag_addr(&mut args, "--server")?;
             ensure_no_extra_args(&args)?;
             hosted_lobby(server).await.map(|_| ())
+        }
+        "legacy-roster" => {
+            let server = parse_flag_addr(&mut args, "--server")?;
+            let share = parse_flag_addr(&mut args, "--share")?;
+            ensure_no_extra_args(&args)?;
+            legacy_roster(server, share).await
         }
         "ranked-result" => {
             let server = parse_flag_addr(&mut args, "--server")?;
@@ -277,6 +290,76 @@ async fn hosted_lobby(server: SocketAddr) -> Result<HostedGameStartPair, String>
         join_start.session_id.0, join_start.seed, join_start.ranked
     );
     Ok(HostedGameStartPair { entry, join_start })
+}
+
+async fn legacy_roster(server: SocketAddr, share: SocketAddr) -> Result<(), String> {
+    let stream = timeout(SMOKE_TIMEOUT, TcpStream::connect(server))
+        .await
+        .map_err(|_| format!("timed out connecting to legacy server {server}"))?
+        .map_err(|error| format!("connect to legacy server {server} failed: {error}"))?;
+    let mut connection = LegacyConnection::from_stream(stream);
+    let accepted = timeout(SMOKE_TIMEOUT, connection.recv())
+        .await
+        .map_err(|_| "timed out waiting for legacy server accept".to_string())?
+        .map_err(|error| format!("legacy server accept read failed: {error}"))?;
+    if accepted.token != LegacyToken::Accepted {
+        return Err(format!("expected BT_ACCEPTED, got {:?}", accepted.token));
+    }
+
+    let entry = LegacyNetworkEntry::waiting(identity("Smoke Legacy"), share, std::process::id(), 1);
+    connection
+        .send(&LegacyPacket {
+            token: LegacyToken::QueryConnection,
+            payload: entry.encode(),
+        })
+        .await
+        .map_err(|error| format!("legacy register failed: {error}"))?;
+    connection
+        .send(&LegacyPacket::empty(LegacyToken::QueryNetworkDb))
+        .await
+        .map_err(|error| format!("legacy roster query failed: {error}"))?;
+    let count_packet = connection
+        .recv()
+        .await
+        .map_err(|error| format!("legacy roster length read failed: {error}"))?;
+    if count_packet.token != LegacyToken::ResponseDbLen {
+        return Err(format!(
+            "expected BT_RESP_DBLEN, got {:?}",
+            count_packet.token
+        ));
+    }
+    if count_packet.payload.len() != 4 && count_packet.payload.len() != LEGACY_C_ULONG_LEN {
+        return Err(format!(
+            "unexpected legacy roster length payload size {}",
+            count_packet.payload.len()
+        ));
+    }
+    let count = u32::from_be_bytes(count_packet.payload[..4].try_into().unwrap()) as usize;
+    let db_packet = connection
+        .recv()
+        .await
+        .map_err(|error| format!("legacy roster read failed: {error}"))?;
+    if db_packet.token != LegacyToken::ResponseNetworkDb {
+        return Err(format!("expected BT_RESP_NETDB, got {:?}", db_packet.token));
+    }
+    let expected_len = count * LEGACY_NETWORK_ENTRY_LEN;
+    if db_packet.payload.len() != expected_len {
+        return Err(format!(
+            "legacy roster payload size mismatch: expected {expected_len}, got {}",
+            db_packet.payload.len()
+        ));
+    }
+    println!("legacy-roster ok entries={count}");
+    for chunk in db_packet.payload.chunks_exact(LEGACY_NETWORK_ENTRY_LEN) {
+        let entry = LegacyNetworkEntry::decode(chunk)
+            .map_err(|error| format!("legacy roster entry decode failed: {error}"))?;
+        println!("{} {}:{}", entry.user_name, entry.host_name, entry.port);
+    }
+    connection
+        .send(&LegacyPacket::empty(LegacyToken::Disconnect))
+        .await
+        .map_err(|error| format!("legacy disconnect failed: {error}"))?;
+    Ok(())
 }
 
 async fn ranked_result(server: SocketAddr) -> Result<(), String> {
@@ -621,7 +704,7 @@ fn ensure_no_extra_args(args: &[String]) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "Usage: battletris-tools net-smoke <command>\n\nCommands:\n  direct-loopback\n  direct-host --listen ADDR:PORT\n  direct-join --addr ADDR:PORT\n  hosted-lobby --server ADDR:PORT\n  ranked-result --server ADDR:PORT\n\nProtocol: {}.{} ({})",
+        "Usage: battletris-tools net-smoke <command>\n\nCommands:\n  direct-loopback\n  direct-host --listen ADDR:PORT\n  direct-join --addr ADDR:PORT\n  hosted-lobby --server ADDR:PORT\n  legacy-roster --server ADDR:PORT --share ADDR:PORT\n  ranked-result --server ADDR:PORT\n\nProtocol: {}.{} ({})",
         PROTOCOL_MAJOR, PROTOCOL_MINOR, CAPABILITY_DIRECT_TCP
     );
 

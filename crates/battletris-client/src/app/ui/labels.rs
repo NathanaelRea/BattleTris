@@ -96,17 +96,34 @@ pub(in crate::app) fn legacy_score_label(local: &LocalGame) -> String {
     let player = local.local_player;
     let opponent = opponent_player(player);
     let own = game.player(player);
+    let remote = local.legacy_remote.as_ref();
     let other = game.player(opponent);
+    let opponent_score = remote.map_or_else(|| other.score(), |remote| remote.score);
+    let opponent_lines = remote.map_or_else(|| other.lines(), |remote| remote.lines);
+    let opponent_funds = remote.map_or_else(|| other.funds(), |remote| remote.funds);
     let mut text = format!(
         "Your score:          {}\nOpponent's score:    {}\n\nYour lines:          {}\nOpponent's lines:    {}\n\nYour funds:          {}\nOpponent's funds:    {}\n\nLines 'til bazaar:   {}",
         own.score(),
-        other.score(),
+        opponent_score,
         own.lines(),
-        other.lines(),
+        opponent_lines,
         own.funds(),
-        other.funds(),
+        opponent_funds,
         game.lines_until_bazaar(),
     );
+    if let Some(remote) = remote {
+        let _ = write!(
+            text,
+            "\n\nOpponent status: {}{}\nOpponent arsenal: {}",
+            if remote.in_bazaar {
+                "Bazaar"
+            } else {
+                "Playing"
+            },
+            if remote.paused { ", paused" } else { "" },
+            legacy_remote_arsenal_label(remote),
+        );
+    }
     if let Some(session) = &local.network_session {
         text.push_str("\n\n");
         text.push_str(&network_session_status_label(
@@ -117,14 +134,40 @@ pub(in crate::app) fn legacy_score_label(local: &LocalGame) -> String {
     text
 }
 
+pub(in crate::app) fn legacy_remote_arsenal_label(remote: &LegacyRemoteOpponentState) -> String {
+    let Some(arsenal) = &remote.arsenal else {
+        return "unknown".to_string();
+    };
+    let labels = arsenal
+        .slots
+        .iter()
+        .enumerate()
+        .filter_map(|(index, slot)| {
+            let slot = slot.as_ref()?;
+            let token = WeaponToken::from_legacy_id(slot.weapon)?;
+            Some(format!(
+                "{}:{}x{}",
+                index + 1,
+                weapon_spec(token).name,
+                slot.quantity
+            ))
+        })
+        .collect::<Vec<_>>();
+    if labels.is_empty() {
+        "empty".to_string()
+    } else {
+        labels.join(" ")
+    }
+}
+
 pub(in crate::app) fn network_session_status_label(
     session: &NetworkSession,
     lockstep: Option<&NetworkLockstep>,
 ) -> String {
-    let mode = if session.hosted.is_some() {
-        "Hosted Play"
-    } else {
-        "Direct-Connect"
+    let mode = match session.mode {
+        NetworkMode::Direct => "Direct-Connect",
+        NetworkMode::Hosted => "Hosted Play",
+        NetworkMode::LegacyDirect => "Legacy Direct",
     };
     let community = session
         .community_label
@@ -197,7 +240,9 @@ pub(in crate::app) fn legacy_game_message_label(
                 format!("Playing {} Ernie", difficulty.name)
             }
             GameMode::HumanVsHuman => match local.mode {
-                LocalGameMode::DirectConnect | LocalGameMode::HostedPlay => local
+                LocalGameMode::DirectConnect
+                | LocalGameMode::HostedPlay
+                | LocalGameMode::LegacyDirect => local
                     .network_session
                     .as_ref()
                     .map(|session| {
@@ -279,14 +324,14 @@ pub(in crate::app) fn screen_body_label(
 pub(in crate::app) fn challenge_screen_body_label(settings: &ClientSettings) -> String {
     match settings.challenge_style {
         ChallengeStyle::Legacy => format!(
-            "Challenge\nStyle: Legacy\n\nLeft panel: available legacy players.\nRight panel: selected player information and legacy Direct IP details.\n\nControls: Enter/C challenges the selected legacy peer or accepts an incoming challenge. D denies. Escape/Cancel backs out.\n\nIdentity: {} ({})\nLegacy peer address: {}\nLegacy listen address: {}",
+            "Challenge\nProtocol: Legacy\n\nLegacy uses original BattleTris TCP packets. The Update button starts legacy host availability; Challenge connects to the configured peer.\n\nControls: Enter/C challenges the selected legacy peer or accepts an incoming challenge. D denies. Escape/Cancel backs out.\n\nIdentity: {} ({})\nLegacy peer address: {}\nLegacy listen address: {}",
             settings.display_name,
             hosted_player_id(settings),
             settings.direct_join_addr,
             settings.direct_listen_addr,
         ),
         ChallengeStyle::Modern => format!(
-            "Challenge\nStyle: Modern  Mode: {}\n\nLeft panel: choose Computer, Direct IP, hosted availability, a lobby opponent, LAN discovery, or legacy compatibility.\nRight panel: shows the selected mode, addresses, challenge state, and next action.\n\nControls: 1-8 choose mode. Up/Down or mouse selects opponents. Enter/C starts, refreshes, challenges, or accepts. D denies. Escape/Cancel backs out.\n\nIdentity: {} ({})  Community: {}\nProtocol v{}.{} ({}, {})",
+            "Challenge\nProtocol: Modern  Mode: {}\n\nModern uses the Rust BTRS framed protocol. Left panel: choose Computer, Direct IP, hosted availability, a lobby opponent, or LAN discovery.\nRight panel: shows the selected mode, addresses, challenge state, and next action.\n\nControls: 1-6 choose mode. Up/Down or mouse selects opponents. Enter/C starts, refreshes, challenges, or accepts. D denies. Escape/Cancel backs out.\n\nIdentity: {} ({})  Community: {}\nProtocol v{}.{} ({}, {})",
             settings.challenge_mode.label(),
             settings.display_name,
             hosted_player_id(settings),
@@ -334,11 +379,9 @@ pub(in crate::app) fn challenge_opponent_list_label(
         (ChallengeMode::ComputerOpponent, "1"),
         (ChallengeMode::HostDirect, "2"),
         (ChallengeMode::JoinDirect, "3"),
-        (ChallengeMode::LegacyHost, "4"),
-        (ChallengeMode::LegacyJoin, "5"),
-        (ChallengeMode::HostViaLobby, "6"),
-        (ChallengeMode::BrowseLobby, "7"),
-        (ChallengeMode::BrowseLan, "8"),
+        (ChallengeMode::HostViaLobby, "4"),
+        (ChallengeMode::BrowseLobby, "5"),
+        (ChallengeMode::BrowseLan, "6"),
     ] {
         let marker = if settings.challenge_mode == mode {
             ">"
@@ -431,19 +474,41 @@ pub(in crate::app) fn legacy_challenge_player_list_label(
     network_state: &ClientNetworkState,
 ) -> String {
     let mut text = String::new();
-    let marker = if network_state.pending_challenge.is_none() {
-        ">"
+    if let Some(list) = &network_state.lobby_list {
+        if list.entries.is_empty() {
+            text.push_str("No legacy players registered.\nPress Update to refresh.\n");
+        } else {
+            for (index, entry) in list.entries.iter().enumerate().take(8) {
+                let marker = if index == network_state.lobby_selected_index {
+                    ">"
+                } else {
+                    " "
+                };
+                let _ = writeln!(
+                    text,
+                    "{marker} {:<8} {:<24} v{}.{}",
+                    truncate_label(&entry.host.display_name, 8),
+                    truncate_label(&entry.direct_addr, 24),
+                    entry.protocol_major,
+                    entry.protocol_minor,
+                );
+            }
+        }
     } else {
-        " "
-    };
-    let _ = writeln!(
-        text,
-        "{marker} {:<8} {:<24} {:<8}",
-        truncate_label(&settings.display_name, 8),
-        truncate_label(&settings.direct_join_addr, 24),
-        "Waiting",
-    );
-    text.push_str("\nNo legacy server roster is configured.\nThis entry uses manual Direct IP.\n");
+        let marker = if network_state.pending_challenge.is_none() {
+            ">"
+        } else {
+            " "
+        };
+        let _ = writeln!(
+            text,
+            "{marker} {:<8} {:<24} {:<8}",
+            truncate_label(&settings.display_name, 8),
+            truncate_label(&settings.direct_join_addr, 24),
+            "Waiting",
+        );
+        text.push_str("\nPress Update to register with the legacy server.\nManual Direct IP is used until the roster loads.\n");
+    }
     if let Some(challenge) = &network_state.pending_challenge {
         let _ = write!(
             text,
@@ -470,8 +535,6 @@ pub(in crate::app) fn challenge_mode_panel_label(
         ChallengeMode::ComputerOpponent => computer_challenge_panel_label(settings),
         ChallengeMode::HostDirect => host_direct_panel_label(settings, network_state),
         ChallengeMode::JoinDirect => join_direct_panel_label(settings, network_state),
-        ChallengeMode::LegacyHost => legacy_host_panel_label(settings, network_state),
-        ChallengeMode::LegacyJoin => legacy_join_panel_label(settings, network_state),
         ChallengeMode::HostViaLobby => host_via_lobby_panel_label(settings, network_state),
         ChallengeMode::BrowseLobby => browse_lobby_panel_label(settings, network_state),
         ChallengeMode::BrowseLan => browse_lan_panel_label(network_state),
@@ -542,42 +605,27 @@ pub(in crate::app) fn legacy_challenge_info_panel_label(
     settings: &ClientSettings,
     network_state: &ClientNetworkState,
 ) -> String {
+    let selected = selected_lobby_entry(network_state)
+        .map(|entry| {
+            format!(
+                "Selected: {} at {}\n",
+                entry.host.display_name, entry.direct_addr
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "User Information\n\nName: {}\nHost: {}\nStatus: Waiting\nProtocol: legacy packet transport\n\nLegacy Challenge mirrors the original screen: choose a player on the left, inspect details here, then press Challenge.\n\nManual Direct IP\nChallenge peer: {}\nAvailable at: {}\n\n{}",
+        "User Information\n\nName: {}\nServer: {}\nStatus: Waiting\nProtocol: legacy packet transport\n\nLegacy Challenge mirrors the original screen: press Update to register/listen, then choose a roster row or use manual Direct IP.\n\n{}Manual Direct IP\nChallenge peer: {}\nAvailable at: {}\n\n{}",
         settings.display_name,
-        settings.direct_join_addr,
+        lobby_status_label(settings),
+        selected,
         settings.direct_join_addr,
         settings.direct_listen_addr,
-        legacy_transport_status_label(network_state),
-    )
-}
-
-pub(in crate::app) fn legacy_host_panel_label(
-    settings: &ClientSettings,
-    network_state: &ClientNetworkState,
-) -> String {
-    format!(
-        "Legacy Host\n\nListen for an original BattleTris peer using the legacy packet framing.\n\nBind: {}\nShare: {}\n\nLegacy gameplay compatibility still needs the old wire adapter before this can accept real legacy clients.\n\n{}",
-        settings.direct_listen_addr,
-        effective_direct_share_addr(settings, network_state),
-        legacy_transport_status_label(network_state),
-    )
-}
-
-pub(in crate::app) fn legacy_join_panel_label(
-    settings: &ClientSettings,
-    network_state: &ClientNetworkState,
-) -> String {
-    format!(
-        "Legacy Join\n\nChallenge an original BattleTris peer by manual Direct IP.\n\nJoin address: {}\nYour name: {}\n\nLegacy gameplay compatibility still needs the old wire adapter before this can challenge real legacy clients.\n\n{}",
-        settings.direct_join_addr,
-        settings.display_name,
         legacy_transport_status_label(network_state),
     )
 }
 
 pub(in crate::app) fn legacy_transport_status_label(network_state: &ClientNetworkState) -> String {
-    let mut status = "Status: legacy compatibility adapter not wired yet".to_string();
+    let mut status = challenge_status_lifecycle_label(network_state);
     if let Some(message) = network_state.transient_messages.last() {
         let _ = write!(status, "\nLast status: {message}");
     }
@@ -692,8 +740,6 @@ pub(in crate::app) fn challenge_compact_status_label(
         ChallengeMode::HostViaLobby | ChallengeMode::BrowseLobby if !settings.lobby_enabled => {
             "Lobby disabled".to_string()
         }
-        ChallengeMode::LegacyHost => "Legacy host pending adapter".to_string(),
-        ChallengeMode::LegacyJoin => "Legacy join pending adapter".to_string(),
         ChallengeMode::BrowseLan if !network_state.lan_entries.is_empty() => {
             format!("LAN hosts: {}", network_state.lan_entries.len())
         }
@@ -717,8 +763,6 @@ pub(in crate::app) fn challenge_primary_button_label(
         }
         ChallengeMode::HostDirect => "Host Direct".to_string(),
         ChallengeMode::JoinDirect => "Join Direct".to_string(),
-        ChallengeMode::LegacyHost => "Legacy Host".to_string(),
-        ChallengeMode::LegacyJoin => "Legacy Join".to_string(),
         ChallengeMode::HostViaLobby if !settings.lobby_enabled => "Lobby Disabled".to_string(),
         ChallengeMode::HostViaLobby => "Host Via Lobby".to_string(),
         ChallengeMode::BrowseLobby if !settings.lobby_enabled => "Lobby Disabled".to_string(),
@@ -761,6 +805,10 @@ pub(in crate::app) fn challenge_status_lifecycle_label(
         NetworkLifecycleState::Connected { session } => format!(
             "Status: accepted; starting game with {} as {:?}",
             session.peer_identity.display_name, session.local_slot
+        ),
+        NetworkLifecycleState::LegacyConnected { peer_identity } => format!(
+            "Status: legacy handshake complete with {}; starting game",
+            peer_identity.display_name
         ),
         NetworkLifecycleState::Disconnecting => "Status: disconnecting".to_string(),
         NetworkLifecycleState::Error { message } => {
@@ -813,6 +861,10 @@ pub(in crate::app) fn challenge_network_status_label(network_state: &ClientNetwo
         NetworkLifecycleState::Connected { session } => format!(
             "Network: connected to {} as {:?}; starting game",
             session.peer_identity.display_name, session.local_slot
+        ),
+        NetworkLifecycleState::LegacyConnected { peer_identity } => format!(
+            "Network: legacy handshake complete with {}; starting game",
+            peer_identity.display_name
         ),
         NetworkLifecycleState::Disconnecting => "Network: disconnecting".to_string(),
         NetworkLifecycleState::Error { message } => format!("Network error: {message}"),

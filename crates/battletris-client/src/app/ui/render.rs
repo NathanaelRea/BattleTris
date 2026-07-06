@@ -402,7 +402,9 @@ pub(in crate::app) fn player_view_visible(
 ) -> bool {
     player == local.local_player
         || (player == opponent_player(local.local_player)
-            && (local.computer.is_some() || recon.snapshot.is_some()))
+            && (local.computer.is_some()
+                || recon.snapshot.is_some()
+                || local.legacy_remote.is_some()))
 }
 
 pub(in crate::app) fn update_menu_button_visuals(
@@ -491,6 +493,14 @@ pub(in crate::app) fn render_cell_sprite(
     theme: &LoadedTheme,
 ) -> RenderedCellSprite {
     if player != local.local_player {
+        if let Some(remote) = &local.legacy_remote {
+            if let Some(board) = &remote.board {
+                return legacy_remote_cell(board, x, y).map_or_else(
+                    || empty_cell_sprite(theme),
+                    |cell| cell_sprite(cell, false, theme),
+                );
+            }
+        }
         if local.computer.is_some() && recon.manual_condor {
             return local
                 .game
@@ -540,4 +550,29 @@ pub(in crate::app) fn render_cell_sprite(
         || empty_cell_sprite(theme),
         |cell| cell_sprite(cell, false, theme),
     )
+}
+
+pub(in crate::app) fn legacy_remote_cell(
+    board: &battletris_protocol::BoardSnapshot,
+    x: usize,
+    y: usize,
+) -> Option<Cell> {
+    let width = usize::from(board.width);
+    let height = usize::from(board.height);
+    if width == 0 || height == 0 || x >= width {
+        return None;
+    }
+    let source_y = if height > BOARD_HEIGHT {
+        y + (height - BOARD_HEIGHT)
+    } else {
+        y
+    };
+    if source_y >= height {
+        return None;
+    }
+    board
+        .cells
+        .get(source_y * width + x)
+        .copied()
+        .and_then(Cell::from_legacy_id)
 }

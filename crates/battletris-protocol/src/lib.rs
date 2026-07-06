@@ -13,6 +13,9 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
+/// Original BattleTris packet protocol compatibility support.
+pub mod legacy;
+
 /// Fixed frame magic used by every BattleTris rewrite protocol frame.
 pub const MAGIC: [u8; 4] = *b"BTRS";
 /// Current supported protocol major version.

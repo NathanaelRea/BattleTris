@@ -6,8 +6,8 @@
 
 use battletris_client::net::{
     build_ranked_result_claim, FinalResultStatus, LanAvailability, LanDiscoveryEntry,
-    NetworkCommand, NetworkEvent, NetworkLifecycleState, NetworkLockstep, NetworkRuntime,
-    NetworkSession,
+    LegacyRemoteOpponentState, LegacyRemoteScoreUpdate, NetworkCommand, NetworkEvent,
+    NetworkLifecycleState, NetworkLockstep, NetworkMode, NetworkRuntime, NetworkSession,
 };
 use battletris_core::{
     ai::{computer_difficulty, ComputerOpponent, BAZAAR_LEAVE_DELAY_MS, COMPUTER_DIFFICULTIES},
@@ -23,10 +23,11 @@ use battletris_core::{
 };
 use battletris_db::{CommunityLabel, PersistencePaths, PlayerStore, StreakKind};
 use battletris_protocol::{
-    derive_player_seeds, BazaarBuy, BazaarDone, BazaarRemove, Challenge, GameChecksum, GameOver,
-    Heartbeat, HostedGameStart, HostedPlayer, HostedSessionStatus, HostedSessionStatusKind,
-    InputCommand, LobbyEntry, LobbyList, LobbyRegister, PlayerIdentity, PlayerInput, PlayerSlot,
-    RankedRecords, RankedResultPending, RankedResultRejected, TickWatermark, CAPABILITY_DIRECT_TCP,
+    derive_player_seeds, ArsenalEntry, ArsenalSnapshot, BazaarBuy, BazaarDone, BazaarRemove,
+    BoardSnapshot as WireBoardSnapshot, Challenge, GameChecksum, GameOver, Heartbeat,
+    HostedGameStart, HostedPlayer, HostedSessionStatus, HostedSessionStatusKind, InputCommand,
+    LobbyEntry, LobbyList, LobbyRegister, PlayerIdentity, PlayerInput, PlayerSlot, RankedRecords,
+    RankedResultPending, RankedResultRejected, ScoreSnapshot, TickWatermark, CAPABILITY_DIRECT_TCP,
     CAPABILITY_SELF_HOSTED_LOBBY, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 use bevy::ecs::system::SystemParam;
