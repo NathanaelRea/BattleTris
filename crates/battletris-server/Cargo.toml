@@ -5,6 +5,10 @@ edition.workspace = true
 publish.workspace = true
 description = "Optional BattleTris lobby, relay, or dedicated server service."
 
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
 [lints]
 workspace = true
 
